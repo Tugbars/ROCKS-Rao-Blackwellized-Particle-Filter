@@ -16,102 +16,61 @@
 #───────────────────────────────────────────────────────────────────────────────
 
 cmake_minimum_required(VERSION 3.16)
+project(rbpf C)
 
-project(RBPF
-    VERSION 1.0.0
-    LANGUAGES C
-    DESCRIPTION "Rao-Blackwellized Particle Filter for Stochastic Volatility"
-)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-#───────────────────────────────────────────────────────────────────────────────
-# Build Type
-#───────────────────────────────────────────────────────────────────────────────
-
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
-        "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+# Build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
 endif()
 
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-
 #───────────────────────────────────────────────────────────────────────────────
-# Find MKL
+# MKL Configuration
 #───────────────────────────────────────────────────────────────────────────────
 
 set(MKL_INTERFACE lp64)
-set(MKL_THREADING sequential)  # Single-threaded for low latency
+set(MKL_THREADING intel_thread)  # Intel OpenMP for MSVC
+set(MKL_MPI intelmpi)
 
-find_package(MKL CONFIG REQUIRED)
-
-if(MKL_FOUND)
-    message(STATUS "MKL found: ${MKL_ROOT}")
-else()
-    message(FATAL_ERROR "Intel MKL not found. Please install oneAPI or set MKL_ROOT.")
+# Hint for MKL location on Windows
+if(WIN32 AND NOT DEFINED ENV{MKLROOT})
+    list(APPEND CMAKE_PREFIX_PATH 
+        "C:/Program Files (x86)/Intel/oneAPI/mkl/latest"
+        "C:/Program Files/Intel/oneAPI/mkl/latest"
+    )
 endif()
 
-#───────────────────────────────────────────────────────────────────────────────
-# Find OpenMP (optional, for non-Windows)
-#───────────────────────────────────────────────────────────────────────────────
+# Find MKL
+find_package(MKL CONFIG REQUIRED)
 
-if(NOT WIN32)
-    find_package(OpenMP)
-    if(OpenMP_C_FOUND)
-        message(STATUS "OpenMP found: ${OpenMP_C_VERSION}")
-    endif()
+# OpenMP - MKL brings its own Intel OpenMP on Windows
+if(MSVC)
+    set(OpenMP_FOUND TRUE)
+else()
+    find_package(OpenMP REQUIRED)
 endif()
 
 #───────────────────────────────────────────────────────────────────────────────
 # Compiler Flags
 #───────────────────────────────────────────────────────────────────────────────
 
-set(COMMON_FLAGS "")
-set(COMMON_DEFS "")
-
 if(MSVC)
-    # MSVC flags
-    set(COMMON_FLAGS
-        /O2             # Full optimization
-        /arch:AVX2      # AVX2 instructions
-        /fp:fast        # Fast floating point
-        /GL             # Whole program optimization
-        /W3             # Warning level 3
+    set(COMMON_FLAGS 
+        /W4 
+        /openmp:llvm     # Use LLVM OpenMP for modern features
+        $<$<CONFIG:Release>:/O2 /fp:fast /arch:AVX2>
+        $<$<CONFIG:Debug>:/Od /Zi>
     )
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /LTCG")
-    set(CMAKE_STATIC_LINKER_FLAGS "${CMAKE_STATIC_LINKER_FLAGS} /LTCG")
-    
-    # Suppress some noisy warnings
-    list(APPEND COMMON_FLAGS /wd4244 /wd4267 /wd4996)
-    
-elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    # GCC/Clang flags
-    set(COMMON_FLAGS
-        -O3
-        -march=native
-        -ffast-math
-        -funroll-loops
-        -Wall
-        -Wextra
-        -Wno-unused-parameter
-    )
-    
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU")
-        list(APPEND COMMON_FLAGS -flto)
-    endif()
-    
+    set(COMMON_DEFS _CRT_SECURE_NO_WARNINGS)
 elseif(CMAKE_C_COMPILER_ID MATCHES "Intel")
-    # Intel compiler flags
-    set(COMMON_FLAGS
-        -O3
-        -xHost
-        -ipo
-        -fp-model fast=2
-        -Wall
-    )
+    set(COMMON_FLAGS -Wall -xHost -qopenmp -qopt-report=3 -qopt-report-phase=vec)
+elseif(CMAKE_C_COMPILER_ID MATCHES "GNU")
+    set(COMMON_FLAGS -Wall -Wextra -Wpedantic -O3 -march=native -fopenmp -ffast-math -funroll-loops)
+elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    set(COMMON_FLAGS -Wall -Wextra -Wpedantic -O3 -march=native -fopenmp -ffast-math -funroll-loops)
 endif()
-
-message(STATUS "Compiler: ${CMAKE_C_COMPILER_ID}")
-message(STATUS "Flags: ${COMMON_FLAGS}")
 
 #───────────────────────────────────────────────────────────────────────────────
 # Add RBPF Subdirectory
@@ -124,12 +83,13 @@ add_subdirectory(RBPF)
 #───────────────────────────────────────────────────────────────────────────────
 
 message(STATUS "")
-message(STATUS "╔═══════════════════════════════════════════════════════════════╗")
-message(STATUS "║                    RBPF Build Configuration                   ║")
-message(STATUS "╠═══════════════════════════════════════════════════════════════╣")
-message(STATUS "║  Version:       ${PROJECT_VERSION}                                       ║")
-message(STATUS "║  Build Type:    ${CMAKE_BUILD_TYPE}                                     ║")
-message(STATUS "║  Compiler:      ${CMAKE_C_COMPILER_ID}                                        ║")
-message(STATUS "║  MKL:           ${MKL_ROOT}")
-message(STATUS "╚═══════════════════════════════════════════════════════════════╝")
+message(STATUS "=== RBPF Configuration ===")
+message(STATUS "Build type:       ${CMAKE_BUILD_TYPE}")
+message(STATUS "Compiler:         ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
+message(STATUS "MKL threading:    ${MKL_THREADING}")
+if(MSVC)
+    message(STATUS "Platform:         Windows (MSVC + Intel OpenMP)")
+else()
+    message(STATUS "Platform:         Unix-like")
+endif()
 message(STATUS "")

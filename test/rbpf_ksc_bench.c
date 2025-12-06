@@ -12,6 +12,8 @@
  */
 
 #include "rbpf_ksc.h"
+#define SSA_USE_MKL  
+#include "mkl_config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -749,6 +751,7 @@ void print_tracking_summary(const DiagnosticData *diag)
 int main(int argc, char **argv)
 {
     printf("=== RBPF-KSC Benchmark ===\n\n");
+    mkl_config_14900kf(1);
 
     /* Configuration */
     int n_obs = 5000; /* Observations per run */
