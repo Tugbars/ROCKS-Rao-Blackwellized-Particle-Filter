@@ -29,11 +29,417 @@ A production-grade particle filter implementation using the Kim-Shephard-Chib (1
 
 ### Why Rao-Blackwellization?
 
-Standard particle filters sample both continuous (volatility) and discrete (regime) states, requiring thousands of particles. RBPF analytically marginalizes the continuous state using Kalman filtering, sampling only the discrete regime. This achieves:
+#### The Fundamental Problem: Path Degeneracy
 
-- **10x fewer particles** (200 vs 2000+)
-- **Lower variance** estimates
-- **Faster convergence** after regime changes
+Standard particle filters suffer from **path degeneracy**—the collapse of particle history to a single ancestral trajectory. This is the primary reason we chose RBPF over our native PF2D implementation.
+
+**What happens:**
+
+```
+t=0:   200 unique particles, 200 unique histories
+       [p1] [p2] [p3] [p4] ... [p200]
+       
+t=50:  After 50 resamplings, all particles share ~5 ancestors
+       [p1] [p1] [p1] [p2] [p2] [p1] [p3] [p1] ...
+        ↑    ↑    ↑
+       All descended from particle 1's history
+       
+t=200: ALL particles share a SINGLE ancestor at t=0
+       [p1] [p1] [p1] [p1] [p1] [p1] [p1] [p1] ...
+       
+       The filter has "forgotten" the past.
+       Effective sample size for historical states = 1
+```
+
+**Why this happens:**
+
+Each resampling step duplicates high-weight particles and kills low-weight ones. Over time, the genealogy collapses:
+
+```
+Resampling genealogy:
+                    
+t=0:    A   B   C   D   E        5 unique ancestors
+        |   |   |   |   |
+t=1:    A   A   C   C   E        3 unique (B,D killed)
+        |\ /|   |\ /|   |
+t=2:    A A A   C C C   E        3 ancestors
+        |/|\|   |/|\|   |
+t=3:    A A A A A C C            2 ancestors (E killed)
+        |/| |\|\| |/|
+t=4:    A A A A A A A            1 ancestor (C killed)
+        
+After ~O(N) steps, ALL particles descend from ONE original particle.
+```
+
+**The mathematical inevitability:**
+
+For N particles with resampling, the expected coalescence time is O(N). With N=200 particles:
+
+```
+Coalescence time ≈ 200 steps
+
+After 200 ticks, your filter has ZERO information about 
+what happened at t=0. The "particle cloud" at t=0 
+has collapsed to a single point.
+```
+
+**Why this kills stochastic volatility tracking:**
+
+1. **Volatility is persistent**: σ_t depends strongly on σ_{t-100}. Path degeneracy destroys this history.
+
+2. **Smoothing is impossible**: Fixed-lag smoothing requires diverse historical paths. With degeneracy, smoothed estimates equal filtered estimates.
+
+3. **Parameter learning fails**: Liu-West and PMMH need trajectory diversity. Degenerate paths mean you're learning from a single (possibly wrong) history.
+
+4. **Regime duration is lost**: "How long have we been in crisis?" requires intact history. Degeneracy answers: "I don't know, all my histories collapsed."
+
+```
+PF2D at t=500, looking back at t=400:
+
+Particle 1:  ... → σ=0.15 → σ=0.18 → σ=0.22 → σ=0.25 → ...
+Particle 2:  ... → σ=0.15 → σ=0.18 → σ=0.22 → σ=0.25 → ...
+Particle 3:  ... → σ=0.15 → σ=0.18 → σ=0.22 → σ=0.25 → ...
+...
+Particle 200:... → σ=0.15 → σ=0.18 → σ=0.22 → σ=0.25 → ...
+
+ALL IDENTICAL. The filter "remembers" only one version of history.
+Effective information about t=400: ONE sample, not 200.
+```
+
+#### How RBPF Solves Path Degeneracy
+
+RBPF analytically marginalizes the continuous state using Kalman filtering. Particles only represent the **discrete regime**, not the continuous volatility.
+
+**The key insight:**
+
+```
+Standard PF:  Particle = (σ_t, r_t, w_t)      ← continuous + discrete, both resampled
+              Path degeneracy affects BOTH states
+              History of σ collapses to single trajectory
+              
+RBPF:         Particle = (μ_t, P_t, r_t, w_t)  ← Kalman sufficient statistics + discrete
+              Only r_t is resampled
+              (μ_t, P_t) are UPDATED analytically, never resampled
+```
+
+**Why this eliminates the problem:**
+
+1. **Continuous state is never resampled**: The Kalman sufficient statistics (μ, P) are updated analytically. No ancestral collapse for volatility.
+
+2. **Regime degeneracy is benign**: With only 4 regimes, "degeneracy" just means particles agree on the regime—which is often correct!
+
+3. **Information is preserved**: Even if all particles collapse to regime 3, each particle's (μ, P) retains full Kalman-filtered history.
+
+```
+RBPF at t=500:
+
+Particle 1:  regime=3, μ=-1.82, P=0.04   ← unique Kalman state
+Particle 2:  regime=3, μ=-1.79, P=0.05   ← unique Kalman state  
+Particle 3:  regime=2, μ=-2.31, P=0.03   ← different regime
+...
+Particle 200: regime=3, μ=-1.85, P=0.04  ← unique Kalman state
+
+Regime may be degenerate (most say "regime 3")
+But volatility estimates are DIVERSE and Kalman-optimal
+```
+
+#### Quantifying the Improvement
+
+| Metric | PF2D (Standard) | RBPF |
+|--------|-----------------|------|
+| **Particles for equivalent accuracy** | 2000+ | **200** |
+| **Path degeneracy time** | ~N steps | **N/A** (continuous state exempt) |
+| **Effective historical samples** | 1 (after coalescence) | **N** (Kalman states independent) |
+| **Smoothing quality** | Poor (degenerate) | **Excellent** (analytic) |
+| **Parameter learning** | Unreliable | **Stable** |
+
+#### The Rao-Blackwell Theorem
+
+The mathematical foundation: **if you can analytically integrate out variables, do it**—the resulting estimator has provably lower variance.
+
+```
+Var[E[f(x,y)|y]] ≤ Var[f(x,y)]
+
+Translation: 
+  Analytically marginalizing x (via Kalman) 
+  beats sampling x (via particles)
+  
+  ALWAYS. Provably. No exceptions.
+```
+
+For stochastic volatility:
+- **x** = continuous log-volatility ℓ_t → Kalman handles this optimally
+- **y** = discrete regime r_t → must sample, but only 4 values
+
+RBPF exploits this structure. Standard PF ignores it and pays the price in particles and degeneracy.
+
+---
+
+#### Implementation Details
+
+Standard particle filters sample both continuous (volatility) and discrete (regime) states. With 4 regimes and continuous log-volatility, you need thousands of particles to adequately cover the joint state space.
+
+**The Rao-Blackwell Theorem** tells us: if we can analytically integrate out some variables, the resulting estimator has lower variance.
+
+```
+Standard PF:  Sample (ℓ_t, r_t) jointly
+              → Need ~2000+ particles
+              → High variance in vol estimate
+
+RBPF:         Analytically compute p(ℓ_t | r_t, y_{1:t}) via Kalman filter
+              Sample only r_t (discrete, 4 values)
+              → Need ~200 particles
+              → Exact conditional vol estimate
+```
+
+**How it works:**
+
+```
+For each particle i with regime r_i:
+
+1. KALMAN PREDICT:
+   μ_pred = μ_r + (1-θ_r)(μ_i - μ_r)
+   P_pred = (1-θ_r)² P_i + q_r
+
+2. KALMAN UPDATE (per mixture component k):
+   K = P_pred × H / (H² P_pred + v_k)
+   μ_post = μ_pred + K × (y - H×μ_pred - m_k)
+   P_post = (1 - K×H) × P_pred
+
+3. GPB1 COLLAPSE (10 components → 1):
+   μ_i = Σ_k π_k × μ_post_k
+   P_i = Σ_k π_k × (P_post_k + (μ_post_k - μ_i)²)
+```
+
+The continuous state (μ, P) is tracked **exactly** by the Kalman filter. Particles only represent regime uncertainty.
+
+**Benefits:**
+
+| Aspect | Standard PF | RBPF |
+|--------|-------------|------|
+| Particles needed | 2000+ | **200** |
+| Vol estimate variance | High | **Minimal** (Kalman-optimal) |
+| Regime convergence | Slow | **Fast** (focused sampling) |
+| Memory | O(N × state_dim) | O(N × 2) per regime |
+| Latency @ 200 particles | ~200 μs | **~20 μs** |
+
+The 10x particle reduction comes directly from not wasting particles on the continuous dimension that Kalman handles optimally.
+
+---
+
+## Particle Rejuvenation: APF and PMMH
+
+### The Degeneracy Problem
+
+Standard particle filters suffer from **weight degeneracy**: resampling kills particles that have low weight *now* but would be valuable *later*.
+
+```
+t=99:  Crisis brewing, but current observation still looks calm
+       Particles: [calm, calm, calm, calm, crisis]
+       Weights:   [0.25, 0.25, 0.25, 0.24, 0.01]  ← crisis particle dying
+       
+       Standard resample → kills crisis particle
+       
+t=100: Crisis hits!
+       Filter has no crisis particles → slow adaptation → missed detection
+```
+
+### Auxiliary Particle Filter (APF): 1-Step Lookahead
+
+APF solves this by peeking at the next observation before resampling:
+
+```
+At time t, before resampling:
+
+1. Observe y_{t+1} (available from data stream)
+2. Ask each particle: "How well do you predict this?"
+3. Boost particles that predict well
+4. THEN resample
+
+     Current likelihood      Future likelihood
+           ↓                       ↓
+      ┌─────────┐            ┌─────────┐
+      │ p(y_t)  │     ×      │ p(y_t+1)│^α  =  Combined weights
+      └─────────┘            └─────────┘
+      
+      α = 0.8 → 80% lookahead influence, 20% diversity preservation
+```
+
+**Implementation details:**
+
+```c
+// 3-Component Omori "Shotgun" for lookahead
+// Evaluates peak, tail, and extreme components - catches 5σ events
+
+static const int SHOTGUN_COMPONENTS[3] = {2, 7, 9};  // Peak, tail, extreme
+
+for each particle i:
+    // Predict state to t+1
+    μ_pred = predict(μ_i, regime_i)
+    
+    // Evaluate likelihood under each component, take max
+    max_lik = -∞
+    for k in SHOTGUN_COMPONENTS:
+        lik = log_normal_pdf(y_next, 2*μ_pred + m_k, 4*P_pred + v_k)
+        max_lik = max(max_lik, lik + log_π_k)
+    
+    lookahead_weight[i] = max_lik
+
+// Blend with current weights
+combined[i] = current_weight[i] + 0.8 * lookahead_weight[i]
+```
+
+**Why the "shotgun" approach?**
+
+A single Gaussian says "5σ is impossible" → assigns near-zero weight → kills crisis particles.
+
+The Omori mixture Component 9 (extreme) says "5σ fits me perfectly!" → correct weight → crisis particle survives.
+
+### PMMH: Full Trajectory Learning
+
+Particle Marginal Metropolis-Hastings uses the **entire trajectory** to learn parameters:
+
+```
+For candidate parameters θ*:
+
+1. Run complete particle filter: y_1 → y_2 → ... → y_T
+2. Compute marginal likelihood: p(y_{1:T} | θ*)
+3. Accept θ* with probability:
+   
+   α = min(1, p(y_{1:T} | θ*) × p(θ*) / (p(y_{1:T} | θ) × p(θ)))
+
+4. If accepted: θ ← θ*
+5. Repeat for thousands of iterations
+```
+
+**What PMMH learns:**
+
+| Parameter | Description | Typical Range |
+|-----------|-------------|---------------|
+| μ_vol[r] | Long-run mean per regime | -5.0 to -1.0 |
+| σ_vol[r] | Vol-of-vol per regime | 0.05 to 0.40 |
+| θ[r] | Mean reversion speed | 0.02 to 0.20 |
+| P[r,r'] | Transition probabilities | 0.0 to 1.0 |
+
+### Comparison: APF vs PMMH
+
+| Aspect | APF | PMMH |
+|--------|-----|------|
+| **Lookahead** | 1 step | Full trajectory |
+| **What's rejuvenated** | Particle states | Parameters |
+| **When to use** | Real-time filtering | Offline calibration |
+| **Latency cost** | +2-5 μs/tick | Minutes to hours |
+| **Frequency** | Every tick | Daily/weekly |
+
+### The Unified Insight
+
+> Don't evaluate particles only on the past.
+> Use knowledge of the future to pick survivors.
+
+Standard PF is myopic—it only sees observations up to `t`. 
+
+APF sees `t+1`. PMMH sees the entire trajectory `1:T`.
+
+Both achieve the same goal: **keep particles that will matter**.
+
+---
+
+## RBPF as Change Detector
+
+### The Old Approach: Separate BOCPD
+
+Traditional stacks use Bayesian Online Changepoint Detection as a separate module:
+
+```
+Old Stack:
+  SSA → BOCPD → PF → Kelly
+         ↓       ↓
+     (change) (vol)
+     
+Two models, two sets of assumptions, two things to tune.
+```
+
+**BOCPD's problem:** It assumes a constant hazard rate λ.
+
+```
+P(changepoint at t) = λ    ← Same probability every tick
+```
+
+Markets don't work this way. Volatility clusters. Calm periods persist. Crises cluster.
+
+### The Insight: RBPF Already Computes This
+
+Every signal needed for change detection is a **byproduct of filtering**:
+
+**Signal 1: Surprise (Marginal Likelihood)**
+```c
+marginal_likelihood = Σᵢ wᵢ × p(yₜ | particleᵢ)
+surprise = -log(marginal_likelihood)
+
+Normal tick:  p(y|particles) = 0.30  → surprise = 1.2
+Anomaly:      p(y|particles) = 0.001 → surprise = 6.9  ← CHANGE
+```
+
+This is exactly what BOCPD computes internally. RBPF gets it for free.
+
+**Signal 2: Vol Ratio**
+```c
+vol_ratio = vol_ema_short / vol_ema_long
+
+Stable:     vol_ratio ≈ 1.0
+Vol spike:  vol_ratio > 2.0  ← CHANGE
+Vol crash:  vol_ratio < 0.5  ← CHANGE
+```
+
+**Signal 3: Regime Entropy**
+```c
+regime_entropy = -Σᵣ p(r) × log(p(r))
+
+Confident:  p = [0.90, 0.05, 0.03, 0.02]  → entropy = 0.4
+Uncertain:  p = [0.30, 0.30, 0.20, 0.20]  → entropy = 1.3  ← TRANSITION
+```
+
+**Signal 4: Regime Flip**
+```c
+regime_changed = (current_regime != prev_regime) && (confidence > 0.7)
+```
+
+### The New Stack
+
+```
+New Stack:
+  SSA → RBPF → Kelly
+          │
+          ├── vol_forecast      → position sizing
+          ├── regime            → parameter selection  
+          ├── surprise          → change detection (was BOCPD)
+          ├── vol_ratio         → change confirmation
+          ├── regime_entropy    → uncertainty quantification
+          └── position_scale    → risk multiplier
+```
+
+One filter. All signals. No separate BOCPD.
+
+### RBPF vs BOCPD
+
+| Aspect | BOCPD | RBPF |
+|--------|-------|------|
+| **Core assumption** | Constant hazard λ | None (data-driven) |
+| **Output** | "Something changed" | "Entering regime 3 at 85% confidence" |
+| **Separate model?** | Yes | No (byproduct of filtering) |
+| **Additional latency** | +30-50 μs | **+0 μs** (already computed) |
+| **Detection delay** | 45-69 ticks | **+1 tick** (extreme bypass) |
+| **Memory** | O(T) growing | O(N) fixed |
+
+### The Key Insight
+
+> **Change detection is not a separate problem.**
+>
+> It's a natural output of Bayesian filtering.
+> When the model is surprised, something changed.
+> RBPF already computes this—use it.
+
+The marginal likelihood IS a change detector. RBPF computes it anyway. Wrapping it with thresholds and confirmation windows gives you everything BOCPD provides, plus regime classification, plus volatility tracking, with zero additional latency.
 
 ---
 
