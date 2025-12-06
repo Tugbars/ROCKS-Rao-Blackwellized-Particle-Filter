@@ -19,27 +19,6 @@ A production-grade particle filter implementation using the Kim-Shephard-Chib (1
 | **Latency** | <25μs | **~20μs** ✅ |
 | **Particles Required** | - | **200** (vs 2000+ standard PF) |
 
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     RBPF Trading Pipeline                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   Raw Ticks ──► SSA Filter ──► RBPF-KSC ──► Kelly Criterion ──► Orders │
-│                   │              │              │                       │
-│                   │              │              └─► Position sizing     │
-│                   │              │                                      │
-│                   │              ├─► Log-volatility estimate            │
-│                   │              ├─► Regime classification              │
-│                   │              ├─► Change detection signals           │
-│                   │              └─► Confidence metrics                 │
-│                   │                                                     │
-│                   └─► Noise removal, trend extraction                   │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why Rao-Blackwellization?
