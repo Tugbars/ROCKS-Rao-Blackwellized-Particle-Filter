@@ -1,22 +1,31 @@
 /*
- * MKL Configuration for Intel Hybrid CPUs (14th Gen Raptor Lake, etc.)
+ * MKL Configuration for Low-Latency Quant Trading
  *
- * Cross-platform: Windows (MSVC, MinGW) and Linux (GCC, Clang)
+ * Optimized for Intel Hybrid CPUs (12th-14th Gen) and AMD Ryzen/EPYC
  *
- * Intel 14900KF specifics:
- *   - 8 P-cores (Performance) with HT = 16 threads
- *   - 16 E-cores (Efficient) = 16 threads
- *   - Total: 32 threads, but NOT equal performance
- *   - P-cores: ~2x faster than E-cores for compute workloads
- *   - AVX-512 is DISABLED on consumer chips (use AVX2)
+ * KEY OPTIMIZATIONS FOR <200µs LATENCY:
+ *   1. P-cores only, NO hyperthreading (1t per core, not 2t)
+ *   2. Infinite blocktime (threads never sleep, burn CPU)
+ *   3. DAZ/FTZ enabled (flush denormals to zero)
+ *   4. Core affinity pinning (avoid E-cores and scheduler jitter)
  *
  * Usage:
  *   #include "mkl_config.h"
  *
  *   int main() {
- *       mkl_config_init();  // Call once at startup
+ *       mkl_config_quant_mode(1);  // 1 = verbose
  *       // ... your code ...
  *   }
+ *
+ * OR set environment variables in launch script (more reliable):
+ *
+ *   export KMP_AFFINITY="granularity=fine,compact,1,0"
+ *   export KMP_HW_SUBSET="1s,8c,1t"
+ *   export KMP_BLOCKTIME="infinite"
+ *   export KMP_LIBRARY="turnaround"
+ *   export MKL_ENABLE_INSTRUCTIONS="AVX2"
+ *   export MKL_NUM_THREADS=8
+ *   ./quant_bot
  */
 
 #ifndef MKL_CONFIG_H
@@ -28,38 +37,41 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+
+/* SIMD intrinsics for DAZ/FTZ */
+#include <xmmintrin.h>
+#include <pmmintrin.h>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-// ============================================================================
-// Platform-specific includes and macros
-// ============================================================================
+/* ============================================================================
+ * Platform-specific macros
+ * ============================================================================ */
 
 #ifdef _WIN32
-#include <intrin.h>
-#define MKL_SETENV(name, value) _putenv_s(name, value)
+    #include <intrin.h>
+    #define MKL_SETENV(name, value) _putenv_s(name, value)
 #else
-#define MKL_SETENV(name, value) setenv(name, value, 1)
+    #define MKL_SETENV(name, value) setenv(name, value, 1)
 #endif
 
-// ============================================================================
-// CPU Detection
-// ============================================================================
+/* ============================================================================
+ * CPU Detection
+ * ============================================================================ */
 
-typedef struct
-{
-    int num_p_cores;        // Performance cores
-    int num_e_cores;        // Efficiency cores
-    int threads_per_p_core; // Usually 2 (hyperthreading)
-    int threads_per_e_core; // Usually 1
-    int total_threads;
-    int is_hybrid; // 1 if P+E cores detected
+typedef struct {
+    int num_p_cores;         /* Performance cores (physical) */
+    int num_e_cores;         /* Efficiency cores (physical) */
+    int total_logical;       /* Total logical processors */
+    int is_hybrid;           /* 1 if P+E cores detected */
     int has_avx512;
     int has_avx2;
-    int l3_cache_kb;  // L3 cache size in KB
+    int l3_cache_kb;
     char cpu_name[64];
+    char vendor[16];         /* "GenuineIntel" or "AuthenticAMD" */
 } CPUInfo;
 
 static inline void mkl_cpuid(int info[4], int leaf, int subleaf)
@@ -79,7 +91,14 @@ static CPUInfo detect_cpu(void)
     CPUInfo info = {0};
     int regs[4];
 
-    // Get CPU brand string
+    /* Get vendor string */
+    mkl_cpuid(regs, 0, 0);
+    memcpy(info.vendor, &regs[1], 4);
+    memcpy(info.vendor + 4, &regs[3], 4);
+    memcpy(info.vendor + 8, &regs[2], 4);
+    info.vendor[12] = '\0';
+
+    /* Get CPU brand string */
     mkl_cpuid(regs, 0x80000002, 0);
     memcpy(info.cpu_name, regs, 16);
     mkl_cpuid(regs, 0x80000003, 0);
@@ -87,175 +106,384 @@ static CPUInfo detect_cpu(void)
     mkl_cpuid(regs, 0x80000004, 0);
     memcpy(info.cpu_name + 32, regs, 16);
 
-    // Check for AVX-512
+    /* Check for AVX-512 and AVX2 */
     mkl_cpuid(regs, 7, 0);
-    info.has_avx512 = (regs[1] >> 16) & 1; // AVX-512F
-    info.has_avx2 = (regs[1] >> 5) & 1;    // AVX2
+    info.has_avx512 = (regs[1] >> 16) & 1;
+    info.has_avx2 = (regs[1] >> 5) & 1;
 
-    // Get L3 cache size (approximate)
+    /* Get L3 cache size */
     mkl_cpuid(regs, 0x80000006, 0);
-    info.l3_cache_kb = ((regs[2] >> 18) & 0x3FFF) * 512; // In KB
-    if (info.l3_cache_kb == 0) info.l3_cache_kb = 36 * 1024; // Default 36MB for 14900KF
+    info.l3_cache_kb = ((regs[2] >> 18) & 0x3FFF) * 512;
 
-    // Detect hybrid architecture (12th gen+)
+    /* Detect Intel hybrid architecture (12th gen+) */
+    int is_intel = (strstr(info.vendor, "Intel") != NULL);
+    int is_amd = (strstr(info.vendor, "AMD") != NULL);
+
     mkl_cpuid(regs, 0, 0);
     int max_leaf = regs[0];
 
-    if (max_leaf >= 0x1A)
-    {
+    if (is_intel && max_leaf >= 0x1A) {
         mkl_cpuid(regs, 0x1A, 0);
-        // core_type: 0x20 = Atom/E-core, 0x40 = Core/P-core
-        info.is_hybrid = 1;
-
-        // For 14900KF: 8P + 16E
-        if (strstr(info.cpu_name, "14900") || strstr(info.cpu_name, "14700"))
-        {
+        int core_type = (regs[0] >> 24) & 0xFF;
+        
+        /* Detect based on CPU model */
+        if (strstr(info.cpu_name, "14900") || strstr(info.cpu_name, "14700")) {
+            info.is_hybrid = 1;
             info.num_p_cores = 8;
             info.num_e_cores = 16;
-            info.threads_per_p_core = 2;
-            info.threads_per_e_core = 1;
+            info.l3_cache_kb = 36 * 1024;
         }
-        else if (strstr(info.cpu_name, "13900") || strstr(info.cpu_name, "13700"))
-        {
+        else if (strstr(info.cpu_name, "13900") || strstr(info.cpu_name, "13700")) {
+            info.is_hybrid = 1;
             info.num_p_cores = 8;
             info.num_e_cores = 16;
-            info.threads_per_p_core = 2;
-            info.threads_per_e_core = 1;
+            info.l3_cache_kb = 36 * 1024;
         }
-        else if (strstr(info.cpu_name, "12900") || strstr(info.cpu_name, "12700"))
-        {
+        else if (strstr(info.cpu_name, "12900") || strstr(info.cpu_name, "12700")) {
+            info.is_hybrid = 1;
             info.num_p_cores = 8;
             info.num_e_cores = 8;
-            info.threads_per_p_core = 2;
-            info.threads_per_e_core = 1;
+            info.l3_cache_kb = 30 * 1024;
         }
-        else
-        {
-            // Generic hybrid assumption
+        else if (strstr(info.cpu_name, "12600") || strstr(info.cpu_name, "12400")) {
+            info.is_hybrid = 1;
+            info.num_p_cores = 6;
+            info.num_e_cores = 4;
+            info.l3_cache_kb = 20 * 1024;
+        }
+        else if (core_type == 0x40 || core_type == 0x20) {
+            /* Generic hybrid detection */
+            info.is_hybrid = 1;
             info.num_p_cores = 6;
             info.num_e_cores = 8;
-            info.threads_per_p_core = 2;
-            info.threads_per_e_core = 1;
         }
     }
-    else
-    {
-        // Non-hybrid (older Intel or AMD)
+    else if (is_amd) {
+        /* AMD Ryzen / EPYC - no hybrid, all cores equal */
+        info.is_hybrid = 0;
+        
+        if (strstr(info.cpu_name, "9950X") || strstr(info.cpu_name, "9900X")) {
+            info.num_p_cores = 16;
+            info.num_e_cores = 0;
+            info.l3_cache_kb = 64 * 1024;
+        }
+        else if (strstr(info.cpu_name, "9700X") || strstr(info.cpu_name, "9600X")) {
+            info.num_p_cores = 8;
+            info.num_e_cores = 0;
+            info.l3_cache_kb = 32 * 1024;
+        }
+        else if (strstr(info.cpu_name, "EPYC") && strstr(info.cpu_name, "9575")) {
+            info.num_p_cores = 64;
+            info.num_e_cores = 0;
+            info.l3_cache_kb = 256 * 1024;
+        }
+        else if (strstr(info.cpu_name, "EPYC")) {
+            info.num_p_cores = 64;
+            info.num_e_cores = 0;
+            info.l3_cache_kb = 256 * 1024;
+        }
+        else if (strstr(info.cpu_name, "7950X") || strstr(info.cpu_name, "7900X")) {
+            info.num_p_cores = 16;
+            info.num_e_cores = 0;
+            info.l3_cache_kb = 64 * 1024;
+        }
+        else {
+            /* Generic AMD */
+            mkl_cpuid(regs, 1, 0);
+            int logical = (regs[1] >> 16) & 0xFF;
+            info.num_p_cores = logical / 2;  /* Assume SMT */
+            info.num_e_cores = 0;
+        }
+    }
+    else {
+        /* Unknown/older CPU */
         info.is_hybrid = 0;
         mkl_cpuid(regs, 1, 0);
-        int logical_cores = (regs[1] >> 16) & 0xFF;
-        info.num_p_cores = logical_cores / 2; // Assume HT
-        info.threads_per_p_core = 2;
+        int logical = (regs[1] >> 16) & 0xFF;
+        info.num_p_cores = logical / 2;
+        info.num_e_cores = 0;
     }
 
-    info.total_threads = info.num_p_cores * info.threads_per_p_core +
-                         info.num_e_cores * info.threads_per_e_core;
+    /* Calculate total logical processors */
+    if (info.is_hybrid) {
+        /* Intel hybrid: P-cores have HT, E-cores don't */
+        info.total_logical = info.num_p_cores * 2 + info.num_e_cores;
+    } else {
+        /* AMD or non-hybrid Intel: assume SMT-2 */
+        info.total_logical = info.num_p_cores * 2;
+    }
 
     return info;
 }
 
-// ============================================================================
-// MKL Configuration
-// ============================================================================
+/* ============================================================================
+ * Configuration Modes
+ * ============================================================================ */
 
-typedef enum
-{
-    MKL_CONFIG_AUTO,       // Let MKL decide (may use all cores)
-    MKL_CONFIG_P_CORES,    // Use P-cores only (recommended for compute)
-    MKL_CONFIG_ALL_CORES,  // Use all cores
-    MKL_CONFIG_SEQUENTIAL, // Single-threaded (for small problems)
-    MKL_CONFIG_CUSTOM      // Use MKL_NUM_THREADS environment variable
+typedef enum {
+    MKL_CONFIG_AUTO,         /* Auto-detect optimal settings */
+    MKL_CONFIG_P_CORES,      /* P-cores only (recommended for latency) */
+    MKL_CONFIG_ALL_CORES,    /* All cores (throughput mode) */
+    MKL_CONFIG_SEQUENTIAL,   /* Single-threaded */
+    MKL_CONFIG_CUSTOM        /* Use environment variables */
 } MKLConfigMode;
 
-typedef struct
-{
+typedef enum {
+    MKL_LATENCY_MODE,        /* Optimize for low latency (quant trading) */
+    MKL_THROUGHPUT_MODE      /* Optimize for throughput (backtesting) */
+} MKLOptimizationMode;
+
+typedef struct {
     MKLConfigMode mode;
+    MKLOptimizationMode opt_mode;
     int num_threads;
     int verbose;
+    int daz_ftz_enabled;
     CPUInfo cpu;
 } MKLConfig;
 
 static MKLConfig g_mkl_config = {0};
 
+/* ============================================================================
+ * Denormal Handling (DAZ/FTZ)
+ * 
+ * CRITICAL FOR LOW LATENCY:
+ * Denormal numbers (very small, ~1e-310) trigger microcode traps
+ * that can take 100-1500 cycles instead of ~4 cycles.
+ * 
+ * DAZ = Denormals Are Zero (treat denormal inputs as zero)
+ * FTZ = Flush To Zero (flush denormal results to zero)
+ * ============================================================================ */
+
+static inline void mkl_config_enable_daz_ftz(void)
+{
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+    g_mkl_config.daz_ftz_enabled = 1;
+}
+
+static inline void mkl_config_disable_daz_ftz(void)
+{
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_OFF);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_OFF);
+    g_mkl_config.daz_ftz_enabled = 0;
+}
+
+/* ============================================================================
+ * Thread Affinity Configuration
+ * ============================================================================ */
+
 /*
- * Initialize MKL with optimal settings for the detected CPU.
+ * Configure for P-cores only, NO hyperthreading.
+ * 
+ * WHY NO HYPERTHREADING FOR LOW LATENCY:
+ *   - HT shares L1 cache, execution units between 2 threads
+ *   - Causes cache evictions and resource contention
+ *   - Increases latency variance (jitter)
+ *   - 1 thread per physical core = predictable, stable latency
+ *
+ * KMP_HW_SUBSET="1s,8c,1t":
+ *   - 1s = 1 socket
+ *   - 8c = 8 cores (P-cores only on hybrid)
+ *   - 1t = 1 thread per core (NO hyperthreading)
  */
-static int mkl_config_init_ex(MKLConfigMode mode, int verbose)
+static void mkl_config_set_p_core_affinity_no_ht(int num_p_cores)
+{
+    char subset[32];
+    snprintf(subset, sizeof(subset), "1s,%dc,1t", num_p_cores);
+    
+    MKL_SETENV("KMP_AFFINITY", "granularity=fine,compact,1,0");
+    MKL_SETENV("KMP_HW_SUBSET", subset);
+}
+
+/*
+ * Configure for P-cores with hyperthreading (throughput mode).
+ * Use for backtesting, not live trading.
+ */
+static void mkl_config_set_p_core_affinity_with_ht(int num_p_cores)
+{
+    char subset[32];
+    snprintf(subset, sizeof(subset), "1s,%dc,2t", num_p_cores);
+    
+    MKL_SETENV("KMP_AFFINITY", "granularity=fine,compact,1,0");
+    MKL_SETENV("KMP_HW_SUBSET", subset);
+}
+
+/*
+ * Configure for all cores (E-cores included).
+ * NOT recommended for latency-sensitive code.
+ */
+static void mkl_config_set_all_core_affinity(void)
+{
+    MKL_SETENV("KMP_AFFINITY", "granularity=fine,scatter");
+}
+
+/*
+ * Disable affinity (let OS schedule).
+ */
+static void mkl_config_disable_affinity(void)
+{
+    MKL_SETENV("KMP_AFFINITY", "disabled");
+}
+
+/* ============================================================================
+ * Thread Sleep/Wake Configuration
+ * 
+ * CRITICAL FOR LOW LATENCY:
+ * Default MKL behavior: threads sleep after ~200ms idle
+ * Waking a sleeping thread costs 10-30µs (OS scheduler overhead)
+ * 
+ * For <200µs latency budget, this is unacceptable.
+ * ============================================================================ */
+
+/*
+ * Latency mode: threads NEVER sleep, spin-wait forever.
+ * Burns 100% CPU on worker threads even when idle.
+ * Eliminates wake-up latency entirely.
+ */
+static void mkl_config_set_latency_mode(void)
+{
+    MKL_SETENV("KMP_BLOCKTIME", "infinite");
+    MKL_SETENV("KMP_LIBRARY", "turnaround");
+    g_mkl_config.opt_mode = MKL_LATENCY_MODE;
+}
+
+/*
+ * Throughput mode: threads sleep when idle.
+ * Better for power efficiency and shared systems.
+ * Use for backtesting, research, not live trading.
+ */
+static void mkl_config_set_throughput_mode(void)
+{
+    MKL_SETENV("KMP_BLOCKTIME", "200");
+    MKL_SETENV("KMP_LIBRARY", "throughput");
+    g_mkl_config.opt_mode = MKL_THROUGHPUT_MODE;
+}
+
+/* ============================================================================
+ * Instruction Set Configuration
+ * ============================================================================ */
+
+static void mkl_config_set_instructions(const char* level)
+{
+    if (strcmp(level, "AVX512") == 0) {
+        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX512");
+    }
+    else if (strcmp(level, "AVX2") == 0) {
+        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX2");
+    }
+    else if (strcmp(level, "AVX") == 0) {
+        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX");
+    }
+    else if (strcmp(level, "SSE4_2") == 0) {
+        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "SSE4_2");
+    }
+}
+
+/* ============================================================================
+ * Main Initialization Functions
+ * ============================================================================ */
+
+/*
+ * Initialize with explicit settings.
+ */
+static int mkl_config_init_ex(MKLConfigMode mode, MKLOptimizationMode opt_mode, int verbose)
 {
     g_mkl_config.cpu = detect_cpu();
     g_mkl_config.mode = mode;
+    g_mkl_config.opt_mode = opt_mode;
     g_mkl_config.verbose = verbose;
 
-    CPUInfo *cpu = &g_mkl_config.cpu;
+    CPUInfo* cpu = &g_mkl_config.cpu;
 
-    if (verbose)
-    {
-        printf("=== MKL Configuration ===\n");
-        printf("CPU: %s\n", cpu->cpu_name);
-        printf("Hybrid: %s\n", cpu->is_hybrid ? "Yes" : "No");
-        if (cpu->is_hybrid)
-        {
-            printf("P-cores: %d (x%d threads = %d)\n",
-                   cpu->num_p_cores, cpu->threads_per_p_core,
-                   cpu->num_p_cores * cpu->threads_per_p_core);
-            printf("E-cores: %d (x%d threads = %d)\n",
-                   cpu->num_e_cores, cpu->threads_per_e_core,
-                   cpu->num_e_cores * cpu->threads_per_e_core);
+    if (verbose) {
+        printf("╔═══════════════════════════════════════════════════════════╗\n");
+        printf("║              MKL CONFIGURATION                            ║\n");
+        printf("╠═══════════════════════════════════════════════════════════╣\n");
+        printf("║  CPU: %-52s ║\n", cpu->cpu_name);
+        printf("║  Vendor: %-49s ║\n", cpu->vendor);
+        printf("║  Hybrid: %-49s ║\n", cpu->is_hybrid ? "Yes (P+E cores)" : "No");
+        if (cpu->is_hybrid) {
+            printf("║  P-cores: %-48d ║\n", cpu->num_p_cores);
+            printf("║  E-cores: %-48d ║\n", cpu->num_e_cores);
+        } else {
+            printf("║  Cores: %-50d ║\n", cpu->num_p_cores);
         }
-        printf("Total threads: %d\n", cpu->total_threads);
-        printf("L3 Cache: %d KB\n", cpu->l3_cache_kb);
-        printf("AVX-512: %s\n", cpu->has_avx512 ? "Yes" : "No");
-        printf("AVX2: %s\n", cpu->has_avx2 ? "Yes" : "No");
+        printf("║  L3 Cache: %-47d KB ║\n", cpu->l3_cache_kb);
+        printf("║  AVX-512: %-48s ║\n", cpu->has_avx512 ? "Yes" : "No");
+        printf("║  AVX2: %-51s ║\n", cpu->has_avx2 ? "Yes" : "No");
+        printf("╠═══════════════════════════════════════════════════════════╣\n");
     }
 
-    // Determine thread count
+    /* Determine thread count based on mode */
     int num_threads;
-    switch (mode)
-    {
+    
+    switch (mode) {
     case MKL_CONFIG_SEQUENTIAL:
         num_threads = 1;
         break;
-
+        
     case MKL_CONFIG_P_CORES:
-        num_threads = cpu->num_p_cores * cpu->threads_per_p_core;
-        if (num_threads == 0)
-            num_threads = cpu->total_threads / 2;
+        /* 
+         * For LATENCY mode: 1 thread per P-core (NO hyperthreading)
+         * For THROUGHPUT mode: 2 threads per P-core (with hyperthreading)
+         */
+        if (opt_mode == MKL_LATENCY_MODE) {
+            num_threads = cpu->num_p_cores;
+            mkl_config_set_p_core_affinity_no_ht(cpu->num_p_cores);
+        } else {
+            num_threads = cpu->num_p_cores * 2;
+            mkl_config_set_p_core_affinity_with_ht(cpu->num_p_cores);
+        }
         break;
-
+        
     case MKL_CONFIG_ALL_CORES:
-        num_threads = cpu->total_threads;
+        num_threads = cpu->total_logical;
+        mkl_config_set_all_core_affinity();
         break;
-
+        
     case MKL_CONFIG_CUSTOM:
-    {
-        char *env = getenv("MKL_NUM_THREADS");
-        if (env)
         {
-            num_threads = atoi(env);
+            char* env = getenv("MKL_NUM_THREADS");
+            if (env) {
+                num_threads = atoi(env);
+            } else {
+                num_threads = cpu->num_p_cores;
+            }
         }
-        else
-        {
-            num_threads = cpu->num_p_cores * cpu->threads_per_p_core;
-        }
-    }
-    break;
-
+        break;
+        
     case MKL_CONFIG_AUTO:
     default:
-        if (cpu->is_hybrid)
-        {
-            num_threads = cpu->num_p_cores * cpu->threads_per_p_core;
-        }
-        else
-        {
-            num_threads = cpu->total_threads;
+        if (cpu->is_hybrid) {
+            if (opt_mode == MKL_LATENCY_MODE) {
+                num_threads = cpu->num_p_cores;
+                mkl_config_set_p_core_affinity_no_ht(cpu->num_p_cores);
+            } else {
+                num_threads = cpu->num_p_cores * 2;
+                mkl_config_set_p_core_affinity_with_ht(cpu->num_p_cores);
+            }
+        } else {
+            /* Non-hybrid (AMD, older Intel) */
+            if (opt_mode == MKL_LATENCY_MODE) {
+                num_threads = cpu->num_p_cores;  /* 1 per physical core */
+            } else {
+                num_threads = cpu->num_p_cores * 2;  /* With SMT */
+            }
         }
         break;
     }
 
     g_mkl_config.num_threads = num_threads;
 
-    // Configure MKL
+    /* Set thread blocking behavior */
+    if (opt_mode == MKL_LATENCY_MODE) {
+        mkl_config_set_latency_mode();
+    } else {
+        mkl_config_set_throughput_mode();
+    }
+
+    /* Configure MKL */
     mkl_set_num_threads(num_threads);
     mkl_set_dynamic(0);
 
@@ -263,62 +491,201 @@ static int mkl_config_init_ex(MKLConfigMode mode, int verbose)
     omp_set_num_threads(num_threads);
 #endif
 
-    if (verbose)
-    {
-        printf("MKL threads: %d\n", num_threads);
-        printf("MKL dynamic: disabled\n");
-
-        MKLVersion ver;
-        mkl_get_version(&ver);
-        printf("MKL version: %d.%d.%d (%s)\n",
-               ver.MajorVersion, ver.MinorVersion, ver.UpdateVersion,
-               ver.ProductStatus);
-        printf("=========================\n\n");
+    if (verbose) {
+        printf("║  Mode: %-51s ║\n", 
+               opt_mode == MKL_LATENCY_MODE ? "LATENCY (no HT, no sleep)" : "THROUGHPUT (HT, sleep OK)");
+        printf("║  MKL Threads: %-44d ║\n", num_threads);
+        printf("║  Hyperthreading: %-41s ║\n", 
+               (opt_mode == MKL_LATENCY_MODE) ? "DISABLED" : "ENABLED");
+        printf("║  Thread Sleep: %-43s ║\n",
+               (opt_mode == MKL_LATENCY_MODE) ? "NEVER (busy spin)" : "ENABLED");
+        printf("║  Dynamic Threading: %-38s ║\n", "DISABLED");
+        printf("╚═══════════════════════════════════════════════════════════╝\n\n");
     }
 
     return 0;
 }
 
 /*
- * Initialize MKL with default settings (P-cores only for hybrid CPUs).
+ * Default initialization (auto-detect, throughput mode).
  */
 static int mkl_config_init(void)
 {
-    return mkl_config_init_ex(MKL_CONFIG_AUTO, 0);
+    return mkl_config_init_ex(MKL_CONFIG_AUTO, MKL_THROUGHPUT_MODE, 0);
 }
 
 /*
- * Initialize MKL with verbose output.
+ * Verbose initialization.
  */
 static int mkl_config_init_verbose(void)
 {
-    return mkl_config_init_ex(MKL_CONFIG_AUTO, 1);
+    return mkl_config_init_ex(MKL_CONFIG_AUTO, MKL_THROUGHPUT_MODE, 1);
 }
 
-/*
- * Get optimal thread count for a given problem size.
- */
-static int mkl_config_optimal_threads(int n)
+/* ============================================================================
+ * QUANT MODE - The main function for trading applications
+ * 
+ * Combines all low-latency optimizations:
+ *   1. P-cores only (avoid slow E-cores)
+ *   2. NO hyperthreading (1 thread per physical core)
+ *   3. Infinite blocktime (threads never sleep)
+ *   4. DAZ/FTZ enabled (no denormal traps)
+ *   5. AVX2 instructions (AVX-512 disabled on consumer Intel)
+ * 
+ * Call this ONCE at program start, BEFORE any MKL operations.
+ * ============================================================================ */
+
+static void mkl_config_quant_mode(int verbose)
 {
-    CPUInfo *cpu = &g_mkl_config.cpu;
-    int max_threads = cpu->num_p_cores * cpu->threads_per_p_core;
-    if (max_threads == 0)
-        max_threads = 8;
+    CPUInfo cpu = detect_cpu();
+    g_mkl_config.cpu = cpu;
+    g_mkl_config.verbose = verbose;
+    g_mkl_config.mode = MKL_CONFIG_P_CORES;
+    g_mkl_config.opt_mode = MKL_LATENCY_MODE;
 
-    if (n < 1024)
-        return 1;
-    if (n < 4096)
-        return 2;
-    if (n < 16384)
-        return 4;
-    if (n < 65536)
-        return 8;
-    return max_threads;
+    /* 1. Thread affinity: P-cores only, NO hyperthreading */
+    mkl_config_set_p_core_affinity_no_ht(cpu.num_p_cores);
+
+    /* 2. Thread sleep: NEVER (busy spin) */
+    mkl_config_set_latency_mode();
+
+    /* 3. Instruction set */
+    if (cpu.is_hybrid && strstr(cpu.vendor, "Intel")) {
+        /* Intel 12th-14th gen: AVX-512 is DISABLED in microcode */
+        mkl_config_set_instructions("AVX2");
+    } else if (strstr(cpu.vendor, "AMD") && cpu.has_avx512) {
+        /* AMD EPYC Zen4: AVX-512 works */
+        mkl_config_set_instructions("AVX512");
+    } else if (cpu.has_avx2) {
+        mkl_config_set_instructions("AVX2");
+    }
+
+    /* 4. DAZ/FTZ: Flush denormals to zero */
+    mkl_config_enable_daz_ftz();
+
+    /* 5. Configure MKL threads */
+    int num_threads = cpu.num_p_cores;  /* 1 thread per physical core */
+    g_mkl_config.num_threads = num_threads;
+    
+    mkl_set_num_threads(num_threads);
+    mkl_set_dynamic(0);
+
+#ifdef _OPENMP
+    omp_set_num_threads(num_threads);
+#endif
+
+    /* 6. Memory settings */
+    MKL_SETENV("MKL_FAST_MEMORY_LIMIT", "0");
+
+    if (verbose) {
+        printf("╔═══════════════════════════════════════════════════════════╗\n");
+        printf("║              QUANT MODE ENGAGED                           ║\n");
+        printf("╠═══════════════════════════════════════════════════════════╣\n");
+        printf("║  CPU: %-52s ║\n", cpu.cpu_name);
+        printf("║  Cores: %d P-cores (E-cores ignored)%*s║\n", 
+               cpu.num_p_cores, 26 - (cpu.num_p_cores >= 10 ? 1 : 0), "");
+        printf("║  Threads: %d (1 per physical core, NO HT)%*s║\n", 
+               num_threads, 19 - (num_threads >= 10 ? 1 : 0), "");
+        printf("║  Hyperthreading: DISABLED%33s║\n", "");
+        printf("║  Thread Sleep: NEVER (infinite blocktime)%17s║\n", "");
+        printf("║  DAZ/FTZ: ENABLED (denormals → zero)%22s║\n", "");
+        printf("║  Instructions: %-43s ║\n", 
+               (cpu.is_hybrid && strstr(cpu.vendor, "Intel")) ? "AVX2" :
+               (cpu.has_avx512 ? "AVX-512" : "AVX2"));
+        printf("╠═══════════════════════════════════════════════════════════╣\n");
+        printf("║  WARNING: Threads will burn 100%% CPU even when idle.     ║\n");
+        printf("║           This is intentional for minimum latency.        ║\n");
+        printf("╚═══════════════════════════════════════════════════════════╝\n\n");
+    }
 }
 
 /*
- * Temporarily set thread count for a specific operation.
+ * Throughput mode for backtesting/research.
+ * Uses hyperthreading and allows thread sleep.
  */
+static void mkl_config_throughput_mode(int verbose)
+{
+    CPUInfo cpu = detect_cpu();
+    g_mkl_config.cpu = cpu;
+    g_mkl_config.verbose = verbose;
+    g_mkl_config.mode = MKL_CONFIG_P_CORES;
+    g_mkl_config.opt_mode = MKL_THROUGHPUT_MODE;
+
+    /* P-cores with hyperthreading */
+    mkl_config_set_p_core_affinity_with_ht(cpu.num_p_cores);
+    mkl_config_set_throughput_mode();
+
+    /* Instruction set */
+    if (cpu.is_hybrid && strstr(cpu.vendor, "Intel")) {
+        mkl_config_set_instructions("AVX2");
+    } else if (cpu.has_avx512) {
+        mkl_config_set_instructions("AVX512");
+    } else {
+        mkl_config_set_instructions("AVX2");
+    }
+
+    /* DAZ/FTZ still useful for numerical stability */
+    mkl_config_enable_daz_ftz();
+
+    /* 2 threads per P-core (hyperthreading) */
+    int num_threads = cpu.num_p_cores * 2;
+    g_mkl_config.num_threads = num_threads;
+    
+    mkl_set_num_threads(num_threads);
+    mkl_set_dynamic(0);
+
+#ifdef _OPENMP
+    omp_set_num_threads(num_threads);
+#endif
+
+    if (verbose) {
+        printf("╔═══════════════════════════════════════════════════════════╗\n");
+        printf("║              THROUGHPUT MODE                              ║\n");
+        printf("╠═══════════════════════════════════════════════════════════╣\n");
+        printf("║  CPU: %-52s ║\n", cpu.cpu_name);
+        printf("║  Threads: %d (with hyperthreading)%*s║\n",
+               num_threads, 24 - (num_threads >= 10 ? 1 : 0), "");
+        printf("║  Thread Sleep: ENABLED (power efficient)%18s║\n", "");
+        printf("║  DAZ/FTZ: ENABLED%41s║\n", "");
+        printf("╚═══════════════════════════════════════════════════════════╝\n\n");
+    }
+}
+
+/* ============================================================================
+ * Legacy compatibility functions
+ * ============================================================================ */
+
+/* Original function name - now calls quant_mode */
+static inline void mkl_config_14900kf(int verbose)
+{
+    mkl_config_quant_mode(verbose);
+}
+
+/* Original SSA-specific setup - now calls quant_mode */
+static void mkl_config_ssa_full(int verbose)
+{
+    mkl_config_quant_mode(verbose);
+    
+    if (verbose) {
+        printf("=== SSA Configuration ===\n");
+        printf("Recommendation: Use randomized SVD for k < L/2\n");
+        printf("Memory alignment: 64 bytes\n");
+        printf("=========================\n\n");
+    }
+}
+
+/* Generic setup for unknown CPUs */
+static void mkl_config_generic(int verbose)
+{
+    mkl_config_disable_affinity();
+    mkl_config_enable_daz_ftz();
+    mkl_config_init_ex(MKL_CONFIG_AUTO, MKL_THROUGHPUT_MODE, verbose);
+}
+
+/* ============================================================================
+ * Runtime Thread Control
+ * ============================================================================ */
+
 static void mkl_config_set_threads(int n)
 {
     mkl_set_num_threads(n);
@@ -327,9 +694,6 @@ static void mkl_config_set_threads(int n)
 #endif
 }
 
-/*
- * Restore default thread count.
- */
 static void mkl_config_restore_threads(void)
 {
     mkl_set_num_threads(g_mkl_config.num_threads);
@@ -338,428 +702,89 @@ static void mkl_config_restore_threads(void)
 #endif
 }
 
-// ============================================================================
-// Thread Affinity for Hybrid CPUs
-// ============================================================================
-//
-// BACKGROUND: Intel 12th-14th gen CPUs have two types of cores:
-//
-//   P-cores (Performance):
-//     - High clock speed (~5.5-5.8 GHz on 14900KF)
-//     - Full AVX2/AVX-512 support
-//     - Hyperthreading (2 threads per core)
-//     - Designed for compute-intensive single-threaded work
-//
-//   E-cores (Efficient):
-//     - Lower clock speed (~4.3 GHz on 14900KF)
-//     - Limited SIMD (no AVX-512, slower AVX2)
-//     - No hyperthreading (1 thread per core)
-//     - Designed for background tasks and power efficiency
-//
-// PROBLEM: If MKL spawns threads across both P and E cores, the fast P-cores
-// finish early and wait for slow E-cores. This causes:
-//   - 30-50% performance loss vs P-cores only
-//   - Unpredictable latency (depends on OS scheduler)
-//   - Wasted power (E-cores running at high load)
-//
-// SOLUTION: Pin compute threads to P-cores only.
-//
-// ============================================================================
-
-/*
- * Set thread affinity to P-cores only (RECOMMENDED for SSA).
- *
- * KMP_AFFINITY="granularity=fine,compact,1,0"
- *   - granularity=fine: Bind to specific hardware threads, not just cores
- *   - compact: Pack threads close together for better L3 cache sharing
- *   - 1,0: Offset parameters (socket 1, core 0 start)
- *
- * KMP_HW_SUBSET="8c,2t"
- *   - 8c: Use only 8 cores (the P-cores on 14900KF)
- *   - 2t: Use 2 threads per core (hyperthreading)
- *   - Result: 16 threads on P-cores only, E-cores ignored
- *
- * IMPORTANT: Call BEFORE mkl_config_init() or at program start.
- * Environment variables must be set before MKL initializes its thread pool.
- *
- * Performance impact: +30-50% for compute-bound workloads like SSA
- */
-static void mkl_config_set_p_core_affinity(void)
+static int mkl_config_get_threads(void)
 {
-    MKL_SETENV("KMP_AFFINITY", "granularity=fine,compact,1,0");
-    MKL_SETENV("KMP_HW_SUBSET", "8c,2t");
+    return g_mkl_config.num_threads;
 }
 
-/*
- * Set thread affinity for maximum throughput (all cores).
- *
- * KMP_AFFINITY="granularity=fine,scatter"
- *   - scatter: Spread threads across all cores to maximize memory bandwidth
- *   - Each thread gets its own core (reduces cache contention)
- *
- * When to use:
- *   - Memory-bound workloads (bandwidth > compute)
- *   - Very large datasets that don't fit in cache
- *   - Batch processing many independent signals
- *
- * NOT recommended for SSA because:
- *   - SSA is compute-bound (FFT, BLAS)
- *   - E-cores are 30-40% slower, causing load imbalance
- *   - P-cores idle while waiting for E-cores to finish
- */
-static void mkl_config_set_all_core_affinity(void)
-{
-    MKL_SETENV("KMP_AFFINITY", "granularity=fine,scatter");
-}
+/* ============================================================================
+ * SSA-Specific Thread Tuning
+ * ============================================================================ */
 
-/*
- * Disable thread affinity (let OS schedule).
- *
- * KMP_AFFINITY="disabled"
- *   - OS scheduler decides where threads run
- *   - Threads can migrate between cores
- *
- * When to use:
- *   - Unknown CPU topology
- *   - Shared systems with other active workloads
- *   - Debugging thread-related issues
- *   - When affinity settings cause problems
- *
- * Downsides:
- *   - Unpredictable performance (threads may land on E-cores)
- *   - Cache thrashing when threads migrate
- *   - Higher latency variance
- */
-static void mkl_config_disable_affinity(void)
-{
-    MKL_SETENV("KMP_AFFINITY", "disabled");
-}
-
-// ============================================================================
-// Instruction Set Configuration
-// ============================================================================
-//
-// MKL automatically detects CPU capabilities, but sometimes you need to
-// force a specific instruction set:
-//
-//   AVX-512: Widest vectors (512-bit), best for large problems
-//     - 2x throughput vs AVX2 for vectorizable code
-//     - BUT: Disabled on consumer Intel chips (12th-14th gen desktop)
-//     - Only available on: Xeon, i9-10980XE, i7-11xxxH (Tiger Lake H)
-//
-//   AVX2: Standard wide vectors (256-bit), universally supported
-//     - Available on all modern x86 CPUs (Intel 4th gen+, AMD Zen+)
-//     - Best choice for 14900KF and similar desktop chips
-//     - Good balance of throughput and clock speed
-//
-//   AVX: Older 256-bit (no FMA), rarely needed
-//
-//   SSE4.2: Baseline 128-bit, for ancient CPUs or compatibility
-//
-// IMPORTANT: Using AVX-512 on a CPU where it's disabled will cause MKL
-// to silently fall back, but may affect scheduling decisions. Always
-// match the setting to actual hardware capabilities.
-//
-// ============================================================================
-
-/*
- * Force specific instruction set.
- *
- * Recommended settings by CPU:
- *   - Intel 12th-14th gen desktop (i5/i7/i9-12xxx/13xxx/14xxx): "AVX2"
- *   - Intel Xeon (Skylake-X, Ice Lake, Sapphire Rapids): "AVX512"
- *   - Intel 10th-11th gen mobile (Tiger Lake H): "AVX512"
- *   - AMD Ryzen (Zen 2/3/4): "AVX2"
- *   - AMD EPYC (Zen 4): "AVX512"
- *   - Older CPUs or VMs: "SSE4_2" or "AVX"
- *
- * NOTE: 14900KF reports AVX-512 in CPUID but Intel DISABLED it in microcode.
- * Using AVX-512 code on 14900KF will crash or trigger illegal instruction.
- * Always use "AVX2" for consumer Alder Lake / Raptor Lake chips.
- */
-static void mkl_config_set_instructions(const char *level)
-{
-    if (strcmp(level, "AVX512") == 0)
-    {
-        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX512");
-    }
-    else if (strcmp(level, "AVX2") == 0)
-    {
-        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX2");
-    }
-    else if (strcmp(level, "AVX") == 0)
-    {
-        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX");
-    }
-    else if (strcmp(level, "SSE4_2") == 0)
-    {
-        MKL_SETENV("MKL_ENABLE_INSTRUCTIONS", "SSE4_2");
-    }
-}
-
-// ============================================================================
-// Verbose/Debug Mode
-// ============================================================================
-
-/*
- * Enable MKL verbose mode - prints every MKL call with timing info.
- *
- * Output example:
- *   MKL_VERBOSE DFTI 123.45ms dft_r2c_1d_n16384
- *   MKL_VERBOSE BLAS 0.02ms dgemm_nn_m64_n64_k1024
- *
- * Useful for:
- *   - Identifying which MKL calls are slow
- *   - Verifying correct function dispatch (AVX2 vs SSE)
- *   - Profiling without external tools
- *
- * WARNING: Significant overhead. Never enable in production.
- */
-static void mkl_config_enable_verbose(void)
-{
-    MKL_SETENV("MKL_VERBOSE", "1");
-}
-
-/*
- * Enable Conditional Bitwise Reproducibility (CBWR).
- *
- * MKL_CBWR="AUTO,STRICT"
- *   - AUTO: MKL chooses optimal code path for this CPU
- *   - STRICT: Results must be bitwise identical across runs
- *
- * Why this matters:
- *   - Floating point order of operations affects results
- *   - Parallel reductions can sum in different orders
- *   - Without CBWR, you may get slightly different results each run
- *
- * Trade-off: STRICT mode may disable some optimizations.
- * Use for: Testing, validation, reproducible research.
- */
-static void mkl_config_check_alignment(void)
-{
-    MKL_SETENV("MKL_CBWR", "AUTO,STRICT");
-}
-
-// ============================================================================
-// SSA-SPECIFIC CONFIGURATION
-// ============================================================================
-//
-// SSA (Singular Spectrum Analysis) has unique workload characteristics
-// that differ from typical MKL use cases (large matrix multiply, etc.):
-//
-// DECOMPOSITION PHASE:
-//   - Many sequential Hankel matvec operations (FFT-based)
-//   - Power iteration has sequential dependencies (iter N needs iter N-1)
-//   - QR factorization in randomized SVD (parallelizes well)
-//   - Many small BLAS calls (dgemv for orthogonalization)
-//
-// RECONSTRUCTION PHASE:
-//   - Embarrassingly parallel across components (can use threads)
-//   - Single FFT + accumulation per group (one IFFT at end)
-//   - Memory-bound for large N (streaming access pattern)
-//
-// W-CORRELATION PHASE:
-//   - Compute-bound dsyrk operation (parallelizes very well)
-//   - Matrix size is k×k where k = number of components (usually 10-100)
-//
-// KEY INSIGHT: MKL threading helps in different amounts per phase:
-//
-//   Operation          | Threading Benefit | Why
-//   -------------------|-------------------|----------------------------------
-//   Small FFT (<4K)    | NEGATIVE          | Thread spawn > compute time
-//   Large FFT (>16K)   | Moderate (2-4x)   | FFT has limited parallelism
-//   dgemv              | None              | Memory-bound, not compute-bound
-//   dgemm              | Good (4-8x)       | Compute-bound, parallelizes well
-//   dsyrk              | Good (4-8x)       | Compute-bound, parallelizes well
-//   QR factorization   | Moderate (2-4x)   | Sequential bottleneck in panel
-//
-// RECOMMENDATION: Use adaptive threading - different thread counts for
-// different phases based on problem size.
-//
-// ============================================================================
-
-typedef enum
-{
-    SSA_WORKLOAD_DECOMPOSE,    // Power iteration / randomized SVD
-    SSA_WORKLOAD_RECONSTRUCT,  // FFT-based reconstruction
-    SSA_WORKLOAD_WCORR,        // W-correlation (dsyrk heavy)
-    SSA_WORKLOAD_FORECAST      // LRF forecasting
+typedef enum {
+    SSA_WORKLOAD_DECOMPOSE,
+    SSA_WORKLOAD_RECONSTRUCT,
+    SSA_WORKLOAD_WCORR,
+    SSA_WORKLOAD_FORECAST
 } SSAWorkloadType;
 
-/*
- * Get optimal thread count for SSA operation based on problem size.
- *
- * Parameters:
- *   N: signal length (determines FFT size)
- *   L: window length (determines matrix dimensions L × K)
- *   k: number of components (determines BLAS problem sizes)
- *   workload: which SSA phase we're optimizing for
- *
- * Returns: Recommended thread count for MKL
- *
- * Tuning rationale:
- *
- *   DECOMPOSE: Limited by sequential dependencies in power iteration.
- *     - L < 1K: Single thread (overhead dominates)
- *     - L < 4K: 2 threads (QR benefits slightly)
- *     - L < 16K: 4 threads (dgemm in randomized SVD)
- *     - L >= 16K: 8 threads max (diminishing returns)
- *
- *   RECONSTRUCT: Single FFT at end, mostly memory-bound.
- *     - FFT < 8K: Single thread (spawn overhead)
- *     - FFT < 32K: 2 threads
- *     - FFT >= 32K: 4 threads (FFT doesn't scale beyond this)
- *
- *   WCORR: dsyrk is compute-bound, scales well with threads.
- *     - k < 10: Single thread (matrix too small)
- *     - k < 50: 4 threads
- *     - k >= 50: All P-core threads
- *
- *   FORECAST: Trivial computation, always single thread.
- */
 static int mkl_config_ssa_threads(int N, int L, int k, SSAWorkloadType workload)
 {
-    CPUInfo *cpu = &g_mkl_config.cpu;
-    int p_threads = cpu->num_p_cores * cpu->threads_per_p_core;
-    if (p_threads == 0) p_threads = 8;
+    int p_cores = g_mkl_config.cpu.num_p_cores;
+    if (p_cores == 0) p_cores = 8;
+
+    /* In latency mode, we use 1 thread per core (no HT) */
+    int max_threads = (g_mkl_config.opt_mode == MKL_LATENCY_MODE) 
+                      ? p_cores 
+                      : p_cores * 2;
 
     int fft_len = 1;
     while (fft_len < N) fft_len <<= 1;
 
-    switch (workload)
-    {
+    switch (workload) {
     case SSA_WORKLOAD_DECOMPOSE:
-        // Power iteration: sequential dependencies limit parallelism
-        // But QR and dgemm benefit from threads
-        if (L < 1024) return 1;          // Small L: overhead > benefit
+        if (L < 1024) return 1;
         if (L < 4096) return 2;
         if (L < 16384) return 4;
-        return p_threads > 8 ? 8 : p_threads;  // Cap at 8 for diminishing returns
+        return (max_threads > 8) ? 8 : max_threads;
 
     case SSA_WORKLOAD_RECONSTRUCT:
-        // Single FFT + accumulation
-        // FFT threading only helps for large sizes
-        if (fft_len < 8192) return 1;    // Small FFT: single thread wins
+        if (fft_len < 8192) return 1;
         if (fft_len < 32768) return 2;
-        return 4;  // FFT doesn't scale well beyond 4 threads
+        return 4;
 
     case SSA_WORKLOAD_WCORR:
-        // dsyrk is compute-bound, scales well
         if (k < 10) return 1;
         if (k < 50) return 4;
-        return p_threads;
+        return max_threads;
 
     case SSA_WORKLOAD_FORECAST:
-        // Very light workload
         return 1;
 
     default:
-        return p_threads;
+        return max_threads;
     }
 }
 
-/*
- * Configure MKL for SSA decomposition phase.
- */
 static void mkl_config_ssa_decompose(int N, int L, int k)
 {
     int threads = mkl_config_ssa_threads(N, L, k, SSA_WORKLOAD_DECOMPOSE);
     mkl_set_num_threads(threads);
-    
-    if (g_mkl_config.verbose)
-    {
-        printf("[MKL] SSA decompose: N=%d, L=%d, k=%d -> %d threads\n", 
-               N, L, k, threads);
-    }
 }
 
-/*
- * Configure MKL for SSA reconstruction phase.
- */
 static void mkl_config_ssa_reconstruct(int N, int n_group)
 {
     int threads = mkl_config_ssa_threads(N, 0, n_group, SSA_WORKLOAD_RECONSTRUCT);
     mkl_set_num_threads(threads);
-    
-    if (g_mkl_config.verbose)
-    {
-        printf("[MKL] SSA reconstruct: N=%d, n_group=%d -> %d threads\n", 
-               N, n_group, threads);
-    }
 }
 
-/*
- * Configure MKL for W-correlation computation.
- */
 static void mkl_config_ssa_wcorr(int N, int k)
 {
     int threads = mkl_config_ssa_threads(N, 0, k, SSA_WORKLOAD_WCORR);
     mkl_set_num_threads(threads);
-    
-    if (g_mkl_config.verbose)
-    {
-        printf("[MKL] SSA wcorr: N=%d, k=%d -> %d threads\n", 
-               N, k, threads);
-    }
 }
 
-// ============================================================================
-// MEMORY CONFIGURATION FOR SSA
-// ============================================================================
-//
-// Memory alignment and cache behavior significantly impact SSA performance:
-//
-// ALIGNMENT:
-//   - AVX2 loads/stores are fastest when 32-byte aligned
-//   - AVX-512 needs 64-byte alignment
-//   - Cache lines are 64 bytes on Intel
-//   - Using 64-byte alignment covers all cases
-//
-// CACHE HIERARCHY (14900KF):
-//   - L1 Data: 48KB per P-core, 32KB per E-core
-//   - L2: 2MB per P-core, 4MB shared per 4 E-cores
-//   - L3: 36MB shared across all cores
-//
-// SSA MEMORY ACCESS PATTERNS:
-//   - FFT: Mostly sequential with some butterfly jumps
-//   - Hankel matvec: Streaming access (good prefetch)
-//   - Power iteration: Small working set (fits in L2)
-//   - Reconstruction: Streaming accumulation (memory-bound)
-//
-// WHEN PROBLEM FITS IN L3:
-//   - All data stays in cache across operations
-//   - 2-3x faster than going to main memory
-//   - For SSA: L3 fit happens when N×L×k×8 < 36MB
-//
-// ============================================================================
+/* ============================================================================
+ * Memory Configuration
+ * ============================================================================ */
 
-/*
- * Recommended alignment for SSA buffers.
- * 64 bytes = cache line size = optimal for AVX-512 (if available) and AVX2
- */
 #define SSA_MEM_ALIGN 64
 
-/*
- * Check if a pointer is properly aligned for SIMD operations.
- * Misaligned pointers cause ~20% slowdown on AVX2 loads/stores.
- */
-static inline int mkl_config_is_aligned(const void *ptr)
+static inline int mkl_config_is_aligned(const void* ptr)
 {
     return ((uintptr_t)ptr & (SSA_MEM_ALIGN - 1)) == 0;
 }
 
-/*
- * Estimate memory requirement for SSA decomposition.
- *
- * Returns bytes needed for a given N, L, k.
- * Use this to check if problem fits in cache or plan memory allocation.
- *
- * Memory breakdown:
- *   - U matrix: L × k doubles
- *   - V matrix: K × k doubles (K = N - L + 1)
- *   - FFT workspace: ~4 × fft_len doubles
- *   - Batch workspace: ~32 × fft_len doubles (for block methods)
- */
 static size_t mkl_config_ssa_memory_estimate(int N, int L, int k)
 {
     int K = N - L + 1;
@@ -768,191 +793,62 @@ static size_t mkl_config_ssa_memory_estimate(int N, int L, int k)
     int r2c_len = fft_len / 2 + 1;
 
     size_t mem = 0;
-    
-    // Core arrays
-    mem += L * k * sizeof(double);           // U
-    mem += K * k * sizeof(double);           // V
-    mem += k * sizeof(double);               // sigma
-    mem += k * sizeof(double);               // eigenvalues
-    mem += N * sizeof(double);               // inv_diag_count
-    
-    // FFT workspace
-    mem += 2 * r2c_len * sizeof(double);     // fft_x
-    mem += fft_len * sizeof(double);         // ws_real
-    mem += 2 * r2c_len * sizeof(double);     // ws_complex
-    mem += fft_len * sizeof(double);         // ws_real2
-    mem += k * sizeof(double);               // ws_proj
-    
-    // Batch workspace (assuming batch size 32)
-    mem += 32 * fft_len * sizeof(double);    // ws_batch_real
-    mem += 32 * 2 * r2c_len * sizeof(double); // ws_batch_complex
+    mem += L * k * sizeof(double);
+    mem += K * k * sizeof(double);
+    mem += k * sizeof(double) * 2;
+    mem += N * sizeof(double);
+    mem += 2 * r2c_len * sizeof(double);
+    mem += fft_len * sizeof(double) * 2;
+    mem += 2 * r2c_len * sizeof(double);
+    mem += k * sizeof(double);
+    mem += 32 * fft_len * sizeof(double);
+    mem += 32 * 2 * r2c_len * sizeof(double);
     
     return mem;
 }
 
-/*
- * Check if SSA problem fits in L3 cache.
- *
- * Returns 1 if problem fits with 2x headroom (for FFT scratch).
- * When problem fits in L3, expect 2-3x better performance.
- *
- * Typical L3 sizes:
- *   - 14900KF: 36 MB → fits N=10K, L=2500, k=50
- *   - 13900K:  36 MB
- *   - 12900K:  30 MB
- *   - Ryzen 9: 64 MB → fits larger problems
- */
 static int mkl_config_fits_in_cache(int N, int L, int k)
 {
     size_t mem = mkl_config_ssa_memory_estimate(N, L, k);
     size_t l3_bytes = (size_t)g_mkl_config.cpu.l3_cache_kb * 1024;
-    
-    // Want at least 2x headroom for FFT scratch
     return mem * 2 < l3_bytes;
 }
 
-// ============================================================================
-// FFT-SPECIFIC TUNING
-// ============================================================================
-//
-// FFT parallelism is fundamentally different from matrix operations:
-//
-// HOW FFT PARALLELISM WORKS:
-//   - FFT is computed in log₂(N) stages
-//   - Each stage has N/2 independent butterfly operations
-//   - Stages must be synchronized (barrier between stages)
-//   - More threads = more synchronization overhead
-//
-// WHY FFT DOESN'T SCALE WELL:
-//   - Synchronization at each stage limits speedup
-//   - Memory bandwidth becomes bottleneck (random access pattern)
-//   - For small FFTs, thread spawn time > compute time
-//
-// EMPIRICAL RESULTS (14900KF, MKL 2024):
-//
-//   FFT Length | 1 thread | 2 threads | 4 threads | 8 threads
-//   -----------|----------|-----------|-----------|----------
-//   1K         | 2 µs     | 3 µs      | 5 µs      | 8 µs      ← slower!
-//   4K         | 8 µs     | 6 µs      | 6 µs      | 7 µs
-//   16K        | 35 µs    | 22 µs     | 18 µs     | 19 µs
-//   64K        | 150 µs   | 90 µs     | 60 µs     | 55 µs
-//   256K       | 700 µs   | 400 µs    | 250 µs    | 180 µs
-//
-// CONCLUSION: For SSA's typical FFT sizes (4K-32K), use 1-4 threads max.
-//
-// ============================================================================
+/* ============================================================================
+ * FFT Thread Tuning
+ * ============================================================================ */
 
-/*
- * Get optimal thread count for a given FFT length.
- *
- * Based on empirical testing - balances compute vs. overhead.
- * These thresholds work well for MKL on Intel desktop CPUs.
- */
 static int mkl_config_fft_threads(int fft_len)
 {
-    if (fft_len < 4096) return 1;     // Thread overhead dominates
-    if (fft_len < 16384) return 2;    // Slight benefit from 2 threads
-    if (fft_len < 65536) return 4;    // Good scaling up to 4
-    return 8;                          // Large FFTs can use more
+    if (fft_len < 4096) return 1;
+    if (fft_len < 16384) return 2;
+    if (fft_len < 65536) return 4;
+    return 8;
 }
 
-/*
- * Set thread limit in FFT descriptor.
- *
- * Call after DftiCreateDescriptor, before DftiCommitDescriptor.
- * This limits threads for this specific FFT plan, not globally.
- *
- * Usage:
- *   DftiCreateDescriptor(&desc, DFTI_DOUBLE, DFTI_REAL, 1, fft_len);
- *   MKL_CONFIG_FFT_SET_THREADS(desc, fft_len);  // <-- Add this
- *   DftiSetValue(desc, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
- *   DftiCommitDescriptor(desc);
- */
 #define MKL_CONFIG_FFT_SET_THREADS(desc, fft_len) \
     DftiSetValue(desc, DFTI_THREAD_LIMIT, mkl_config_fft_threads(fft_len))
 
-// ============================================================================
-// RECOMMENDED SETUP FUNCTIONS
-// ============================================================================
+/* ============================================================================
+ * Debug / Verbose Mode
+ * ============================================================================ */
 
-/*
- * Optimal configuration for Intel 14900KF.
- * Call at program start, BEFORE any MKL operations.
- *
- * What this does:
- *   1. Sets thread affinity to P-cores only (avoids slow E-cores)
- *   2. Forces AVX2 instructions (AVX-512 is disabled on 14900KF)
- *   3. Configures thread count for 16 P-core threads
- *   4. Disables dynamic thread adjustment
- *
- * Expected impact: +30-50% performance vs default MKL settings.
- */
-static inline void mkl_config_14900kf(int verbose)
+static void mkl_config_enable_verbose(void)
 {
-    mkl_config_set_p_core_affinity();
-    mkl_config_set_instructions("AVX2"); // AVX-512 disabled on 14900KF!
-    mkl_config_init_ex(MKL_CONFIG_P_CORES, verbose);
+    MKL_SETENV("MKL_VERBOSE", "1");
 }
 
-/*
- * Full SSA-optimized setup for 14900KF.
- * Combines hardware config with SSA-specific tuning.
- *
- * This is the recommended one-call setup for SSA applications.
- *
- * What this does:
- *   1. All of mkl_config_14900kf() settings
- *   2. Removes fast memory limits (allows MKL to use more scratch space)
- *   3. Reports cache fit estimates in verbose mode
- *
- * Usage:
- *   int main() {
- *       mkl_config_ssa_full(1);  // 1 = verbose output
- *       
- *       // Your SSA code here...
- *       SSA_Opt ssa;
- *       ssa_opt_init(&ssa, signal, N, L);
- *       ssa_opt_decompose_randomized(&ssa, k, 8);
- *       // ...
- *   }
- */
-static void mkl_config_ssa_full(int verbose)
+static void mkl_config_print_status(void)
 {
-    // Hardware setup
-    mkl_config_set_p_core_affinity();
-    mkl_config_set_instructions("AVX2");
-    mkl_config_init_ex(MKL_CONFIG_P_CORES, verbose);
-    
-    // Memory allocation hints
-    // MKL_FAST_MEMORY_LIMIT=0 means no limit on internal scratch memory
-    // This can improve performance for repeated FFT calls
-    MKL_SETENV("MKL_FAST_MEMORY_LIMIT", "0");
-    
-    if (verbose)
-    {
-        printf("\n=== SSA Configuration ===\n");
-        printf("Memory alignment: %d bytes\n", SSA_MEM_ALIGN);
-        printf("L3 cache: %d KB\n", g_mkl_config.cpu.l3_cache_kb);
-        printf("FFT threading: adaptive (1-4 threads based on size)\n");
-        printf("Recommendation: Use randomized SVD for k < L/2\n");
-        printf("=========================\n\n");
-    }
+    printf("\n=== MKL Status ===\n");
+    printf("Threads: %d\n", g_mkl_config.num_threads);
+    printf("Mode: %s\n", g_mkl_config.opt_mode == MKL_LATENCY_MODE 
+           ? "LATENCY" : "THROUGHPUT");
+    printf("DAZ/FTZ: %s\n", g_mkl_config.daz_ftz_enabled ? "ON" : "OFF");
+    printf("CPU: %s\n", g_mkl_config.cpu.cpu_name);
+    printf("==================\n\n");
 }
 
-/*
- * Quick setup for non-Intel CPUs (AMD, older Intel).
- *
- * Uses conservative settings that work everywhere:
- *   - No affinity pinning (let OS decide)
- *   - Auto-detect instruction set
- *   - Use all available cores
- */
-static void mkl_config_generic(int verbose)
-{
-    mkl_config_disable_affinity();
-    mkl_config_init_ex(MKL_CONFIG_AUTO, verbose);
-}
+#endif /* SSA_USE_MKL */
 
-#endif // SSA_USE_MKL
-
-#endif // MKL_CONFIG_H
+#endif /* MKL_CONFIG_H */
