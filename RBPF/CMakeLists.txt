@@ -6,16 +6,26 @@
 option(RBPF_USE_DOUBLE "Use double precision (slower but more accurate)" OFF)
 option(RBPF_BUILD_BENCH "Build benchmark executable" ON)
 option(RBPF_BUILD_TESTS "Build test executables" ON)
+option(RBPF_ENABLE_STORVIK "Enable Sleeping Storvik parameter learning" ON)
 
 #───────────────────────────────────────────────────────────────────────────────
 # RBPF Core Library
 #───────────────────────────────────────────────────────────────────────────────
 
-add_library(rbpf_ksc STATIC
+set(RBPF_SOURCES
     rbpf_ksc.c
     rbpf_apf.c
-    rbpf_pipeline.c
 )
+
+# Add Storvik parameter learning if enabled
+if(RBPF_ENABLE_STORVIK)
+    list(APPEND RBPF_SOURCES
+        rbpf_param_learn.c
+        rbpf_ksc_param_integration.c
+    )
+endif()
+
+add_library(rbpf_ksc STATIC ${RBPF_SOURCES})
 
 target_include_directories(rbpf_ksc 
     PUBLIC 
@@ -34,18 +44,34 @@ if(RBPF_USE_DOUBLE)
     target_compile_definitions(rbpf_ksc PUBLIC RBPF_USE_DOUBLE=1)
 endif()
 
+if(RBPF_ENABLE_STORVIK)
+    target_compile_definitions(rbpf_ksc PUBLIC RBPF_ENABLE_STORVIK=1)
+endif()
+
 #───────────────────────────────────────────────────────────────────────────────
 # Test Executables
 #───────────────────────────────────────────────────────────────────────────────
 
 if(RBPF_BUILD_TESTS)
-    # Pipeline comprehensive test (CSV output for Jupyter)
-    add_executable(rbpf_pipeline_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_pipeline_test.c
-    )
-    target_link_libraries(rbpf_pipeline_test PRIVATE rbpf_ksc)
-    target_compile_options(rbpf_pipeline_test PRIVATE ${COMMON_FLAGS})
-    target_compile_definitions(rbpf_pipeline_test PRIVATE ${COMMON_DEFS})
+    # Integration test (Storvik + RBPF-KSC)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_integration.c)
+        add_executable(test_rbpf_integration
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_integration.c
+        )
+        target_link_libraries(test_rbpf_integration PRIVATE rbpf_ksc)
+        target_compile_options(test_rbpf_integration PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_rbpf_integration PRIVATE ${COMMON_DEFS})
+    endif()
+
+    # Param learning standalone test (no MKL dependency in test itself)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_param_learn.c)
+        add_executable(test_param_learn
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_param_learn.c
+        )
+        target_link_libraries(test_param_learn PRIVATE rbpf_ksc)
+        target_compile_options(test_param_learn PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_param_learn PRIVATE ${COMMON_DEFS})
+    endif()
 
     # Scenario tests
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_scenarios.c)
@@ -105,7 +131,7 @@ if(RBPF_BUILD_BENCH)
 endif()
 
 #───────────────────────────────────────────────────────────────────────────────
-# Installation (optional)
+# Installation
 #───────────────────────────────────────────────────────────────────────────────
 
 install(TARGETS rbpf_ksc
@@ -113,8 +139,18 @@ install(TARGETS rbpf_ksc
     LIBRARY DESTINATION lib
 )
 
-install(FILES 
+set(RBPF_HEADERS
     rbpf_ksc.h
     mkl_config.h
+)
+
+if(RBPF_ENABLE_STORVIK)
+    list(APPEND RBPF_HEADERS
+        rbpf_param_learn.h
+        rbpf_ksc_param_integration.h
+    )
+endif()
+
+install(FILES ${RBPF_HEADERS}
     DESTINATION include/rbpf
 )

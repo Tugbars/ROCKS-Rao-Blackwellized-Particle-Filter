@@ -229,6 +229,8 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
         rbpf->lw_sigma_vol_var[r] = RBPF_REAL(0.01);
     }
 
+    rbpf->use_learned_params = 0;
+
     /* MKL fast math mode */
     vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
 
@@ -391,6 +393,7 @@ void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag)
 void rbpf_ksc_enable_liu_west(RBPF_KSC *rbpf, rbpf_real_t shrinkage, int warmup_ticks)
 {
     rbpf->liu_west.enabled = 1;
+    rbpf->use_learned_params = 1;
     rbpf->liu_west.shrinkage = shrinkage;
     rbpf->liu_west.warmup_ticks = warmup_ticks;
     rbpf->liu_west.tick_count = 0;
@@ -411,6 +414,7 @@ void rbpf_ksc_enable_liu_west(RBPF_KSC *rbpf, rbpf_real_t shrinkage, int warmup_
 void rbpf_ksc_disable_liu_west(RBPF_KSC *rbpf)
 {
     rbpf->liu_west.enabled = 0;
+    rbpf->use_learned_params = 0;
     rbpf->liu_west.resample_threshold = RBPF_REAL(0.5); /* Back to normal */
 }
 
@@ -905,7 +909,7 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
- * PREDICT STEP (optimized)
+ * PREDICT STEP (Option B: Decoupled per-particle flag)
  *
  * ℓ_t = (1-θ)ℓ_{t-1} + θμ + η_t,  η_t ~ N(0, q)
  *
@@ -913,10 +917,13 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
  *   μ_pred = (1-θ)μ + θμ_vol
  *   P_pred = (1-θ)²P + q
  *
- * Optimizations:
- *   - Unrolled regime gather (branch prediction friendly for stable regimes)
- *   - Fused arithmetic to reduce VML calls
- *   - Liu-West: uses per-particle parameters when enabled
+ * OPTION B LOGIC:
+ *   Use per-particle parameters if:
+ *   1. Explicitly requested via use_learned_params flag (Storvik Mode), OR
+ *   2. Liu-West is enabled AND warmup is complete (Liu-West Mode)
+ *
+ * This decoupling allows Storvik to populate particle_mu_vol/particle_sigma_vol
+ * without triggering Liu-West's shrinkage/jitter logic in resample.
  *───────────────────────────────────────────────────────────────────────────*/
 
 void rbpf_ksc_predict(RBPF_KSC *rbpf)
@@ -924,8 +931,18 @@ void rbpf_ksc_predict(RBPF_KSC *rbpf)
     const int n = rbpf->n_particles;
     const RBPF_RegimeParams *params = rbpf->params;
     const int n_regimes = rbpf->n_regimes;
-    const int lw_enabled = rbpf->liu_west.enabled &&
-                           (rbpf->liu_west.tick_count >= rbpf->liu_west.warmup_ticks);
+
+    /* OPTION B: Decoupled flag check
+     *
+     * use_learned_params:  Set by external learner (Storvik) or Liu-West enable
+     * liu_west.enabled:    Controls Liu-West UPDATE logic only
+     *
+     * Storvik mode:  use_learned_params=1, liu_west.enabled=0
+     * Liu-West mode: use_learned_params=1, liu_west.enabled=1 (after warmup)
+     */
+    const int use_particles = rbpf->use_learned_params || 
+                              (rbpf->liu_west.enabled && 
+                               rbpf->liu_west.tick_count >= rbpf->liu_west.warmup_ticks);
 
     rbpf_real_t *restrict mu = rbpf->mu;
     rbpf_real_t *restrict var = rbpf->var;
@@ -933,9 +950,9 @@ void rbpf_ksc_predict(RBPF_KSC *rbpf)
     rbpf_real_t *restrict mu_pred = rbpf->mu_pred;
     rbpf_real_t *restrict var_pred = rbpf->var_pred;
 
-    if (lw_enabled)
+    if (use_particles)
     {
-        /* Use per-particle learned parameters */
+        /* Use per-particle learned parameters (Storvik or Liu-West) */
         const rbpf_real_t *particle_mu_vol = rbpf->particle_mu_vol;
         const rbpf_real_t *particle_sigma_vol = rbpf->particle_sigma_vol;
 
@@ -946,7 +963,9 @@ void rbpf_ksc_predict(RBPF_KSC *rbpf)
             rbpf_real_t omt = RBPF_REAL(1.0) - theta;
             rbpf_real_t omt2 = omt * omt;
 
-            /* Per-particle μ_vol and σ_vol */
+            /* Per-particle μ_vol and σ_vol
+             * In Storvik mode: populated by memcpy from Storvik's mu_cached/sigma_cached
+             * In Liu-West mode: populated by Liu-West shrinkage+jitter */
             int idx = i * n_regimes + r;
             rbpf_real_t mv = particle_mu_vol[idx];
             rbpf_real_t sigma_vol = particle_sigma_vol[idx];
@@ -958,7 +977,7 @@ void rbpf_ksc_predict(RBPF_KSC *rbpf)
     }
     else
     {
-        /* Use global regime parameters (original behavior) */
+        /* Use global regime parameters (original behavior - no learning) */
         rbpf_real_t theta_r[RBPF_MAX_REGIMES];
         rbpf_real_t mu_vol_r[RBPF_MAX_REGIMES];
         rbpf_real_t q_r[RBPF_MAX_REGIMES];

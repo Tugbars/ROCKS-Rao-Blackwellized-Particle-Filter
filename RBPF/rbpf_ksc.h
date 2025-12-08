@@ -472,6 +472,8 @@ typedef float rbpf_real_t;
         rbpf_real_t uniform_weight; /* 1/n */
         rbpf_real_t inv_n;
 
+        int use_learned_params;  // 1 = predict reads particle_mu/sigma_vol arrays
+
     } RBPF_KSC;
 
     /**
@@ -784,6 +786,8 @@ typedef float rbpf_real_t;
     /* Debug */
     void rbpf_pipeline_print_config(const RBPF_Pipeline *pipe);
     void rbpf_pipeline_print_signal(const RBPF_Signal *sig);
+
+    void rbpf_ksc_set_learned_params_mode(RBPF_KSC *rbpf, int enable);
 
 #ifdef __cplusplus
 }
