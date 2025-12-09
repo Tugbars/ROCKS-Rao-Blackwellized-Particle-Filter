@@ -72,15 +72,11 @@ static const rbpf_real_t APF_SHOTGUN_LOG_PROB[3] = {
 #define APF_N_SHOTGUN 3
 
 /*─────────────────────────────────────────────────────────────────────────────
- * STATIC STORAGE FOR RESAMPLE INDICES
- *
- * The indices array stores which source particle each new particle came from.
- * This allows external code (Storvik integration) to resample consistently.
+ * NOTE: Static buffer removed for thread safety.
+ * Resample indices are now passed via indices_out parameter.
  *───────────────────────────────────────────────────────────────────────────*/
 
 #define APF_MAX_PARTICLES 2048
-static int apf_resample_indices[APF_MAX_PARTICLES];
-static int apf_last_n_particles = 0;
 
 /*─────────────────────────────────────────────────────────────────────────────
  * APF LOOKAHEAD LIKELIHOOD (FUSED PREDICT + LIKELIHOOD)
@@ -92,6 +88,7 @@ static void apf_compute_lookahead_weights_fused(
     rbpf_real_t *lookahead_log_weights)
 {
     const int n = rbpf->n_particles;
+    const int n_regimes = rbpf->n_regimes;
     const rbpf_real_t H = RBPF_REAL(2.0);
     const rbpf_real_t H2 = RBPF_REAL(4.0);
     const rbpf_real_t NEG_HALF = RBPF_REAL(-0.5);
@@ -100,6 +97,11 @@ static void apf_compute_lookahead_weights_fused(
     const rbpf_real_t *restrict var = rbpf->var;
     const int *restrict regime = rbpf->regime;
     const RBPF_RegimeParams *params = rbpf->params;
+
+    /* FIX: Check if we should use per-particle learned params (Option B) */
+    const int use_particles = rbpf->use_learned_params ||
+                              (rbpf->liu_west.enabled &&
+                               rbpf->liu_west.tick_count >= rbpf->liu_west.warmup_ticks);
 
     rbpf_real_t *restrict S_peak = rbpf->mu_pred;
     rbpf_real_t *restrict S_tail = rbpf->var_pred;
@@ -110,10 +112,24 @@ static void apf_compute_lookahead_weights_fused(
     for (int i = 0; i < n; i++)
     {
         int r = regime[i];
-        rbpf_real_t mu_r = params[r].mu_vol;
         rbpf_real_t theta_r = params[r].theta;
         rbpf_real_t omt = RBPF_REAL(1.0) - theta_r;
-        rbpf_real_t q_r = params[r].q;
+
+        /* FIX: Select correct parameter source */
+        rbpf_real_t mu_r, q_r;
+
+        if (use_particles && rbpf->particle_mu_vol && rbpf->particle_sigma_vol)
+        {
+            int idx = i * n_regimes + r;
+            mu_r = rbpf->particle_mu_vol[idx];
+            rbpf_real_t sigma = rbpf->particle_sigma_vol[idx];
+            q_r = sigma * sigma;
+        }
+        else
+        {
+            mu_r = params[r].mu_vol;
+            q_r = params[r].q;
+        }
 
         rbpf_real_t mu_pred = mu_r + omt * (mu[i] - mu_r);
         rbpf_real_t var_pred = omt * omt * var[i] + q_r * APF_VARIANCE_INFLATION;
@@ -240,12 +256,8 @@ void rbpf_ksc_apf_compute_resample_indices(
         indices_out[i] = j;
     }
 
-    /* Store in static buffer for later retrieval */
-    apf_last_n_particles = n;
-    if (n <= APF_MAX_PARTICLES)
-    {
-        memcpy(apf_resample_indices, indices_out, n * sizeof(int));
-    }
+    /* NOTE: Static buffer removed for thread safety.
+     * Use rbpf_ksc_step_apf_indexed() which returns indices directly. */
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -299,17 +311,19 @@ void rbpf_ksc_apf_apply_resample_indices(
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
- * APF GET LAST RESAMPLE INDICES
+ * APF GET LAST RESAMPLE INDICES (DEPRECATED)
+ *
+ * This function used a static buffer which is not thread-safe.
+ * Use rbpf_ksc_step_apf_indexed() instead, which returns indices directly.
  *───────────────────────────────────────────────────────────────────────────*/
 
 int rbpf_ksc_apf_get_resample_indices(int *indices_out, int max_n)
 {
-    if (apf_last_n_particles == 0)
-        return 0;
-
-    int n = (apf_last_n_particles < max_n) ? apf_last_n_particles : max_n;
-    memcpy(indices_out, apf_resample_indices, n * sizeof(int));
-    return n;
+    (void)indices_out;
+    (void)max_n;
+    /* DEPRECATED: Static buffer removed for thread safety.
+     * Always returns 0. Use rbpf_ksc_step_apf_indexed() instead. */
+    return 0;
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -496,10 +510,23 @@ void rbpf_ksc_step_apf_indexed(
     out->resampled = 1;
     out->apf_triggered = 1;
 
-    /* Step 9: Liu-West */
+    /* Step 9: Liu-West
+     *
+     * TODO: Missing jitter/mutation step!
+     * When Liu-West is enabled, we should call:
+     *   rbpf_ksc_liu_west_compute_stats(rbpf);
+     *   rbpf_ksc_liu_west_resample(rbpf, resample_indices_out);
+     *
+     * This requires making those functions non-static in rbpf_ksc.c
+     * and adding extern declarations here.
+     *
+     * For now, in Storvik mode (use_learned_params=1), liu_west.enabled=0,
+     * so this code path is not taken.
+     */
     if (rbpf->liu_west.enabled)
     {
         rbpf->liu_west.tick_count++;
+        /* WARNING: Jitter not applied! Particles may collapse. */
         for (int r = 0; r < rbpf->n_regimes; r++)
         {
             rbpf_ksc_get_learned_params(rbpf, r,

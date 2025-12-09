@@ -57,14 +57,6 @@ static double get_time_us(void)
  * See rbpf_ksc_option_b.patch for the complete patch.
  *═══════════════════════════════════════════════════════════════════════════*/
 
-#ifndef RBPF_KSC_HAS_LEARNED_PARAMS_MODE
-/* Fallback: directly set the field if setter doesn't exist yet */
-static inline void rbpf_ksc_set_learned_params_mode(RBPF_KSC *rbpf, int enable)
-{
-    rbpf->use_learned_params = enable;
-}
-#endif
-
 /*═══════════════════════════════════════════════════════════════════════════
  * FORWARD DECLARATIONS (static functions used before definition)
  *═══════════════════════════════════════════════════════════════════════════*/
@@ -161,7 +153,7 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     if (mode == RBPF_PARAM_STORVIK)
     {
         /* Enable per-particle param reading, but NOT Liu-West logic */
-        rbpf_ksc_set_learned_params_mode(ext->rbpf, 1);
+        ext->rbpf->use_learned_params = 1;
         /* liu_west.enabled stays 0 (default) - no shrinkage/jitter */
     }
     else if (mode == RBPF_PARAM_LIU_WEST || mode == RBPF_PARAM_HYBRID)
@@ -700,12 +692,21 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
          *
          * CRITICAL FIX: rbpf->particle_mu_vol and particle_sigma_vol must
          * be resampled with the same indices as mu/var/regime!
+         *
+         * OPTIMIZATION: Use stack allocation for typical sizes to avoid malloc.
+         * Stack limit: 8KB per array (2048 floats) = 512 particles * 4 regimes
          *═══════════════════════════════════════════════════════════════════*/
         if (output->resampled && rbpf->particle_mu_vol && rbpf->particle_sigma_vol)
         {
-            /* Use scratch space for double buffering */
-            rbpf_real_t *mu_vol_new = (rbpf_real_t *)malloc(n * n_regimes * sizeof(rbpf_real_t));
-            rbpf_real_t *sigma_vol_new = (rbpf_real_t *)malloc(n * n_regimes * sizeof(rbpf_real_t));
+            const int total = n * n_regimes;
+            const int STACK_LIMIT = 2048; /* 8KB per array */
+
+            /* Stack allocation for typical sizes */
+            rbpf_real_t stack_mu[2048];
+            rbpf_real_t stack_sigma[2048];
+
+            rbpf_real_t *mu_vol_new = (total <= STACK_LIMIT) ? stack_mu : (rbpf_real_t *)malloc(total * sizeof(rbpf_real_t));
+            rbpf_real_t *sigma_vol_new = (total <= STACK_LIMIT) ? stack_sigma : (rbpf_real_t *)malloc(total * sizeof(rbpf_real_t));
 
             if (mu_vol_new && sigma_vol_new)
             {
@@ -722,12 +723,16 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
                 }
 
                 /* Copy back */
-                memcpy(rbpf->particle_mu_vol, mu_vol_new, n * n_regimes * sizeof(rbpf_real_t));
-                memcpy(rbpf->particle_sigma_vol, sigma_vol_new, n * n_regimes * sizeof(rbpf_real_t));
+                memcpy(rbpf->particle_mu_vol, mu_vol_new, total * sizeof(rbpf_real_t));
+                memcpy(rbpf->particle_sigma_vol, sigma_vol_new, total * sizeof(rbpf_real_t));
             }
 
-            free(mu_vol_new);
-            free(sigma_vol_new);
+            /* Only free if we malloced */
+            if (total > STACK_LIMIT)
+            {
+                free(mu_vol_new);
+                free(sigma_vol_new);
+            }
         }
     }
 
