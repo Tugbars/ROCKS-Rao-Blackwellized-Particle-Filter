@@ -66,6 +66,12 @@ static inline void rbpf_ksc_set_learned_params_mode(RBPF_KSC *rbpf, int enable)
 #endif
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * FORWARD DECLARATIONS (static functions used before definition)
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+static void sync_storvik_to_rbpf(RBPF_Extended *ext);
+
+/*═══════════════════════════════════════════════════════════════════════════
  * LIFECYCLE
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -200,6 +206,10 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
             param_learn_set_prior(&ext->storvik, r, p->mu_vol, p->theta, p->sigma_vol);
         }
         param_learn_broadcast_priors(&ext->storvik);
+
+        /* CRITICAL: Sync Storvik mu_cached → RBPF particle_mu_vol
+         * Without this, first step sees uninitialized arrays → NaN */
+        sync_storvik_to_rbpf(ext);
     }
 
     ext->structural_break_signaled = 0;
@@ -317,11 +327,13 @@ static void extract_particle_info(RBPF_Extended *ext)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * INTERNAL: Push learned params from Storvik to RBPF (Vectorized)
+ * INTERNAL: Sync Storvik learned params → RBPF particle arrays
  *
- * Both arrays use [particle * n_regimes + regime] layout and are contiguous.
- * Direct memcpy is safe because Storvik initializes mu_cached/sigma_cached
- * from priors when n_obs == 0, so copying blindly is correct.
+ * Element-by-element copy with type conversion:
+ *   param_real (double) → rbpf_real_t (float)
+ *
+ * This is safe because Storvik initializes mu_cached/sigma_cached
+ * from priors when n_obs == 0, so copying is always valid.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static void sync_storvik_to_rbpf(RBPF_Extended *ext)
@@ -333,11 +345,16 @@ static void sync_storvik_to_rbpf(RBPF_Extended *ext)
 
     RBPF_KSC *rbpf = ext->rbpf;
     StorvikSoA *soa = &ext->storvik.storvik;
-    size_t total_bytes = (size_t)rbpf->n_particles * rbpf->n_regimes * sizeof(rbpf_real_t);
+    int total = rbpf->n_particles * rbpf->n_regimes;
 
-    /* Direct bulk copy - O(1) vectorized vs O(N×R) scalar */
-    memcpy(rbpf->particle_mu_vol, soa->mu_cached, total_bytes);
-    memcpy(rbpf->particle_sigma_vol, soa->sigma_cached, total_bytes);
+    /* Element-by-element copy with type conversion
+     * CRITICAL: param_real is double, rbpf_real_t is float
+     * memcpy would copy raw double bits into float → garbage/NaN! */
+    for (int i = 0; i < total; i++)
+    {
+        rbpf->particle_mu_vol[i] = (rbpf_real_t)soa->mu_cached[i];
+        rbpf->particle_sigma_vol[i] = (rbpf_real_t)soa->sigma_cached[i];
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════

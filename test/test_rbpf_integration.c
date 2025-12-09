@@ -251,16 +251,23 @@ static void test_basic_update(void)
         0.00f, 0.01f, 0.04f, 0.95f};
     rbpf_ext_build_transition_lut(ext, trans);
 
-    /* Initialize */
+    /* Initialize at calm regime log-vol */
     rbpf_ext_init(ext, -4.6f, 0.1f);
 
     uint64_t stats_before = ext->storvik.total_stat_updates;
 
     /* Run a few updates */
     RBPF_KSC_Output output;
+    memset(&output, 0, sizeof(output));
+
     for (int t = 0; t < 100; t++)
     {
-        rbpf_real_t ret = 0.01f * (rbpf_real_t)test_randn(); /* Simulated return */
+        /* Generate simulated return with ~1% volatility */
+        rbpf_real_t sigma = 0.01f; /* 1% daily vol */
+        rbpf_real_t ret = sigma * (rbpf_real_t)test_randn();
+
+        /* Pass RAW return - rbpf_ksc_step() transforms internally:
+         * y = log(r²) is done inside rbpf_ksc_step() */
         rbpf_ext_step(ext, ret, &output);
     }
 
@@ -268,8 +275,18 @@ static void test_basic_update(void)
 
     ASSERT(stats_after > stats_before, "Storvik stats updated during loop");
     ASSERT(stats_after >= 100 * 100, "At least 100 updates × 100 particles");
-    ASSERT(output.vol_mean > 0, "Vol mean is positive");
-    ASSERT(output.ess > 0, "ESS is positive");
+
+    /* Debug: print output values */
+    printf("  [DEBUG] vol_mean=%.6f, log_vol_mean=%.3f, ess=%.1f, regime=%d\n",
+           (double)output.vol_mean, (double)output.log_vol_mean,
+           (double)output.ess, output.dominant_regime);
+
+    /* vol_mean = E[exp(ℓ)] should be around 0.01 for σ=1% */
+    /* It must be positive (it's a volatility) */
+    ASSERT(output.vol_mean > 0.0f, "Vol mean is positive");
+
+    /* ESS should be positive and reasonable (between 1 and n_particles) */
+    ASSERT(output.ess > 0.0f && output.ess <= 100.0f, "ESS is valid");
 
     /* Check learned params available */
     rbpf_real_t mu_vol, sigma_vol;
@@ -302,7 +319,7 @@ static void test_structural_break(void)
     rbpf_ext_build_transition_lut(ext, trans);
     rbpf_ext_init(ext, -4.6f, 0.1f);
 
-    /* Run normal updates */
+    /* Run normal updates - pass RAW returns */
     RBPF_KSC_Output output;
     for (int t = 0; t < 50; t++)
     {
@@ -316,8 +333,8 @@ static void test_structural_break(void)
     /* Signal structural break */
     rbpf_ext_signal_structural_break(ext);
 
-    /* Next update should trigger sampling */
-    rbpf_real_t ret = 0.05f * (rbpf_real_t)test_randn(); /* Bigger return */
+    /* Next update should trigger sampling - use larger return for "shock" */
+    rbpf_real_t ret = 0.05f * (rbpf_real_t)test_randn();
     rbpf_ext_step(ext, ret, &output);
 
     uint64_t samples_after = ext->storvik.total_samples_drawn;
@@ -467,7 +484,7 @@ static void bench_latency_comparison(void)
     RBPF_KSC_Output output;
     Timer timer;
 
-    /* Warmup */
+    /* Warmup - pass raw returns */
     for (int i = 0; i < WARMUP; i++)
     {
         rbpf_real_t ret = 0.01f * (rbpf_real_t)test_randn();
@@ -515,9 +532,9 @@ static void bench_latency_comparison(void)
 
     printf("  %-15s %10s %15s\n", "Mode", "Latency", "Overhead vs LW");
     printf("  %-15s %10s %15s\n", "----", "-------", "--------------");
-    printf("  %-15s %8.2f μs %15s\n", "Liu-West", avg_lw, "(baseline)");
-    printf("  %-15s %8.2f μs %+14.1f%%\n", "Storvik", avg_sv, 100.0 * (avg_sv - avg_lw) / avg_lw);
-    printf("  %-15s %8.2f μs %+14.1f%%\n", "Hybrid", avg_hyb, 100.0 * (avg_hyb - avg_lw) / avg_lw);
+    printf("  %-15s %8.2f us %15s\n", "Liu-West", avg_lw, "(baseline)");
+    printf("  %-15s %8.2f us %+14.1f%%\n", "Storvik", avg_sv, 100.0 * (avg_sv - avg_lw) / avg_lw);
+    printf("  %-15s %8.2f us %+14.1f%%\n", "Hybrid", avg_hyb, 100.0 * (avg_hyb - avg_lw) / avg_lw);
 
     rbpf_ext_destroy(ext_lw);
     rbpf_ext_destroy(ext_sv);
@@ -569,18 +586,20 @@ static void bench_sleeping_behavior(void)
         ext->rbpf->regime[i] = 0;
     }
 
-    /* Warmup */
+    /* Warmup - pass raw returns */
     for (int i = 0; i < 100; i++)
     {
-        rbpf_ext_step(ext, 0.01f * (rbpf_real_t)test_randn(), &output);
+        rbpf_real_t ret = 0.01f * (rbpf_real_t)test_randn();
+        rbpf_ext_step(ext, ret, &output);
     }
 
     double total_r0 = 0;
     uint64_t samples_r0_start = ext->storvik.total_samples_drawn;
     for (int i = 0; i < N_ITERS; i++)
     {
+        rbpf_real_t ret = 0.01f * (rbpf_real_t)test_randn();
         timer_start(&timer);
-        rbpf_ext_step(ext, 0.01f * (rbpf_real_t)test_randn(), &output);
+        rbpf_ext_step(ext, ret, &output);
         total_r0 += timer_stop_us(&timer);
     }
     uint64_t samples_r0 = ext->storvik.total_samples_drawn - samples_r0_start;
@@ -595,18 +614,20 @@ static void bench_sleeping_behavior(void)
         ext->rbpf->regime[i] = 3;
     }
 
-    /* Warmup */
+    /* Warmup - pass raw returns */
     for (int i = 0; i < 100; i++)
     {
-        rbpf_ext_step(ext, 0.05f * (rbpf_real_t)test_randn(), &output);
+        rbpf_real_t ret = 0.05f * (rbpf_real_t)test_randn();
+        rbpf_ext_step(ext, ret, &output);
     }
 
     double total_r3 = 0;
     uint64_t samples_r3_start = ext->storvik.total_samples_drawn;
     for (int i = 0; i < N_ITERS; i++)
     {
+        rbpf_real_t ret = 0.05f * (rbpf_real_t)test_randn();
         timer_start(&timer);
-        rbpf_ext_step(ext, 0.05f * (rbpf_real_t)test_randn(), &output);
+        rbpf_ext_step(ext, ret, &output);
         total_r3 += timer_stop_us(&timer);
     }
     uint64_t samples_r3 = ext->storvik.total_samples_drawn - samples_r3_start;
@@ -617,9 +638,9 @@ static void bench_sleeping_behavior(void)
     printf("  Particles: %d, Iterations: %d\n\n", N_PARTICLES, N_ITERS);
     printf("  %-20s %10s %15s %15s\n", "Regime", "Latency", "Samples/iter", "Speedup");
     printf("  %-20s %10s %15s %15s\n", "------", "-------", "------------", "-------");
-    printf("  %-20s %8.2f μs %15.1f %15s\n", "R0 (sleeping)", avg_r0,
+    printf("  %-20s %8.2f us %15.1f %15s\n", "R0 (sleeping)", avg_r0,
            (double)samples_r0 / N_ITERS, "(baseline)");
-    printf("  %-20s %8.2f μs %15.1f %14.1fx\n", "R3 (awake)", avg_r3,
+    printf("  %-20s %8.2f us %15.1f %14.1fx\n", "R3 (awake)", avg_r3,
            (double)samples_r3 / N_ITERS, avg_r3 / avg_r0);
 
     rbpf_ext_destroy(ext);
