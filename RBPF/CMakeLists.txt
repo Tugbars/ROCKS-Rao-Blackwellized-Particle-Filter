@@ -63,6 +63,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_rbpf_integration PRIVATE ${COMMON_DEFS})
     endif()
 
+    # Comprehensive comparison test (Baseline vs Liu-West vs Storvik vs Storvik+APF)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_comparison_test.c)
+        add_executable(rbpf_comparison_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_comparison_test.c
+        )
+        target_link_libraries(rbpf_comparison_test PRIVATE rbpf_ksc)
+        target_compile_options(rbpf_comparison_test PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(rbpf_comparison_test PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Param learning standalone test (no MKL dependency in test itself)
     if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_param_learn.c)
         add_executable(test_param_learn
