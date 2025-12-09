@@ -193,6 +193,9 @@ typedef PARAM_LEARN_REAL param_real;
         int uniform_cursor;    /* Current position in uniform buffer         */
         int buffer_size;       /* Size of each buffer                        */
         uint64_t rng_state[2]; /* xoroshiro128+ state for refill             */
+#ifdef PARAM_LEARN_USE_MKL
+        void *mkl_stream; /* VSLStreamStatePtr - per-instance for thread safety */
+#endif
     } EntropyBuffer;
 
     /*═══════════════════════════════════════════════════════════════════════════
