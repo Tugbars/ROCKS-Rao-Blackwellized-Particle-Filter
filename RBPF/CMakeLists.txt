@@ -22,6 +22,7 @@ if(RBPF_ENABLE_STORVIK)
     list(APPEND RBPF_SOURCES
         rbpf_param_learn.c
         rbpf_ksc_param_integration.c
+        rbpf_tuner.c
     )
 endif()
 
@@ -83,6 +84,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_param_learn PRIVATE ${COMMON_DEFS})
     endif()
 
+    # RBPF Parameter Tuner test
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_tuner.c)
+        add_executable(test_rbpf_tuner
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_tuner.c
+        )
+        target_link_libraries(test_rbpf_tuner PRIVATE rbpf_ksc)
+        target_compile_options(test_rbpf_tuner PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_rbpf_tuner PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Scenario tests
     #if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_scenarios.c)
     #    add_executable(test_rbpf_scenarios
@@ -92,6 +103,7 @@ if(RBPF_BUILD_TESTS)
     #    target_compile_options(test_rbpf_scenarios PRIVATE ${COMMON_FLAGS})
     #    target_compile_definitions(test_rbpf_scenarios PRIVATE ${COMMON_DEFS})
     #endif()
+    
 
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
@@ -158,6 +170,7 @@ if(RBPF_ENABLE_STORVIK)
     list(APPEND RBPF_HEADERS
         rbpf_param_learn.h
         rbpf_ksc_param_integration.h
+        rbpf_tuner.h
     )
 endif()
 
