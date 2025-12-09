@@ -427,7 +427,7 @@ static const char *mode_names[] = {
 static void run_test(SyntheticData *data, TestMode mode, TickRecord *records,
                      double *total_time_us, double *max_latency_us)
 {
-    const int N_PARTICLES = 500;
+    const int N_PARTICLES = 1000;
     const int N_REGIMES = 4;
 
     RBPF_Extended *ext = NULL;
@@ -776,7 +776,7 @@ static void write_summary_csv(const char *filename, SummaryMetrics *metrics, int
 int main(int argc, char **argv)
 {
     int seed = 42;
-    const char *output_dir = "../../test/csv"; /* Default: root/test/csv from Build/Release */
+    const char *output_dir = "../../../test/csv"; /* Default: root/test/csv from Build/Release */
 
     if (argc > 1)
         seed = atoi(argv[1]);

@@ -10,15 +10,17 @@
  *   4. SoA benefit: Compare vs theoretical AoS baseline
  *
  * Build:
- *   gcc -O3 -march=native test_param_learn.c rbpf_param_learn.c -o test_param_learn -lm
+ *   Windows (MSVC):
+ *     cmake --build . --config Release --target test_param_learn
+ *
+ *   Linux (GCC):
+ *     gcc -O3 -march=native test_param_learn.c rbpf_param_learn.c -o test_param_learn -lm
  *
  * With MKL:
  *   gcc -O3 -march=native -DPARAM_LEARN_USE_MKL test_param_learn.c rbpf_param_learn.c -o test_param_learn -lmkl_rt -lm
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
-
-#define _POSIX_C_SOURCE 199309L /* For clock_gettime */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,63 +33,72 @@
 #include "rbpf_param_learn.h"
 
 /*═══════════════════════════════════════════════════════════════════════════
- * TIMING UTILITIES
+ * TIMING UTILITIES (Cross-platform)
  *═══════════════════════════════════════════════════════════════════════════*/
 
-#if defined(__x86_64__) || defined(_M_X64)
-static inline uint64_t rdtsc(void)
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+static double g_timer_freq = 0.0;
+
+static void init_timer(void)
 {
-    unsigned int lo, hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    g_timer_freq = (double)freq.QuadPart / 1e6;
 }
-#define USE_RDTSC 1
+
+static inline double get_time_us(void)
+{
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / g_timer_freq;
+}
+
 #else
-#define USE_RDTSC 0
+#include <sys/time.h>
+
+static void init_timer(void) {}
+
+static inline double get_time_us(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1e6 + (double)tv.tv_usec;
+}
 #endif
 
+/* Simple timer struct for compatibility */
 typedef struct
 {
-    struct timespec start;
-    struct timespec end;
-    uint64_t cycles_start;
-    uint64_t cycles_end;
+    double start_us;
+    double end_us;
 } Timer;
 
 static void timer_start(Timer *t)
 {
-    clock_gettime(CLOCK_MONOTONIC, &t->start);
-#if USE_RDTSC
-    t->cycles_start = rdtsc();
-#endif
+    t->start_us = get_time_us();
 }
 
 static double timer_stop_us(Timer *t)
 {
-    clock_gettime(CLOCK_MONOTONIC, &t->end);
-#if USE_RDTSC
-    t->cycles_end = rdtsc();
-#endif
-    double sec = (t->end.tv_sec - t->start.tv_sec);
-    double nsec = (t->end.tv_nsec - t->start.tv_nsec);
-    return (sec * 1e6) + (nsec / 1000.0);
+    t->end_us = get_time_us();
+    return t->end_us - t->start_us;
 }
 
 static uint64_t timer_cycles(Timer *t)
 {
-#if USE_RDTSC
-    return t->cycles_end - t->cycles_start;
-#else
-    return 0;
-#endif
+    (void)t;
+    return 0; /* Cycles not available on all platforms */
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
  * TEST HELPERS
  *═══════════════════════════════════════════════════════════════════════════*/
 
-#define TEST_PASS "\033[32m✓\033[0m"
-#define TEST_FAIL "\033[31m✗\033[0m"
+#define TEST_PASS "[PASS]"
+#define TEST_FAIL "[FAIL]"
 
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
@@ -113,7 +124,7 @@ static int g_tests_failed = 0;
         double _diff = fabs((double)(a) - (double)(b));                                                     \
         if (_diff <= (tol))                                                                                 \
         {                                                                                                   \
-            printf("  %s %s (%.6f ≈ %.6f)\n", TEST_PASS, msg, (double)(a), (double)(b));                    \
+            printf("  %s %s (%.6f ~ %.6f)\n", TEST_PASS, msg, (double)(a), (double)(b));                    \
             g_tests_passed++;                                                                               \
         }                                                                                                   \
         else                                                                                                \
@@ -137,7 +148,7 @@ static double test_randn(void)
     test_rng_state[1] = (s1 << 37) | (s1 >> 27);
 
     /* Box-Muller */
-    double u1 = (result >> 11) * (1.0 / 9007199254740992.0);
+    double u1 = (double)(result >> 11) * (1.0 / 9007199254740992.0);
 
     s0 = test_rng_state[0];
     s1 = test_rng_state[1];
@@ -146,7 +157,7 @@ static double test_randn(void)
     test_rng_state[0] = ((s0 << 24) | (s0 >> 40)) ^ s1 ^ (s1 << 16);
     test_rng_state[1] = (s1 << 37) | (s1 >> 27);
 
-    double u2 = (result >> 11) * (1.0 / 9007199254740992.0);
+    double u2 = (double)(result >> 11) * (1.0 / 9007199254740992.0);
 
     if (u1 < 1e-15)
         u1 = 1e-15;
@@ -159,7 +170,7 @@ static double test_randn(void)
 
 static void test_initialization(void)
 {
-    printf("\n═══ Test 1: Initialization ═══\n");
+    printf("\n=== Test 1: Initialization ===\n");
 
     ParamLearnConfig cfg = param_learn_config_defaults();
     ParamLearner learner;
@@ -170,10 +181,10 @@ static void test_initialization(void)
     ASSERT_TRUE(learner.n_regimes == 4, "Regime count correct");
     ASSERT_TRUE(learner.storvik_total_size == 800, "Total size = 200*4");
 
-    /* Check SoA arrays allocated */
-    ASSERT_TRUE(learner.storvik.m != NULL, "SoA m array allocated");
-    ASSERT_TRUE(learner.storvik.kappa != NULL, "SoA kappa array allocated");
-    ASSERT_TRUE(learner.storvik.mu_cached != NULL, "SoA mu_cached allocated");
+    /* Check SoA arrays allocated (storvik is double-buffered array) */
+    ASSERT_TRUE(learner.storvik[0].m != NULL, "SoA m array allocated");
+    ASSERT_TRUE(learner.storvik[0].kappa != NULL, "SoA kappa array allocated");
+    ASSERT_TRUE(learner.storvik[0].mu_cached != NULL, "SoA mu_cached allocated");
 
     /* Check entropy buffer */
     ASSERT_TRUE(learner.entropy.normal != NULL, "Entropy normal buffer allocated");
@@ -181,8 +192,8 @@ static void test_initialization(void)
     ASSERT_TRUE(learner.entropy.buffer_size == PL_RNG_BUFFER_SIZE, "Entropy buffer size correct");
 
     /* Check alignment (should be 64-byte for AVX-512) */
-    ASSERT_TRUE(((uintptr_t)learner.storvik.m % 64) == 0, "m array 64-byte aligned");
-    ASSERT_TRUE(((uintptr_t)learner.storvik.kappa % 64) == 0, "kappa array 64-byte aligned");
+    ASSERT_TRUE(((uintptr_t)learner.storvik[0].m % 64) == 0, "m array 64-byte aligned");
+    ASSERT_TRUE(((uintptr_t)learner.storvik[0].kappa % 64) == 0, "kappa array 64-byte aligned");
 
     param_learn_free(&learner);
     printf("\n");
@@ -194,7 +205,7 @@ static void test_initialization(void)
 
 static void test_prior_broadcast(void)
 {
-    printf("═══ Test 2: Prior Broadcast ═══\n");
+    printf("=== Test 2: Prior Broadcast ===\n");
 
     ParamLearnConfig cfg = param_learn_config_defaults();
     ParamLearner learner;
@@ -209,8 +220,8 @@ static void test_prior_broadcast(void)
     /* Broadcast to all particles */
     param_learn_broadcast_priors(&learner);
 
-    /* Check a few particles */
-    StorvikSoA *soa = &learner.storvik;
+    /* Check a few particles (storvik[0] is current buffer) */
+    StorvikSoA *soa = &learner.storvik[0];
     int nr = learner.n_regimes;
 
     /* Particle 0, regime 0 */
@@ -239,7 +250,7 @@ static void test_prior_broadcast(void)
 
 static void test_stat_update(void)
 {
-    printf("═══ Test 3: Stat Update Correctness ═══\n");
+    printf("=== Test 3: Stat Update Correctness ===\n");
 
     ParamLearnConfig cfg = param_learn_config_defaults();
     cfg.sample_interval[0] = 1000; /* Disable sampling to test stats only */
@@ -254,7 +265,7 @@ static void test_stat_update(void)
     param_learn_broadcast_priors(&learner);
 
     /* Create particle info - all in regime 0 */
-    ParticleInfo particles[10];
+    ParticleInfo *particles = (ParticleInfo *)malloc(10 * sizeof(ParticleInfo));
     for (int i = 0; i < 10; i++)
     {
         particles[i].regime = 0;
@@ -264,20 +275,21 @@ static void test_stat_update(void)
         particles[i].weight = 0.1;
     }
 
-    /* Initial state */
-    double kappa_before = learner.storvik.kappa[0];
-    double alpha_before = learner.storvik.alpha[0];
+    /* Initial state (storvik[0] is current buffer) */
+    StorvikSoA *soa = &learner.storvik[0];
+    double kappa_before = soa->kappa[0];
+    double alpha_before = soa->alpha[0];
 
     /* Update */
     param_learn_update(&learner, particles, 10);
 
     /* Check stats updated */
-    double kappa_after = learner.storvik.kappa[0];
-    double alpha_after = learner.storvik.alpha[0];
+    double kappa_after = soa->kappa[0];
+    double alpha_after = soa->alpha[0];
 
     ASSERT_TRUE(kappa_after > kappa_before, "Kappa increased after update");
     ASSERT_TRUE(alpha_after > alpha_before, "Alpha increased after update");
-    ASSERT_TRUE(learner.storvik.n_obs[0] == 1, "n_obs incremented");
+    ASSERT_TRUE(soa->n_obs[0] == 1, "n_obs incremented");
     ASSERT_TRUE(learner.total_stat_updates == 10, "total_stat_updates counted");
 
     /* Multiple updates should accumulate */
@@ -291,9 +303,10 @@ static void test_stat_update(void)
         param_learn_update(&learner, particles, 10);
     }
 
-    ASSERT_TRUE(learner.storvik.n_obs[0] == 101, "n_obs = 101 after 101 updates");
-    ASSERT_TRUE(learner.storvik.kappa[0] > kappa_after, "Kappa keeps increasing");
+    ASSERT_TRUE(soa->n_obs[0] == 101, "n_obs = 101 after 101 updates");
+    ASSERT_TRUE(soa->kappa[0] > kappa_after, "Kappa keeps increasing");
 
+    free(particles);
     param_learn_free(&learner);
     printf("\n");
 }
@@ -304,7 +317,7 @@ static void test_stat_update(void)
 
 static void test_convergence(void)
 {
-    printf("═══ Test 4: Parameter Convergence ═══\n");
+    printf("=== Test 4: Parameter Convergence ===\n");
 
     /* True parameters we're trying to learn */
     const double TRUE_MU = -2.3;
@@ -317,12 +330,12 @@ static void test_convergence(void)
     ParamLearner learner;
     param_learn_init(&learner, &cfg, 50, 4);
 
-    /* Set prior centered near truth (φ is fixed) */
+    /* Set prior centered near truth (phi is fixed) */
     param_learn_set_prior(&learner, 0, -2.0, TRUE_PHI, 0.15);
     param_learn_broadcast_priors(&learner);
 
     /* Generate synthetic data from true model */
-    ParticleInfo particles[50];
+    ParticleInfo *particles = (ParticleInfo *)malloc(50 * sizeof(ParticleInfo));
     double log_vol = TRUE_MU;
     double log_vol_lag;
 
@@ -331,7 +344,7 @@ static void test_convergence(void)
     {
         log_vol_lag = log_vol;
 
-        /* True OU dynamics: ℓ_t = μ + φ(ℓ_{t-1} - μ) + σε */
+        /* True OU dynamics: ell_t = mu + phi(ell_{t-1} - mu) + sigma*eps */
         log_vol = TRUE_MU + TRUE_PHI * (log_vol_lag - TRUE_MU) + TRUE_SIGMA * test_randn();
 
         /* All particles observe same data (testing learning, not filtering) */
@@ -351,15 +364,16 @@ static void test_convergence(void)
     RegimeParams params;
     param_learn_get_params(&learner, 0, 0, &params);
 
-    printf("  True:    μ=%.4f, σ=%.4f\n", TRUE_MU, TRUE_SIGMA);
-    printf("  Learned: μ=%.4f, σ=%.4f\n", params.mu, params.sigma);
-    printf("  Posterior mean: μ=%.4f\n", params.mu_post_mean);
+    printf("  True:    mu=%.4f, sigma=%.4f\n", TRUE_MU, TRUE_SIGMA);
+    printf("  Learned: mu=%.4f, sigma=%.4f\n", params.mu, params.sigma);
+    printf("  Posterior mean: mu=%.4f\n", params.mu_post_mean);
 
-    /* NIG learning is biased by φ - check posterior mean is closer */
-    ASSERT_NEAR(params.mu_post_mean, TRUE_MU, 0.5, "Posterior mean within 0.5 of true μ");
-    ASSERT_NEAR(params.sigma, TRUE_SIGMA, 0.08, "σ converged within 0.08");
+    /* NIG learning is biased by phi - check posterior mean is closer */
+    ASSERT_NEAR(params.mu_post_mean, TRUE_MU, 0.5, "Posterior mean within 0.5 of true mu");
+    ASSERT_NEAR(params.sigma, TRUE_SIGMA, 0.08, "sigma converged within 0.08");
     ASSERT_TRUE(params.n_obs >= 2000, "Sufficient observations accumulated");
 
+    free(particles);
     param_learn_free(&learner);
     printf("\n");
 }
@@ -370,7 +384,7 @@ static void test_convergence(void)
 
 static void test_sleeping(void)
 {
-    printf("═══ Test 5: Sleeping Behavior ═══\n");
+    printf("=== Test 5: Sleeping Behavior ===\n");
 
     ParamLearnConfig cfg = param_learn_config_defaults();
     cfg.sample_interval[0] = 50; /* R0: every 50 ticks */
@@ -382,7 +396,7 @@ static void test_sleeping(void)
     param_learn_init(&learner, &cfg, 100, 4);
     param_learn_broadcast_priors(&learner);
 
-    ParticleInfo particles[100];
+    ParticleInfo *particles = (ParticleInfo *)malloc(100 * sizeof(ParticleInfo));
 
     /* All particles in R0 (calm) */
     for (int i = 0; i < 100; i++)
@@ -401,7 +415,7 @@ static void test_sleeping(void)
         param_learn_update(&learner, particles, 100);
     }
 
-    /* In R0 with interval=50: expect ~2 samples per particle × 100 particles = ~200 */
+    /* In R0 with interval=50: expect ~2 samples per particle x 100 particles = ~200 */
     /* But first tick always samples, so slightly higher */
     printf("  R0 (interval=50): %llu samples over 100 ticks\n",
            (unsigned long long)learner.total_samples_drawn);
@@ -425,6 +439,7 @@ static void test_sleeping(void)
            (unsigned long long)samples_r3);
     ASSERT_TRUE(samples_r3 >= 9000, "R3: Many samples (awake)");
 
+    free(particles);
     param_learn_free(&learner);
     printf("\n");
 }
@@ -435,7 +450,7 @@ static void test_sleeping(void)
 
 static void test_regime_change_trigger(void)
 {
-    printf("═══ Test 6: Regime Change Trigger ═══\n");
+    printf("=== Test 6: Regime Change Trigger ===\n");
 
     ParamLearnConfig cfg = param_learn_config_defaults();
     cfg.sample_interval[0] = 1000; /* Disable interval sampling */
@@ -446,7 +461,7 @@ static void test_regime_change_trigger(void)
     param_learn_init(&learner, &cfg, 10, 4);
     param_learn_broadcast_priors(&learner);
 
-    ParticleInfo particles[10];
+    ParticleInfo *particles = (ParticleInfo *)malloc(10 * sizeof(ParticleInfo));
 
     /* Start in R0 */
     for (int i = 0; i < 10; i++)
@@ -472,9 +487,7 @@ static void test_regime_change_trigger(void)
 
     ASSERT_TRUE(samples_after_100 == samples_after_first, "No samples without regime change");
 
-    /* Now change regime - go to R1 which hasn't been visited yet
-     * Note: First visit to new regime triggers FIRST, not REGIME_CHANGE
-     * This is by design (first obs always samples for cold start) */
+    /* Now change regime - go to R1 which hasn't been visited yet */
     for (int i = 0; i < 10; i++)
     {
         particles[i].regime = 1;
@@ -483,7 +496,7 @@ static void test_regime_change_trigger(void)
 
     param_learn_update(&learner, particles, 10);
 
-    /* Should have sampled on transition (either via FIRST or REGIME_CHANGE) */
+    /* Should have sampled on transition */
     ASSERT_TRUE(learner.total_samples_drawn > samples_after_100, "Samples drawn on regime transition");
     ASSERT_TRUE(learner.total_samples_drawn - samples_after_100 == 10, "All 10 particles sampled on transition");
 
@@ -499,10 +512,11 @@ static void test_regime_change_trigger(void)
 
     param_learn_update(&learner, particles, 10);
 
-    /* This should trigger REGIME_CHANGE (not FIRST, since R0 already has obs) */
+    /* This should trigger REGIME_CHANGE */
     ASSERT_TRUE(learner.samples_triggered_regime > regime_triggers_before, "Regime change triggers counted");
     ASSERT_TRUE(learner.total_samples_drawn > samples_before_back, "Samples drawn on regime change back");
 
+    free(particles);
     param_learn_free(&learner);
     printf("\n");
 }
@@ -513,7 +527,7 @@ static void test_regime_change_trigger(void)
 
 static void test_structural_break_trigger(void)
 {
-    printf("═══ Test 7: Structural Break Trigger ═══\n");
+    printf("=== Test 7: Structural Break Trigger ===\n");
 
     ParamLearnConfig cfg = param_learn_config_defaults();
     cfg.sample_interval[0] = 1000; /* Disable interval sampling */
@@ -523,7 +537,7 @@ static void test_structural_break_trigger(void)
     param_learn_init(&learner, &cfg, 20, 4);
     param_learn_broadcast_priors(&learner);
 
-    ParticleInfo particles[20];
+    ParticleInfo *particles = (ParticleInfo *)malloc(20 * sizeof(ParticleInfo));
     for (int i = 0; i < 20; i++)
     {
         particles[i].regime = 0;
@@ -544,6 +558,7 @@ static void test_structural_break_trigger(void)
     ASSERT_TRUE(learner.samples_triggered_break == 20, "20 structural break triggers");
     ASSERT_TRUE(learner.total_samples_drawn > samples_before, "Samples drawn on break");
 
+    free(particles);
     param_learn_free(&learner);
     printf("\n");
 }
@@ -554,7 +569,7 @@ static void test_structural_break_trigger(void)
 
 static void test_resampling(void)
 {
-    printf("═══ Test 8: Resampling ═══\n");
+    printf("=== Test 8: Resampling ===\n");
 
     ParamLearnConfig cfg = param_learn_config_defaults();
     ParamLearner learner;
@@ -562,7 +577,7 @@ static void test_resampling(void)
     param_learn_broadcast_priors(&learner);
 
     /* Manually set different values for different particles */
-    StorvikSoA *soa = &learner.storvik;
+    StorvikSoA *soa = &learner.storvik[0];
     for (int i = 0; i < 10; i++)
     {
         soa->m[i * 4 + 0] = -2.0 + 0.1 * i; /* Different m for each particle */
@@ -590,7 +605,7 @@ static void test_resampling(void)
 
 static void bench_stat_update(void)
 {
-    printf("═══ Benchmark 1: Stat Update Latency ═══\n");
+    printf("=== Benchmark 1: Stat Update Latency ===\n");
 
     const int N_PARTICLES = 200;
     const int N_REGIMES = 4;
@@ -607,7 +622,7 @@ static void bench_stat_update(void)
     param_learn_init(&learner, &cfg, N_PARTICLES, N_REGIMES);
     param_learn_broadcast_priors(&learner);
 
-    ParticleInfo particles[N_PARTICLES];
+    ParticleInfo *particles = (ParticleInfo *)malloc(N_PARTICLES * sizeof(ParticleInfo));
     for (int i = 0; i < N_PARTICLES; i++)
     {
         particles[i].regime = i % N_REGIMES;
@@ -649,11 +664,12 @@ static void bench_stat_update(void)
 
     printf("  Particles: %d\n", N_PARTICLES);
     printf("  Iterations: %d\n", N_ITERS);
-    printf("  Avg time: %.3f μs\n", avg_us);
+    printf("  Avg time: %.3f us\n", avg_us);
     printf("  Avg cycles: %.0f\n", avg_cycles);
     printf("  Per particle: %.1f ns\n", per_particle_ns);
     printf("  Throughput: %.1f M particles/sec\n", N_PARTICLES / avg_us);
 
+    free(particles);
     param_learn_free(&learner);
     printf("\n");
 }
@@ -664,7 +680,7 @@ static void bench_stat_update(void)
 
 static void bench_full_update(void)
 {
-    printf("═══ Benchmark 2: Full Update (Sampling Every Tick) ═══\n");
+    printf("=== Benchmark 2: Full Update (Sampling Every Tick) ===\n");
 
     const int N_PARTICLES = 200;
     const int N_REGIMES = 4;
@@ -677,7 +693,7 @@ static void bench_full_update(void)
     param_learn_init(&learner, &cfg, N_PARTICLES, N_REGIMES);
     param_learn_broadcast_priors(&learner);
 
-    ParticleInfo particles[N_PARTICLES];
+    ParticleInfo *particles = (ParticleInfo *)malloc(N_PARTICLES * sizeof(ParticleInfo));
     for (int i = 0; i < N_PARTICLES; i++)
     {
         particles[i].regime = i % N_REGIMES;
@@ -715,10 +731,11 @@ static void bench_full_update(void)
 
     printf("  Particles: %d\n", N_PARTICLES);
     printf("  Iterations: %d\n", N_ITERS);
-    printf("  Avg time: %.3f μs (stats + sampling)\n", avg_us);
+    printf("  Avg time: %.3f us (stats + sampling)\n", avg_us);
     printf("  Per particle: %.1f ns\n", per_particle_ns);
     printf("  Throughput: %.1f M particles/sec\n", N_PARTICLES / avg_us);
 
+    free(particles);
     param_learn_free(&learner);
     printf("\n");
 }
@@ -729,7 +746,7 @@ static void bench_full_update(void)
 
 static void bench_sleeping_vs_awake(void)
 {
-    printf("═══ Benchmark 3: Sleeping vs Awake Latency ═══\n");
+    printf("=== Benchmark 3: Sleeping vs Awake Latency ===\n");
 
     const int N_PARTICLES = 200;
     const int N_REGIMES = 4;
@@ -749,7 +766,9 @@ static void bench_sleeping_vs_awake(void)
     param_learn_broadcast_priors(&learner_sleep);
     param_learn_broadcast_priors(&learner_awake);
 
-    ParticleInfo particles_r0[N_PARTICLES], particles_r3[N_PARTICLES];
+    ParticleInfo *particles_r0 = (ParticleInfo *)malloc(N_PARTICLES * sizeof(ParticleInfo));
+    ParticleInfo *particles_r3 = (ParticleInfo *)malloc(N_PARTICLES * sizeof(ParticleInfo));
+
     for (int i = 0; i < N_PARTICLES; i++)
     {
         particles_r0[i].regime = 0;
@@ -794,10 +813,12 @@ static void bench_sleeping_vs_awake(void)
     double avg_sleep = total_sleep / N_ITERS;
     double avg_awake = total_awake / N_ITERS;
 
-    printf("  Sleeping (R0, interval=50): %.3f μs\n", avg_sleep);
-    printf("  Awake (R3, interval=1):     %.3f μs\n", avg_awake);
+    printf("  Sleeping (R0, interval=50): %.3f us\n", avg_sleep);
+    printf("  Awake (R3, interval=1):     %.3f us\n", avg_awake);
     printf("  Speedup when sleeping:      %.1fx\n", avg_awake / avg_sleep);
 
+    free(particles_r0);
+    free(particles_r3);
     param_learn_free(&learner_sleep);
     param_learn_free(&learner_awake);
     printf("\n");
@@ -809,13 +830,13 @@ static void bench_sleeping_vs_awake(void)
 
 static void bench_scaling(void)
 {
-    printf("═══ Benchmark 4: Scaling with Particle Count ═══\n");
+    printf("=== Benchmark 4: Scaling with Particle Count ===\n");
 
     const int particle_counts[] = {50, 100, 200, 500, 1000};
     const int n_counts = sizeof(particle_counts) / sizeof(particle_counts[0]);
     const int N_ITERS = 2000;
 
-    printf("  %-10s %-12s %-12s %-15s\n", "Particles", "Time (μs)", "Per-particle", "Throughput");
+    printf("  %-10s %-12s %-12s %-15s\n", "Particles", "Time (us)", "Per-particle", "Throughput");
     printf("  %-10s %-12s %-12s %-15s\n", "---------", "---------", "------------", "----------");
 
     for (int c = 0; c < n_counts; c++)
@@ -832,7 +853,7 @@ static void bench_scaling(void)
         param_learn_init(&learner, &cfg, np, 4);
         param_learn_broadcast_priors(&learner);
 
-        ParticleInfo *particles = malloc(np * sizeof(ParticleInfo));
+        ParticleInfo *particles = (ParticleInfo *)malloc(np * sizeof(ParticleInfo));
         for (int i = 0; i < np; i++)
         {
             particles[i].regime = i % 4;
@@ -876,16 +897,21 @@ static void bench_scaling(void)
 
 int main(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+
+    init_timer();
+
     printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║     RBPF Parameter Learning: Test & Benchmark Suite          ║\n");
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("================================================================\n");
+    printf("     RBPF Parameter Learning: Test & Benchmark Suite          \n");
+    printf("================================================================\n");
 #ifdef PARAM_LEARN_USE_MKL
-    printf("║  Build: MKL enabled (batch RNG)                              ║\n");
+    printf("  Build: MKL enabled (batch RNG)                              \n");
 #else
-    printf("║  Build: Pure C (no MKL)                                      ║\n");
+    printf("  Build: Pure C (no MKL)                                      \n");
 #endif
-    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    printf("================================================================\n");
 
     /* Run tests */
     test_initialization();
@@ -897,9 +923,9 @@ int main(int argc, char **argv)
     test_structural_break_trigger();
     test_resampling();
 
-    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("===============================================================\n");
     printf("  Tests: %d passed, %d failed\n", g_tests_passed, g_tests_failed);
-    printf("═══════════════════════════════════════════════════════════════\n\n");
+    printf("===============================================================\n\n");
 
     if (g_tests_failed > 0)
     {
@@ -913,9 +939,9 @@ int main(int argc, char **argv)
     bench_sleeping_vs_awake();
     bench_scaling();
 
-    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("===============================================================\n");
     printf("  All tests and benchmarks complete.\n");
-    printf("═══════════════════════════════════════════════════════════════\n\n");
+    printf("===============================================================\n\n");
 
     return 0;
 }
