@@ -27,7 +27,6 @@ A production-grade Rao-Blackwellized particle filter combining:
 - **Regime accuracy**: 70% across calm/crisis/recovery scenarios, without utilizing any change detection algorithm, just by RBPF alone. 
 
 Optimized for Intel CPUs (Haswell+). Tested against 12σ flash crashes and fat-tailed crisis regimes.
-<img width="1187" height="217" alt="Screenshot 2025-12-10 190857" src="https://github.com/user-attachments/assets/df3240c9-80c1-492e-b50d-34b8edad4629" />
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -46,10 +45,10 @@ Optimized for Intel CPUs (Haswell+). Tested against 12σ flash crashes and fat-t
 
 ---
 
-## Architecture
+## Log-Vol Tracking Accuracy:
 
 ```
-
+<img width="1187" height="217" alt="Screenshot 2025-12-10 190857" src="https://github.com/user-attachments/assets/df3240c9-80c1-492e-b50d-34b8edad4629" />
 ```
 
 ### Why Rao-Blackwellization?
