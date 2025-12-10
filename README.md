@@ -3,6 +3,7 @@
 **Real-time stochastic volatility tracking for high-frequency trading**
 
 A production-grade particle filter implementation using the Kim-Shephard-Chib (1998) observation model with Omori et al. (2007) 10-component mixture approximation. Optimized for sub-20μs latency on Intel CPUs.
+<img width="1187" height="217" alt="Screenshot 2025-12-10 190857" src="https://github.com/user-attachments/assets/df3240c9-80c1-492e-b50d-34b8edad4629" />
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
