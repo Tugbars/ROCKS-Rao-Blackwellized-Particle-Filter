@@ -81,6 +81,105 @@ extern "C"
      *═══════════════════════════════════════════════════════════════════════════*/
 
     /*═══════════════════════════════════════════════════════════════════════════
+     * ADAPTIVE FORGETTING (West & Harrison Intervention Model)
+     *
+     * Dynamic forgetting factor based on predictive surprise.
+     *
+     * Theory: When observation likelihood is low, the current parameter set θ
+     * is unlikely to have generated this data. Lower λ reduces effective sample
+     * size, allowing faster adaptation to new regime.
+     *
+     * Signal Options:
+     *   REGIME:             λ = λ_per_regime[r] (baseline only)
+     *   OUTLIER_FRAC:       λ = f(outlier_fraction)
+     *   PREDICTIVE_SURPRISE: λ = f(-log p(y|y_{1:t-1}))  ← Recommended
+     *   COMBINED:           λ = λ_per_regime[r] × (1 - sigmoid(surprise_z))
+     *
+     * Reference: West & Harrison (1997) "Bayesian Forecasting and Dynamic Models"
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Adaptation signal source
+     */
+    typedef enum
+    {
+        ADAPT_SIGNAL_REGIME = 0,          /* λ = λ_per_regime[r] (regime-only baseline) */
+        ADAPT_SIGNAL_OUTLIER_FRAC,        /* λ = f(outlier_ema) */
+        ADAPT_SIGNAL_PREDICTIVE_SURPRISE, /* λ = f(-log likelihood) */
+        ADAPT_SIGNAL_COMBINED             /* Regime baseline × surprise modifier */
+    } RBPF_AdaptSignal;
+
+    /**
+     * Adaptive forgetting configuration
+     */
+    typedef struct
+    {
+        int enabled;
+        RBPF_AdaptSignal signal_source;
+
+        /*───────────────────────────────────────────────────────────────────────
+         * REGIME BASELINE (West & Harrison structural prior)
+         *
+         * Different regimes have different persistence characteristics:
+         *   R0 (Calm):   Long memory, slow parameter drift → high λ
+         *   R3 (Crisis): Short memory, rapid parameter changes → lower λ
+         *─────────────────────────────────────────────────────────────────────*/
+        rbpf_real_t lambda_per_regime[RBPF_MAX_REGIMES];
+
+        /*───────────────────────────────────────────────────────────────────────
+         * PREDICTIVE SURPRISE TRACKING
+         *
+         * Surprise = -log p(y_t | y_{1:t-1})
+         *
+         * We track a baseline EMA of "normal" surprise and compare current
+         * surprise to detect regime breaks vs transient fat tails.
+         *─────────────────────────────────────────────────────────────────────*/
+        rbpf_real_t surprise_baseline;  /* EMA of surprise in normal conditions */
+        rbpf_real_t surprise_var;       /* EMA of surprise variance */
+        rbpf_real_t surprise_ema_alpha; /* Slow adaptation of baseline (0.02-0.05) */
+
+        rbpf_real_t signal_ema;       /* Smoothed current signal (surprise or outlier) */
+        rbpf_real_t signal_ema_alpha; /* Faster reaction to spikes (0.1-0.2) */
+
+        /*───────────────────────────────────────────────────────────────────────
+         * SIGMOID RESPONSE (Continuous Intervention Function)
+         *
+         * Maps z-score to discount amount:
+         *   discount = max_discount / (1 + exp(-steepness × (z - center)))
+         *
+         * This is smoother than hard thresholding and more stable.
+         *─────────────────────────────────────────────────────────────────────*/
+        rbpf_real_t sigmoid_center;    /* Z-score for half-response (2.0) */
+        rbpf_real_t sigmoid_steepness; /* Transition sharpness (1.5-2.5) */
+        rbpf_real_t max_discount;      /* Max reduction from baseline (0.10-0.15) */
+
+        /*───────────────────────────────────────────────────────────────────────
+         * SAFETY BOUNDS
+         *─────────────────────────────────────────────────────────────────────*/
+        rbpf_real_t lambda_floor;   /* Never below this (0.980 → N_eff ≈ 50) */
+        rbpf_real_t lambda_ceiling; /* Never above this (0.9995 → N_eff ≈ 2000) */
+
+        /*───────────────────────────────────────────────────────────────────────
+         * COOLDOWN (prevents oscillation after intervention)
+         *─────────────────────────────────────────────────────────────────────*/
+        int cooldown_ticks;     /* Ticks to hold low λ after spike */
+        int cooldown_remaining; /* Current cooldown counter */
+
+        /*───────────────────────────────────────────────────────────────────────
+         * OUTPUT & DIAGNOSTICS
+         *─────────────────────────────────────────────────────────────────────*/
+        rbpf_real_t lambda_current;   /* Active λ (output) */
+        rbpf_real_t surprise_current; /* Raw surprise this tick */
+        rbpf_real_t surprise_zscore;  /* Standardized surprise */
+        rbpf_real_t discount_applied; /* How much we reduced λ */
+
+        /* Statistics */
+        uint64_t interventions;        /* Times we significantly reduced λ */
+        rbpf_real_t max_surprise_seen; /* For diagnostics */
+
+    } RBPF_AdaptiveForgetting;
+
+    /*═══════════════════════════════════════════════════════════════════════════
      * HAWKES SELF-EXCITING PROCESS
      *
      * Models volatility clustering: "shocks breed shocks"
@@ -179,6 +278,11 @@ extern "C"
          * ROBUST OCSN - 11TH COMPONENT (Optional)
          *─────────────────────────────────────────────────────────────────────*/
         RBPF_RobustOCSN robust_ocsn;
+
+        /*───────────────────────────────────────────────────────────────────────
+         * ADAPTIVE FORGETTING (West & Harrison Intervention)
+         *─────────────────────────────────────────────────────────────────────*/
+        RBPF_AdaptiveForgetting adaptive_forgetting;
 
         /*───────────────────────────────────────────────────────────────────────
          * ASSET PRESET & DIAGNOSTICS
@@ -412,6 +516,140 @@ extern "C"
      * @return Fraction of likelihood explained by outlier component (0-1)
      */
     rbpf_real_t rbpf_ext_get_outlier_fraction(const RBPF_Extended *ext);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * ADAPTIVE FORGETTING (Predictive Surprise)
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Enable adaptive forgetting with default COMBINED mode
+     *
+     * Uses regime baseline × predictive surprise modulation.
+     * This is the recommended configuration for production.
+     *
+     * @param ext  Extended RBPF handle
+     */
+    void rbpf_ext_enable_adaptive_forgetting(RBPF_Extended *ext);
+
+    /**
+     * Enable adaptive forgetting with specific signal source
+     *
+     * @param ext     Extended RBPF handle
+     * @param signal  Signal source (REGIME, OUTLIER_FRAC, PREDICTIVE_SURPRISE, COMBINED)
+     */
+    void rbpf_ext_enable_adaptive_forgetting_mode(RBPF_Extended *ext, RBPF_AdaptSignal signal);
+
+    /**
+     * Disable adaptive forgetting (use fixed λ)
+     */
+    void rbpf_ext_disable_adaptive_forgetting(RBPF_Extended *ext);
+
+    /**
+     * Set per-regime baseline λ values
+     *
+     * Default values (GARCH-inspired):
+     *   R0 (Calm):   0.999 (N_eff ≈ 1000)
+     *   R1 (Normal): 0.998 (N_eff ≈ 500)
+     *   R2 (Elevated): 0.995 (N_eff ≈ 200)
+     *   R3 (Crisis): 0.990 (N_eff ≈ 100)
+     *
+     * @param ext     Extended RBPF handle
+     * @param regime  Regime index
+     * @param lambda  Forgetting factor for this regime
+     */
+    void rbpf_ext_set_regime_lambda(RBPF_Extended *ext, int regime, rbpf_real_t lambda);
+
+    /**
+     * Set sigmoid response parameters
+     *
+     * The sigmoid maps surprise z-score to discount:
+     *   discount = max_discount / (1 + exp(-steepness × (z - center)))
+     *
+     * @param ext         Extended RBPF handle
+     * @param center      Z-score for 50% response (default: 2.0)
+     * @param steepness   Transition sharpness (default: 2.0)
+     * @param max_discount Maximum λ reduction (default: 0.12)
+     */
+    void rbpf_ext_set_adaptive_sigmoid(RBPF_Extended *ext,
+                                       rbpf_real_t center,
+                                       rbpf_real_t steepness,
+                                       rbpf_real_t max_discount);
+
+    /**
+     * Set λ bounds
+     *
+     * @param ext      Extended RBPF handle
+     * @param floor    Minimum λ (default: 0.980, N_eff ≈ 50)
+     * @param ceiling  Maximum λ (default: 0.9995, N_eff ≈ 2000)
+     */
+    void rbpf_ext_set_adaptive_bounds(RBPF_Extended *ext,
+                                      rbpf_real_t floor,
+                                      rbpf_real_t ceiling);
+
+    /**
+     * Set EMA smoothing parameters
+     *
+     * @param ext                 Extended RBPF handle
+     * @param baseline_alpha      EMA for surprise baseline (slow, 0.02-0.05)
+     * @param signal_alpha        EMA for current signal (faster, 0.1-0.2)
+     */
+    void rbpf_ext_set_adaptive_smoothing(RBPF_Extended *ext,
+                                         rbpf_real_t baseline_alpha,
+                                         rbpf_real_t signal_alpha);
+
+    /**
+     * Set cooldown ticks after intervention
+     *
+     * After a significant intervention (λ drops below threshold),
+     * hold the low λ for this many ticks to allow adaptation.
+     *
+     * @param ext    Extended RBPF handle
+     * @param ticks  Cooldown period (default: 10)
+     */
+    void rbpf_ext_set_adaptive_cooldown(RBPF_Extended *ext, int ticks);
+
+    /**
+     * Get current adaptive λ value
+     */
+    rbpf_real_t rbpf_ext_get_current_lambda(const RBPF_Extended *ext);
+
+    /**
+     * Get current surprise z-score (for diagnostics)
+     */
+    rbpf_real_t rbpf_ext_get_surprise_zscore(const RBPF_Extended *ext);
+
+    /**
+     * Get adaptive forgetting statistics
+     *
+     * @param ext            Extended RBPF handle
+     * @param interventions  Output: number of significant interventions
+     * @param avg_lambda     Output: average λ over lifetime
+     * @param max_surprise   Output: maximum surprise z-score seen
+     */
+    void rbpf_ext_get_adaptive_stats(const RBPF_Extended *ext,
+                                     uint64_t *interventions,
+                                     rbpf_real_t *current_lambda,
+                                     rbpf_real_t *max_surprise);
+
+    /**
+     * Print adaptive forgetting configuration
+     */
+    void rbpf_ext_print_adaptive_config(const RBPF_Extended *ext);
+
+    /**
+     * Internal: Initialize adaptive forgetting defaults
+     * Called by rbpf_ext_create()
+     */
+    void rbpf_adaptive_forgetting_init(RBPF_AdaptiveForgetting *af);
+
+    /**
+     * Internal: Update adaptive forgetting based on marginal likelihood
+     * Called by rbpf_ext_step() after Kalman update
+     */
+    void rbpf_adaptive_forgetting_update(
+        RBPF_Extended *ext,
+        rbpf_real_t marginal_lik,
+        int dominant_regime);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * ASSET PRESETS
