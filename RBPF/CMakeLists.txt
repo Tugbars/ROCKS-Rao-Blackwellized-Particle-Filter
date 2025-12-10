@@ -22,6 +22,7 @@ if(RBPF_ENABLE_STORVIK)
     list(APPEND RBPF_SOURCES
         rbpf_param_learn.c
         rbpf_ksc_param_integration.c
+        rbpf_ocsn_robust.c
         rbpf_tuner.c
     )
 endif()
@@ -64,7 +65,17 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_rbpf_integration PRIVATE ${COMMON_DEFS})
     endif()
 
-    # Comprehensive comparison test (Baseline vs Liu-West vs Storvik vs Storvik+APF)
+    # Comprehensive comparison test v2 (Baseline vs Liu-West vs Storvik vs Storvik+Full w/ Robust OCSN)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_comparison.c)
+        add_executable(test_rbpf_comparison
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_comparison.c
+        )
+        target_link_libraries(test_rbpf_comparison PRIVATE rbpf_ksc)
+        target_compile_options(test_rbpf_comparison PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_rbpf_comparison PRIVATE ${COMMON_DEFS})
+    endif()
+
+    # Legacy comparison test (Baseline vs Liu-West vs Storvik vs Storvik+APF)
     if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_comparison_test.c)
         add_executable(rbpf_comparison_test
             ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_comparison_test.c
@@ -93,17 +104,6 @@ if(RBPF_BUILD_TESTS)
         target_compile_options(test_rbpf_tuner PRIVATE ${COMMON_FLAGS})
         target_compile_definitions(test_rbpf_tuner PRIVATE ${COMMON_DEFS})
     endif()
-
-    # Scenario tests
-    #if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_scenarios.c)
-    #    add_executable(test_rbpf_scenarios
-    #        ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_scenarios.c
-    #    )
-    #    target_link_libraries(test_rbpf_scenarios PRIVATE rbpf_ksc)
-    #    target_compile_options(test_rbpf_scenarios PRIVATE ${COMMON_FLAGS})
-    #    target_compile_definitions(test_rbpf_scenarios PRIVATE ${COMMON_DEFS})
-    #endif()
-    
 
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
@@ -179,5 +179,5 @@ install(FILES ${RBPF_HEADERS}
 )
 
 if(MSVC)
-    target_compile_options(tune_pmmh PRIVATE /openmp:experimental)
+    target_compile_options(rbpf_ksc PRIVATE /openmp:experimental)
 endif()

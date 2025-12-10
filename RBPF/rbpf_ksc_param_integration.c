@@ -43,7 +43,6 @@
 
 #include "rbpf_ksc_param_integration.h"
 #include "hawkes_intensity.h"
-#include "rbpf_ocsn_robust.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -1484,16 +1483,20 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
          * (Next tick will re-apply based on updated intensity) */
         hawkes_restore_base_transitions(ext);
     }
-    
-    /*═══════════════════════════════════════════════════════════════════════
+
+    /*═══════════════════════════════════════════════════════════════════════════
      * OUTLIER FRACTION: Compute for diagnostics
-     *═══════════════════════════════════════════════════════════════════════*/
-    if (ext->robust_ocsn.enabled) {
+     *═══════════════════════════════════════════════════════════════════════════*/
+    if (ext->robust_ocsn.enabled)
+    {
         ext->last_outlier_fraction = rbpf_ksc_compute_outlier_fraction(
             rbpf, y, &ext->robust_ocsn);
-    } else {
+    }
+    else
+    {
         ext->last_outlier_fraction = RBPF_REAL(0.0);
     }
+    output->outlier_fraction = ext->last_outlier_fraction; 
 
     /*═══════════════════════════════════════════════════════════════════════
      * STORVIK PARAMETER LEARNING (existing code)
