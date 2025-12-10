@@ -1,4 +1,4 @@
-# ROCKS: Robust Online Conjugate KSC-Storvik
+# ROCKS: Rao-blackwellized Online Conjugate KSC-Storvik
 
 **Real-time stochastic volatility tracking for high-frequency trading with fat-tail resilience**
 
