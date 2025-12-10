@@ -105,6 +105,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_rbpf_tuner PRIVATE ${COMMON_DEFS})
     endif()
 
+    # Realistic scenario tests (Flash Crash, Fed, Earnings, etc.)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_scenarios.c)
+        add_executable(test_rbpf_scenarios
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_rbpf_scenarios.c
+        )
+        target_link_libraries(test_rbpf_scenarios PRIVATE rbpf_ksc)
+        target_compile_options(test_rbpf_scenarios PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_rbpf_scenarios PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
         add_executable(example_usage
