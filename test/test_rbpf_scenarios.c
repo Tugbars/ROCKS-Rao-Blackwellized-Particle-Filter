@@ -1,6 +1,6 @@
 /**
  * @file test_rbpf_scenarios.c
- * @brief Realistic scenario tests for RBPF with Storvik + Robust OCSN
+ * @brief Realistic scenario tests for RBPF with Storvik + Robust OCSN + Adaptive Forgetting
  *
  * Tests RBPF's regime detection + volatility tracking against:
  *   1. Flash crash (sudden vol spike, quick recovery)
@@ -16,13 +16,14 @@
  *
  * Compares modes:
  *   - Baseline: True params, no learning
- *   - Storvik: Parameter learning, no forgetting
- *   - Storvik+Full: Learning + Forgetting + Robust OCSN
+ *   - Storvik: Parameter learning, no forgetting, no Robust OCSN
+ *   - Storvik+Full: Learning + Fixed Forgetting + Robust OCSN
+ *   - Storvik+Adapt: Learning + Adaptive Forgetting (Predictive Surprise) + Robust OCSN
  *
  * Compile:
  *   icx -O3 -xHost -qopenmp test_rbpf_scenarios.c rbpf_ksc.c \
  *       rbpf_ksc_param_integration.c rbpf_param_learn.c rbpf_ocsn_robust.c \
- *       -o test_scenarios -qmkl -lm
+ *       rbpf_adaptive_forgetting.c -o test_scenarios -qmkl -lm
  */
 
 #include "rbpf_ksc.h"
@@ -61,16 +62,20 @@ static const rbpf_real_t TRUE_SIGMA_VOL[4] = {0.05f, 0.08f, 0.12f, 0.20f};
 
 typedef enum
 {
-    MODE_BASELINE = 0, /* True params, no learning */
-    MODE_STORVIK,      /* Storvik learning, no forgetting, no Robust OCSN */
-    MODE_STORVIK_FULL, /* Storvik + Forgetting + Robust OCSN */
+    MODE_BASELINE = 0,       /* True params, no learning */
+    MODE_STORVIK,            /* Storvik learning, no forgetting, no Robust OCSN */
+    MODE_STORVIK_FULL,       /* Storvik + Fixed Forgetting + Robust OCSN */
+    MODE_STORVIK_ADAPT_ONLY, /* Storvik + Adaptive Forgetting (NO OCSN) */
+    MODE_STORVIK_ADAPTIVE,   /* Storvik + Adaptive Forgetting + Robust OCSN */
     NUM_MODES
 } TestMode;
 
 static const char *mode_names[] = {
     "Baseline",
     "Storvik",
-    "Storvik+Full"};
+    "Storvik+Full",
+    "Storvik+AdptOnly",
+    "Storvik+Adapt+OCSN"};
 
 /*============================================================================
  * RNG (xorshift128+)
@@ -719,9 +724,12 @@ static RBPF_KSC *create_baseline_rbpf(void)
     return rbpf;
 }
 
-static RBPF_Extended *create_storvik_rbpf(int with_forgetting, int with_robust_ocsn)
+static RBPF_Extended *create_storvik_rbpf(int with_forgetting, int with_robust_ocsn, int with_adaptive)
 {
     RBPF_Extended *ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
+
+    /* Initialize adaptive forgetting struct (even if not enabled) */
+    rbpf_adaptive_forgetting_init(&ext->adaptive_forgetting);
 
     for (int r = 0; r < N_REGIMES; r++)
     {
@@ -729,8 +737,29 @@ static RBPF_Extended *create_storvik_rbpf(int with_forgetting, int with_robust_o
     }
     rbpf_ext_build_transition_lut(ext, TRANS_MATRIX);
 
-    if (with_forgetting)
+    if (with_adaptive)
     {
+        /* Adaptive forgetting: λ varies based on predictive surprise */
+        rbpf_ext_enable_adaptive_forgetting(ext);
+
+        /* Configure per-regime baselines */
+        rbpf_ext_set_regime_lambda(ext, 0, 0.999f); /* R0: Calm, long memory */
+        rbpf_ext_set_regime_lambda(ext, 1, 0.998f); /* R1: Normal */
+        rbpf_ext_set_regime_lambda(ext, 2, 0.995f); /* R2: Elevated */
+        rbpf_ext_set_regime_lambda(ext, 3, 0.990f); /* R3: Crisis, short memory */
+
+        /* Sigmoid response tuning */
+        rbpf_ext_set_adaptive_sigmoid(ext,
+                                      2.0f,   /* center: 50% response at 2σ surprise */
+                                      2.0f,   /* steepness */
+                                      0.12f); /* max_discount: up to 12% reduction */
+
+        rbpf_ext_set_adaptive_bounds(ext, 0.980f, 0.9995f);
+        rbpf_ext_set_adaptive_cooldown(ext, 10);
+    }
+    else if (with_forgetting)
+    {
+        /* Fixed forgetting: static λ per regime */
         param_learn_set_forgetting(&ext->storvik, 1, 0.997f);
         param_learn_set_regime_forgetting(&ext->storvik, 0, 0.999f);
         param_learn_set_regime_forgetting(&ext->storvik, 1, 0.998f);
@@ -806,10 +835,16 @@ static void run_scenario_mode(const Scenario *s, TestMode mode, int n_runs, Scen
             rbpf_raw = create_baseline_rbpf();
             break;
         case MODE_STORVIK:
-            ext = create_storvik_rbpf(0, 0);
+            ext = create_storvik_rbpf(0, 0, 0); /* No forgetting, no OCSN, no adaptive */
             break;
         case MODE_STORVIK_FULL:
-            ext = create_storvik_rbpf(1, 1);
+            ext = create_storvik_rbpf(1, 1, 0); /* Fixed forgetting + OCSN */
+            break;
+        case MODE_STORVIK_ADAPT_ONLY:
+            ext = create_storvik_rbpf(0, 0, 1); /* Adaptive forgetting, NO OCSN */
+            break;
+        case MODE_STORVIK_ADAPTIVE:
+            ext = create_storvik_rbpf(0, 1, 1); /* Adaptive forgetting + OCSN */
             break;
         default:
             break;
@@ -977,73 +1012,98 @@ static void print_scenario_header(const Scenario *s)
 
 static void print_scenario_results(ScenarioStats stats[NUM_MODES])
 {
-    printf("┌──────────────────────────┬────────────┬────────────┬────────────┐\n");
-    printf("│ Metric                   │   Baseline │    Storvik │ Storvik+F  │\n");
-    printf("├──────────────────────────┼────────────┼────────────┼────────────┤\n");
+    printf("┌──────────────────────────┬────────────┬────────────┬────────────┬────────────┬────────────┐\n");
+    printf("│ Metric                   │   Baseline │    Storvik │ Storvik+F  │ Adpt Only  │ Adpt+OCSN  │\n");
+    printf("├──────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤\n");
 
-    printf("│ Log-Vol RMSE             │ %10.4f │ %10.4f │ %10.4f │\n",
-           stats[0].log_vol_rmse, stats[1].log_vol_rmse, stats[2].log_vol_rmse);
-    printf("│   on Outliers            │ %10.4f │ %10.4f │ %10.4f │\n",
-           stats[0].log_vol_rmse_outliers, stats[1].log_vol_rmse_outliers, stats[2].log_vol_rmse_outliers);
-    printf("│   on Normal              │ %10.4f │ %10.4f │ %10.4f │\n",
-           stats[0].log_vol_rmse_normal, stats[1].log_vol_rmse_normal, stats[2].log_vol_rmse_normal);
-    printf("├──────────────────────────┼────────────┼────────────┼────────────┤\n");
+    printf("│ Log-Vol RMSE             │ %10.4f │ %10.4f │ %10.4f │ %10.4f │ %10.4f │\n",
+           stats[0].log_vol_rmse, stats[1].log_vol_rmse, stats[2].log_vol_rmse,
+           stats[3].log_vol_rmse, stats[4].log_vol_rmse);
+    printf("│   on Outliers            │ %10.4f │ %10.4f │ %10.4f │ %10.4f │ %10.4f │\n",
+           stats[0].log_vol_rmse_outliers, stats[1].log_vol_rmse_outliers,
+           stats[2].log_vol_rmse_outliers, stats[3].log_vol_rmse_outliers,
+           stats[4].log_vol_rmse_outliers);
+    printf("│   on Normal              │ %10.4f │ %10.4f │ %10.4f │ %10.4f │ %10.4f │\n",
+           stats[0].log_vol_rmse_normal, stats[1].log_vol_rmse_normal,
+           stats[2].log_vol_rmse_normal, stats[3].log_vol_rmse_normal,
+           stats[4].log_vol_rmse_normal);
+    printf("├──────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤\n");
 
-    printf("│ Regime Accuracy (post)   │ %9.1f%% │ %9.1f%% │ %9.1f%% │\n",
-           stats[0].regime_accuracy_post, stats[1].regime_accuracy_post, stats[2].regime_accuracy_post);
-    printf("├──────────────────────────┼────────────┼────────────┼────────────┤\n");
+    printf("│ Regime Accuracy (post)   │ %9.1f%% │ %9.1f%% │ %9.1f%% │ %9.1f%% │ %9.1f%% │\n",
+           stats[0].regime_accuracy_post, stats[1].regime_accuracy_post,
+           stats[2].regime_accuracy_post, stats[3].regime_accuracy_post,
+           stats[4].regime_accuracy_post);
+    printf("├──────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤\n");
 
-    printf("│ Avg ESS                  │ %10.1f │ %10.1f │ %10.1f │\n",
-           stats[0].avg_ess, stats[1].avg_ess, stats[2].avg_ess);
-    printf("│ Min ESS                  │ %10.1f │ %10.1f │ %10.1f │\n",
-           stats[0].min_ess, stats[1].min_ess, stats[2].min_ess);
-    printf("│ ESS Collapse Count       │ %10d │ %10d │ %10d │\n",
-           stats[0].ess_collapse_count, stats[1].ess_collapse_count, stats[2].ess_collapse_count);
-    printf("├──────────────────────────┼────────────┼────────────┼────────────┤\n");
+    printf("│ Avg ESS                  │ %10.1f │ %10.1f │ %10.1f │ %10.1f │ %10.1f │\n",
+           stats[0].avg_ess, stats[1].avg_ess, stats[2].avg_ess,
+           stats[3].avg_ess, stats[4].avg_ess);
+    printf("│ Min ESS                  │ %10.1f │ %10.1f │ %10.1f │ %10.1f │ %10.1f │\n",
+           stats[0].min_ess, stats[1].min_ess, stats[2].min_ess,
+           stats[3].min_ess, stats[4].min_ess);
+    printf("│ ESS Collapse Count       │ %10d │ %10d │ %10d │ %10d │ %10d │\n",
+           stats[0].ess_collapse_count, stats[1].ess_collapse_count,
+           stats[2].ess_collapse_count, stats[3].ess_collapse_count,
+           stats[4].ess_collapse_count);
+    printf("├──────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤\n");
 
-    printf("│ Outlier Frac (outliers)  │ %10.2f │ %10.2f │ %10.2f │\n",
+    printf("│ Outlier Frac (outliers)  │ %10.2f │ %10.2f │ %10.2f │ %10.2f │ %10.2f │\n",
            stats[0].avg_outlier_frac_on_outliers,
            stats[1].avg_outlier_frac_on_outliers,
-           stats[2].avg_outlier_frac_on_outliers);
-    printf("│ Outlier Detections       │ %10d │ %10d │ %10d │\n",
-           stats[0].outlier_detections, stats[1].outlier_detections, stats[2].outlier_detections);
-    printf("│   (of %3d total)         │            │            │            │\n", stats[2].n_outliers_total);
-    printf("├──────────────────────────┼────────────┼────────────┼────────────┤\n");
+           stats[2].avg_outlier_frac_on_outliers,
+           stats[3].avg_outlier_frac_on_outliers,
+           stats[4].avg_outlier_frac_on_outliers);
+    printf("│ Outlier Detections       │ %10d │ %10d │ %10d │ %10d │ %10d │\n",
+           stats[0].outlier_detections, stats[1].outlier_detections,
+           stats[2].outlier_detections, stats[3].outlier_detections,
+           stats[4].outlier_detections);
+    printf("│   (of %3d total)         │            │            │            │            │            │\n", stats[4].n_outliers_total);
+    printf("├──────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤\n");
 
-    printf("│ Detection Rate           │ %9.1f%% │ %9.1f%% │ %9.1f%% │\n",
-           stats[0].detection_rate, stats[1].detection_rate, stats[2].detection_rate);
-    printf("│ Detection Delay          │ %+9.1f │ %+9.1f │ %+9.1f │\n",
-           stats[0].mean_detection_delay, stats[1].mean_detection_delay, stats[2].mean_detection_delay);
-    printf("├──────────────────────────┼────────────┼────────────┼────────────┤\n");
+    printf("│ Detection Rate           │ %9.1f%% │ %9.1f%% │ %9.1f%% │ %9.1f%% │ %9.1f%% │\n",
+           stats[0].detection_rate, stats[1].detection_rate,
+           stats[2].detection_rate, stats[3].detection_rate,
+           stats[4].detection_rate);
+    printf("│ Detection Delay          │ %+9.1f │ %+9.1f │ %+9.1f │ %+9.1f │ %+9.1f │\n",
+           stats[0].mean_detection_delay, stats[1].mean_detection_delay,
+           stats[2].mean_detection_delay, stats[3].mean_detection_delay,
+           stats[4].mean_detection_delay);
+    printf("├──────────────────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤\n");
 
-    printf("│ Latency (μs)             │ %10.2f │ %10.2f │ %10.2f │\n",
-           stats[0].avg_latency_us, stats[1].avg_latency_us, stats[2].avg_latency_us);
-    printf("└──────────────────────────┴────────────┴────────────┴────────────┘\n");
+    printf("│ Latency (μs)             │ %10.2f │ %10.2f │ %10.2f │ %10.2f │ %10.2f │\n",
+           stats[0].avg_latency_us, stats[1].avg_latency_us,
+           stats[2].avg_latency_us, stats[3].avg_latency_us,
+           stats[4].avg_latency_us);
+    printf("└──────────────────────────┴────────────┴────────────┴────────────┴────────────┴────────────┘\n");
 }
 
 static void print_summary_table(Scenario *scenarios, ScenarioStats all_stats[][NUM_MODES], int n_scenarios)
 {
-    printf("\n╔════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                                    SUMMARY BY SCENARIO                                         ║\n");
-    printf("╠═════════════════════╦═════════════════════════════╦═════════════════════════════════════════════╣\n");
-    printf("║                     ║    Log-Vol RMSE (Outliers)  ║           ESS Collapse Count                ║\n");
-    printf("║ Scenario            ║ Baseline  Storvik  Storv+F  ║ Baseline    Storvik    Storv+F   (#outliers)║\n");
-    printf("╠═════════════════════╬═════════════════════════════╬═════════════════════════════════════════════╣\n");
+    printf("\n╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                                                   SUMMARY BY SCENARIO                                                             ║\n");
+    printf("╠═════════════════════╦══════════════════════════════════════════════════╦══════════════════════════════════════════════════════════╣\n");
+    printf("║                     ║          Log-Vol RMSE (Outliers)                 ║                  ESS Collapse Count                      ║\n");
+    printf("║ Scenario            ║ Baseln  Storvk  Storv+F AdptOnly Adpt+OCSN       ║ Baseln  Storvk  Storv+F AdptOnly Adpt+OCSN  (#outliers)  ║\n");
+    printf("╠═════════════════════╬══════════════════════════════════════════════════╬══════════════════════════════════════════════════════════╣\n");
 
     for (int i = 0; i < n_scenarios; i++)
     {
-        printf("║ %-19s ║ %7.3f  %7.3f  %7.3f   ║ %8d  %9d  %9d   (%4d)     ║\n",
+        printf("║ %-19s ║ %6.3f  %6.3f  %6.3f  %6.3f  %6.3f         ║ %6d  %6d  %6d  %6d  %6d    (%4d)   ║\n",
                scenarios[i].name,
                all_stats[i][0].log_vol_rmse_outliers,
                all_stats[i][1].log_vol_rmse_outliers,
                all_stats[i][2].log_vol_rmse_outliers,
+               all_stats[i][3].log_vol_rmse_outliers,
+               all_stats[i][4].log_vol_rmse_outliers,
                all_stats[i][0].ess_collapse_count,
                all_stats[i][1].ess_collapse_count,
                all_stats[i][2].ess_collapse_count,
-               all_stats[i][2].n_outliers_total);
+               all_stats[i][3].ess_collapse_count,
+               all_stats[i][4].ess_collapse_count,
+               all_stats[i][4].n_outliers_total);
     }
 
-    printf("╚═════════════════════╩═════════════════════════════╩═════════════════════════════════════════════╝\n");
+    printf("╚═════════════════════╩══════════════════════════════════════════════════╩══════════════════════════════════════════════════════════╝\n");
 }
 
 /*============================================================================
@@ -1058,14 +1118,14 @@ int main(int argc, char **argv)
 
     init_timer();
 
-    printf("╔════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║           RBPF REALISTIC SCENARIO TESTS (with Robust OCSN)                 ║\n");
-    printf("╠════════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║  Modes: Baseline (true params) │ Storvik │ Storvik+Full (Fgt+RobustOCSN)   ║\n");
-    printf("║  Monte Carlo: %2d runs × %4d ticks, Particles: %3d                         ║\n",
+    printf("╔══════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                 RBPF REALISTIC SCENARIO TESTS (with Robust OCSN)                         ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Modes: Baseline │ Storvik │ Storvik+Full │ AdaptOnly (no OCSN) │ Adapt+OCSN (full)      ║\n");
+    printf("║  Monte Carlo: %2d runs × %4d ticks, Particles: %3d                                       ║\n",
            N_MONTE_CARLO, N_OBSERVATIONS, N_PARTICLES);
-    printf("║  Seed: %d                                                                   ║\n", seed);
-    printf("╚════════════════════════════════════════════════════════════════════════════╝\n");
+    printf("║  Seed: %d                                                                                 ║\n", seed);
+    printf("╚══════════════════════════════════════════════════════════════════════════════════════════╝\n");
 
     Scenario scenarios[] = {
         scenario_flash_crash(),
@@ -1122,36 +1182,90 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("  Avg Outlier RMSE:  Baseline=%.3f  Storvik=%.3f  Storvik+Full=%.3f\n",
+    printf("  Avg Outlier RMSE:  Baseln=%.3f  Storvk=%.3f  Storv+F=%.3f  AdptOnly=%.3f  Adpt+OCSN=%.3f\n",
            sum_outlier_rmse[0] / n_scenarios,
            sum_outlier_rmse[1] / n_scenarios,
-           sum_outlier_rmse[2] / n_scenarios);
-    printf("  Total ESS Collapse: Baseline=%d  Storvik=%d  Storvik+Full=%d\n",
-           sum_ess_collapse[0], sum_ess_collapse[1], sum_ess_collapse[2]);
-    printf("  Avg Regime Acc:    Baseline=%.1f%%  Storvik=%.1f%%  Storvik+Full=%.1f%%\n",
+           sum_outlier_rmse[2] / n_scenarios,
+           sum_outlier_rmse[3] / n_scenarios,
+           sum_outlier_rmse[4] / n_scenarios);
+    printf("  Total ESS Collapse: Baseln=%d  Storvk=%d  Storv+F=%d  AdptOnly=%d  Adpt+OCSN=%d\n",
+           sum_ess_collapse[0], sum_ess_collapse[1], sum_ess_collapse[2],
+           sum_ess_collapse[3], sum_ess_collapse[4]);
+    printf("  Avg Regime Acc:    Baseln=%.1f%%  Storvk=%.1f%%  Storv+F=%.1f%%  AdptOnly=%.1f%%  Adpt+OCSN=%.1f%%\n",
            sum_regime_acc[0] / n_scenarios,
            sum_regime_acc[1] / n_scenarios,
-           sum_regime_acc[2] / n_scenarios);
+           sum_regime_acc[2] / n_scenarios,
+           sum_regime_acc[3] / n_scenarios,
+           sum_regime_acc[4] / n_scenarios);
 
-    /* Check if Robust OCSN helps */
+    /* Check if Robust OCSN helps (Storvik vs Storvik+Full) */
     double outlier_improvement = (sum_outlier_rmse[1] - sum_outlier_rmse[2]) / sum_outlier_rmse[1] * 100;
     int ess_improvement = sum_ess_collapse[1] - sum_ess_collapse[2];
 
-    printf("\n  Robust OCSN Impact:\n");
+    printf("\n  Robust OCSN Impact (Storvik → Storvik+Full):\n");
     printf("    Outlier RMSE improvement: %.1f%%\n", outlier_improvement);
     printf("    ESS collapses prevented:  %d\n", ess_improvement);
 
+    /* Check Adaptive alone vs Storvik (no OCSN) */
+    double adapt_alone_improvement = (sum_outlier_rmse[1] - sum_outlier_rmse[3]) / sum_outlier_rmse[1] * 100;
+    int adapt_alone_ess = sum_ess_collapse[1] - sum_ess_collapse[3];
+
+    printf("\n  Adaptive Forgetting Only (Storvik → AdaptOnly, no OCSN):\n");
+    printf("    Outlier RMSE improvement: %.1f%%\n", adapt_alone_improvement);
+    printf("    ESS collapses prevented:  %d\n", adapt_alone_ess);
+
+    /* Check OCSN effect on Adaptive (AdaptOnly → Adapt+OCSN) */
+    double ocsn_on_adapt_improvement = (sum_outlier_rmse[3] - sum_outlier_rmse[4]) / sum_outlier_rmse[3] * 100;
+    int ocsn_on_adapt_ess = sum_ess_collapse[3] - sum_ess_collapse[4];
+
+    printf("\n  OCSN Added to Adaptive (AdaptOnly → Adapt+OCSN):\n");
+    printf("    Outlier RMSE improvement: %.1f%%\n", ocsn_on_adapt_improvement);
+    printf("    ESS collapses prevented:  %d\n", ocsn_on_adapt_ess);
+
+    /* Check if Adaptive+OCSN beats Fixed+OCSN */
+    double adapt_vs_fixed = (sum_outlier_rmse[2] - sum_outlier_rmse[4]) / sum_outlier_rmse[2] * 100;
+    int adapt_vs_fixed_ess = sum_ess_collapse[2] - sum_ess_collapse[4];
+    double adapt_vs_fixed_regime = sum_regime_acc[4] / n_scenarios - sum_regime_acc[2] / n_scenarios;
+
+    printf("\n  Full Comparison (Storvik+Full vs Adapt+OCSN):\n");
+    printf("    Outlier RMSE improvement: %.1f%%\n", adapt_vs_fixed);
+    printf("    ESS collapses prevented:  %d\n", adapt_vs_fixed_ess);
+    printf("    Regime accuracy delta:    %+.1f%%\n", adapt_vs_fixed_regime);
+
+    printf("\n  VERDICT:\n");
     if (outlier_improvement > 20 && ess_improvement > 0)
     {
-        printf("\n  ✓ Robust OCSN provides meaningful protection during fat-tail events\n");
+        printf("    ✓ Robust OCSN provides meaningful protection during fat-tail events\n");
     }
     else if (outlier_improvement > 10)
     {
-        printf("\n  ~ Robust OCSN provides moderate improvement\n");
+        printf("    ~ Robust OCSN provides moderate improvement\n");
     }
     else
     {
-        printf("\n  ✗ Robust OCSN not showing clear benefit (check config)\n");
+        printf("    ✗ Robust OCSN not showing clear benefit\n");
+    }
+
+    if (adapt_alone_improvement > 5 || adapt_alone_ess > 10)
+    {
+        printf("    ✓ Adaptive forgetting alone improves over baseline Storvik\n");
+    }
+    else
+    {
+        printf("    ~ Adaptive forgetting alone shows limited benefit\n");
+    }
+
+    if (adapt_vs_fixed > 3 || adapt_vs_fixed_ess > 5 || adapt_vs_fixed_regime > 1.0)
+    {
+        printf("    ✓ Adaptive+OCSN outperforms Fixed+OCSN → USE ADAPTIVE\n");
+    }
+    else if (adapt_vs_fixed > 0 || adapt_vs_fixed_ess > 0)
+    {
+        printf("    ~ Adaptive+OCSN shows marginal improvement over Fixed+OCSN\n");
+    }
+    else
+    {
+        printf("    ✗ Fixed+OCSN performs comparably or better in these scenarios\n");
     }
 
     printf("════════════════════════════════════════════════════════════════════════════\n");

@@ -24,6 +24,8 @@ if(RBPF_ENABLE_STORVIK)
         rbpf_ksc_param_integration.c
         rbpf_ocsn_robust.c
         rbpf_tuner.c
+        rbpf_preprocess.c
+        rbpf_adaptive_forgetting.c
     )
 endif()
 
@@ -181,6 +183,7 @@ if(RBPF_ENABLE_STORVIK)
         rbpf_param_learn.h
         rbpf_ksc_param_integration.h
         rbpf_tuner.h
+        rbpf_preprocess.h
     )
 endif()
 

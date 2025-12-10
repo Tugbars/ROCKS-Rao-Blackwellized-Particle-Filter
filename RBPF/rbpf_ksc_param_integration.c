@@ -614,6 +614,8 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     ext->last_hawkes_intensity = RBPF_REAL(0.0);
     ext->last_outlier_fraction = RBPF_REAL(0.0);
 
+    rbpf_adaptive_forgetting_init(&ext->adaptive_forgetting);
+
     return ext;
 }
 
@@ -1483,20 +1485,45 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
          * (Next tick will re-apply based on updated intensity) */
         hawkes_restore_base_transitions(ext);
     }
-
-    /*═══════════════════════════════════════════════════════════════════════════
+    
+    /*═══════════════════════════════════════════════════════════════════════
      * OUTLIER FRACTION: Compute for diagnostics
-     *═══════════════════════════════════════════════════════════════════════════*/
-    if (ext->robust_ocsn.enabled)
-    {
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (ext->robust_ocsn.enabled) {
         ext->last_outlier_fraction = rbpf_ksc_compute_outlier_fraction(
             rbpf, y, &ext->robust_ocsn);
-    }
-    else
-    {
+    } else {
         ext->last_outlier_fraction = RBPF_REAL(0.0);
     }
-    output->outlier_fraction = ext->last_outlier_fraction; 
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * ADAPTIVE FORGETTING: Update λ based on predictive surprise
+     * 
+     * Uses marginal likelihood to detect regime breaks vs transient outliers.
+     * Must happen AFTER Kalman update (need marginal_lik) and BEFORE Storvik
+     * update (need to set λ before updating sufficient statistics).
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (ext->adaptive_forgetting.enabled) {
+        /* Get dominant regime for baseline λ */
+        int regime_counts[RBPF_MAX_REGIMES] = {0};
+        for (int i = 0; i < n; i++) {
+            int r = rbpf->regime[i];
+            if (r >= 0 && r < rbpf->n_regimes) {
+                regime_counts[r]++;
+            }
+        }
+        int dominant_regime = 0;
+        int max_count = 0;
+        for (int r = 0; r < rbpf->n_regimes; r++) {
+            if (regime_counts[r] > max_count) {
+                max_count = regime_counts[r];
+                dominant_regime = r;
+            }
+        }
+        
+        /* Update adaptive λ */
+        rbpf_adaptive_forgetting_update(ext, marginal_lik, dominant_regime);
+    }
 
     /*═══════════════════════════════════════════════════════════════════════
      * STORVIK PARAMETER LEARNING (existing code)
