@@ -768,7 +768,7 @@ static RBPF_Extended *create_storvik_rbpf(int with_forgetting, int with_robust_o
     }
     else
     {
-        param_learn_set_forgetting(&ext->storvik, 0, 1.0f);
+        param_learn_set_forgetting(&ext->storvik, 0, 0.998f);
     }
 
     if (with_robust_ocsn)

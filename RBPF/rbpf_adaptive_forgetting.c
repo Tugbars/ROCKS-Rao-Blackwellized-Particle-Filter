@@ -160,28 +160,89 @@ void rbpf_adaptive_forgetting_update(
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 1: Compute Predictive Surprise
+     * STEP 1: Compute Effective Surprise
      *
-     * Surprise = -log p(y_t | y_{1:t-1})
+     * Two signal sources that BOTH indicate model misspecification:
      *
-     * Higher surprise = observation less likely under current model
+     * A) Predictive Surprise = -log p(y_t | y_{1:t-1})
+     *    High when: Data doesn't fit the model at all
+     *
+     * B) Structural Surprise = f(outlier_fraction)
+     *    High when: Data only fits because we're calling it an outlier
+     *
+     * The "Signal Starvation" Problem:
+     *   When Robust OCSN absorbs a shock, marginal likelihood stays decent
+     *   (because the outlier component explains it), so predictive surprise
+     *   stays low. But the model is still "cheating" by using the crutch.
+     *
+     * Solution: Take MAX of both signals. We adapt if EITHER:
+     *   - Data fits poorly (drift) → predictive surprise triggers
+     *   - Data fits via outlier (shock) → structural surprise triggers
      *═══════════════════════════════════════════════════════════════════════*/
 
+    rbpf_real_t pred_surprise = RBPF_REAL(0.0);
+    rbpf_real_t struct_surprise = RBPF_REAL(0.0);
     rbpf_real_t surprise;
 
-    if (af->signal_source == ADAPT_SIGNAL_OUTLIER_FRAC)
+    /* A) Predictive Surprise from marginal likelihood */
+    if (af->signal_source != ADAPT_SIGNAL_OUTLIER_FRAC)
     {
-        /* Use outlier fraction as signal (simpler, already computed) */
-        surprise = ext->last_outlier_fraction * RBPF_REAL(10.0); /* Scale to ~[0,10] */
-    }
-    else
-    {
-        /* Use predictive surprise (recommended) */
         if (marginal_lik < RBPF_REAL(1e-30))
         {
             marginal_lik = RBPF_REAL(1e-30); /* Avoid log(0) */
         }
-        surprise = -rbpf_log(marginal_lik);
+        pred_surprise = -rbpf_log(marginal_lik);
+    }
+
+    /* B) Structural Surprise from outlier usage */
+    /* Scale: 0% outlier → 0, 50% outlier → 2.5, 100% outlier → 5.0 */
+    /* This is calibrated so heavy outlier usage (~50%+) triggers intervention */
+    struct_surprise = ext->last_outlier_fraction * RBPF_REAL(5.0);
+
+    /* Combine signals based on mode */
+    switch (af->signal_source)
+    {
+    case ADAPT_SIGNAL_REGIME:
+        /* Pure regime-based, no surprise adaptation */
+        surprise = RBPF_REAL(0.0);
+        break;
+
+    case ADAPT_SIGNAL_OUTLIER_FRAC:
+        /* Only structural surprise (for testing) */
+        surprise = struct_surprise * RBPF_REAL(4.0); /* Scale up for standalone use */
+        break;
+
+    case ADAPT_SIGNAL_PREDICTIVE_SURPRISE:
+        /* Only predictive surprise (original behavior, for comparison) */
+        surprise = pred_surprise;
+        break;
+
+    case ADAPT_SIGNAL_COMBINED:
+    default:
+        /* ADDITIVE: Predictive + Outlier penalty
+         *
+         * Key insight: When OCSN absorbs a shock, pred_surprise stays low
+         * (because the model "explains" it via the outlier component).
+         * But we should PENALIZE relying on the crutch!
+         *
+         * Formula: surprise = pred_surprise + α × outlier_fraction²
+         *
+         * The quadratic term:
+         *   - 10% outlier → +0.1 (negligible, normal market noise)
+         *   - 30% outlier → +0.9 (moderate penalty, elevated vol)
+         *   - 50% outlier → +2.5 (strong penalty, regime break likely)
+         *   - 80% outlier → +6.4 (massive penalty, clear structural change)
+         *
+         * This ensures heavy outlier usage triggers adaptation even when
+         * the marginal likelihood looks "fine" because OCSN fit well.
+         */
+        {
+            rbpf_real_t outlier_penalty = ext->last_outlier_fraction *
+                                          ext->last_outlier_fraction *
+                                          RBPF_REAL(10.0);
+            surprise = pred_surprise + outlier_penalty;
+        }
+        break;
     }
 
     af->surprise_current = surprise;
