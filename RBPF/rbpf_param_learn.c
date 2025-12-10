@@ -1,6 +1,6 @@
 /*
  * ═══════════════════════════════════════════════════════════════════════════
- * RBPF Parameter Learning: Sleeping Storvik (P99 OPTIMIZED)
+ * RBPF Parameter Learning: Sleeping Storvik (P99 OPTIMIZED + ADAPTIVE FORGETTING)
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * P99 Optimizations:
@@ -8,6 +8,11 @@
  *   P0: Global tick-skip (90% skip rate) - 4μs → 0.4μs average
  *   P1: Double-buffer pointer swap - eliminates 2.1μs memcpy on resample
  *   P1: Reduced entropy refills - 0.3μs saved
+ *
+ * Adaptive Forgetting (NEW):
+ *   Source: RiskMetrics (1996), West & Harrison (1997)
+ *   Prevents model fossilization by discounting sufficient statistics
+ *   N_eff ≈ 1/(1-λ) where λ is the discount factor
  *
  * Target P99: < 25μs (was ~60μs)
  * Target Average: < 5μs (was ~38μs)
@@ -224,7 +229,7 @@ static void rng_seed(uint64_t *s, uint64_t seed)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * CONFIGURATION PRESETS (P0: HFT INTERVALS AS DEFAULT)
+ * CONFIGURATION PRESETS
  *═══════════════════════════════════════════════════════════════════════════*/
 
 ParamLearnConfig param_learn_config_defaults(void)
@@ -234,18 +239,11 @@ ParamLearnConfig param_learn_config_defaults(void)
 
     cfg.method = PARAM_LEARN_SLEEPING_STORVIK;
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * P0 OPTIMIZATION: HFT intervals as default
-     *
-     * Previous: [1, 1, 1, 1] = 19μs every tick = P99 disaster
-     * Now:      [50, 20, 5, 1] = ~4μs average, 19μs P99 only in crisis
-     *
-     * Triggers (regime change, structural break) still force immediate sample.
-     *═══════════════════════════════════════════════════════════════════════*/
-    cfg.sample_interval[0] = 50; /* R0 (calm): every 50 ticks    */
-    cfg.sample_interval[1] = 20; /* R1 (normal): every 20 ticks  */
-    cfg.sample_interval[2] = 5;  /* R2 (elevated): every 5 ticks */
-    cfg.sample_interval[3] = 1;  /* R3 (crisis): every tick      */
+    /* P0: HFT intervals as default */
+    cfg.sample_interval[0] = 50;
+    cfg.sample_interval[1] = 20;
+    cfg.sample_interval[2] = 5;
+    cfg.sample_interval[3] = 1;
     for (int i = 4; i < PARAM_LEARN_MAX_REGIMES; i++)
     {
         cfg.sample_interval[i] = 1;
@@ -268,14 +266,33 @@ ParamLearnConfig param_learn_config_defaults(void)
     cfg.prior_strength = 10.0;
     cfg.rng_seed = 42;
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * P0 OPTIMIZATION: Global tick-skip DISABLED by default
-     *
-     * Enable via param_learn_config_hft() for extreme latency reduction.
-     * When enabled, skips entire update 90% of ticks (unless triggered).
-     *═══════════════════════════════════════════════════════════════════════*/
+    /* P0: Global tick-skip disabled by default */
     cfg.enable_global_tick_skip = false;
     cfg.global_skip_modulo = PL_GLOBAL_SKIP_MODULO;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * ADAPTIVE FORGETTING (NEW)
+     *
+     * Source: RiskMetrics (1996), West & Harrison (1997)
+     *
+     * Prevents model fossilization by exponentially discounting old data.
+     * N_eff ≈ 1/(1-λ) = effective sample size (memory horizon)
+     *═══════════════════════════════════════════════════════════════════════*/
+    cfg.enable_forgetting = true;
+    cfg.forgetting_lambda = 0.997;    /* N_eff ≈ 333 ticks */
+    cfg.forgetting_kappa_floor = 5.0; /* Prevent posterior collapse */
+    cfg.forgetting_alpha_floor = 3.0; /* Keep inverse-gamma proper */
+
+    /* Regime-adaptive forgetting (off by default) */
+    cfg.enable_regime_adaptive_forgetting = false;
+    cfg.forgetting_lambda_regime[0] = 0.999; /* R0: slow (N_eff ≈ 1000) */
+    cfg.forgetting_lambda_regime[1] = 0.998; /* R1: moderate */
+    cfg.forgetting_lambda_regime[2] = 0.996; /* R2: faster */
+    cfg.forgetting_lambda_regime[3] = 0.993; /* R3: fast (N_eff ≈ 143) */
+    for (int i = 4; i < PARAM_LEARN_MAX_REGIMES; i++)
+    {
+        cfg.forgetting_lambda_regime[i] = 0.993;
+    }
 
     return cfg;
 }
@@ -283,7 +300,6 @@ ParamLearnConfig param_learn_config_defaults(void)
 ParamLearnConfig param_learn_config_sleeping(void)
 {
     ParamLearnConfig cfg = param_learn_config_defaults();
-    /* Already HFT intervals - this is now same as defaults */
     return cfg;
 }
 
@@ -295,6 +311,7 @@ ParamLearnConfig param_learn_config_full_bayesian(void)
         cfg.sample_interval[i] = 1;
     }
     cfg.enable_global_tick_skip = false;
+    cfg.enable_forgetting = false; /* Full Bayesian = no forgetting */
     return cfg;
 }
 
@@ -308,11 +325,41 @@ ParamLearnConfig param_learn_config_hft(void)
     cfg.sample_interval[2] = 20;
     cfg.sample_interval[3] = 5;
 
-    /* Enable global tick-skip for extreme latency reduction */
+    /* Enable global tick-skip */
     cfg.enable_global_tick_skip = true;
-    cfg.global_skip_modulo = 10; /* Skip 9 out of 10 ticks */
-
+    cfg.global_skip_modulo = 10;
     cfg.load_skip_threshold = 0.8;
+
+    /* HFT: Faster forgetting + regime-adaptive */
+    cfg.enable_forgetting = true;
+    cfg.forgetting_lambda = 0.995; /* N_eff ≈ 200 */
+
+    cfg.enable_regime_adaptive_forgetting = true;
+    cfg.forgetting_lambda_regime[0] = 0.998; /* R0: N_eff ≈ 500 */
+    cfg.forgetting_lambda_regime[1] = 0.996; /* R1: N_eff ≈ 250 */
+    cfg.forgetting_lambda_regime[2] = 0.994; /* R2: N_eff ≈ 167 */
+    cfg.forgetting_lambda_regime[3] = 0.990; /* R3: N_eff ≈ 100 */
+
+    return cfg;
+}
+
+ParamLearnConfig param_learn_config_stable(void)
+{
+    ParamLearnConfig cfg = param_learn_config_defaults();
+
+    /* Slower forgetting for stable assets */
+    cfg.forgetting_lambda = 0.999; /* N_eff ≈ 1000 */
+    cfg.enable_regime_adaptive_forgetting = false;
+
+    return cfg;
+}
+
+ParamLearnConfig param_learn_config_no_forgetting(void)
+{
+    ParamLearnConfig cfg = param_learn_config_defaults();
+
+    /* Disable forgetting entirely (original behavior) */
+    cfg.enable_forgetting = false;
 
     return cfg;
 }
@@ -325,7 +372,7 @@ ParamLearnConfig param_learn_config_ewss(void)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * LIFECYCLE (with double-buffer allocation)
+ * LIFECYCLE
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static int storvik_soa_alloc(StorvikSoA *soa, int total_size)
@@ -409,7 +456,7 @@ int param_learn_init(ParamLearner *learner,
         return -1;
     }
 
-    /* Scratch for int arrays (n_obs, ticks_since_sample) during resampling */
+    /* Scratch for int arrays during resampling */
     learner->resample_scratch_int = (int *)aligned_alloc_64(
         learner->storvik_total_size * sizeof(int) * 2);
     if (!learner->resample_scratch_int)
@@ -513,6 +560,8 @@ void param_learn_reset(ParamLearner *learner)
     learner->samples_triggered_regime = 0;
     learner->samples_triggered_break = 0;
     learner->ticks_skipped_global = 0;
+    learner->forgetting_floor_hits_kappa = 0;
+    learner->forgetting_floor_hits_alpha = 0;
 
     memset(learner->ewss, 0, sizeof(learner->ewss));
     param_learn_broadcast_priors(learner);
@@ -599,16 +648,79 @@ void param_learn_broadcast_priors(ParamLearner *learner)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * STORVIK: STAT UPDATE (hot path - inlined)
+ * ADAPTIVE FORGETTING API
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void param_learn_set_forgetting(ParamLearner *learner, bool enable, param_real lambda)
+{
+    if (!learner)
+        return;
+
+    learner->config.enable_forgetting = enable;
+
+    if (lambda > 0.0 && lambda <= 1.0)
+    {
+        learner->config.forgetting_lambda = lambda;
+    }
+}
+
+void param_learn_set_regime_forgetting(ParamLearner *learner, int regime, param_real lambda)
+{
+    if (!learner)
+        return;
+    if (regime < 0 || regime >= learner->n_regimes)
+        return;
+    if (lambda <= 0.0 || lambda > 1.0)
+        return;
+
+    learner->config.enable_regime_adaptive_forgetting = true;
+    learner->config.forgetting_lambda_regime[regime] = lambda;
+}
+
+param_real param_learn_get_effective_sample_size(const ParamLearner *learner, int regime)
+{
+    if (!learner)
+        return 0.0;
+    if (!learner->config.enable_forgetting)
+        return (param_real)learner->tick;
+
+    param_real lambda = learner->config.forgetting_lambda;
+    if (learner->config.enable_regime_adaptive_forgetting &&
+        regime >= 0 && regime < learner->n_regimes)
+    {
+        lambda = learner->config.forgetting_lambda_regime[regime];
+    }
+
+    if (lambda >= 1.0)
+        return (param_real)learner->tick;
+    return 1.0 / (1.0 - lambda);
+}
+
+param_real param_learn_get_forgetting_lambda(const ParamLearner *learner, int regime)
+{
+    if (!learner || !learner->config.enable_forgetting)
+        return 1.0;
+
+    if (learner->config.enable_regime_adaptive_forgetting &&
+        regime >= 0 && regime < learner->n_regimes)
+    {
+        return learner->config.forgetting_lambda_regime[regime];
+    }
+
+    return learner->config.forgetting_lambda;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * STORVIK: STAT UPDATE WITH ADAPTIVE FORGETTING
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static PL_FORCE_INLINE void storvik_update_single_soa(
-    param_real *__restrict m_arr,
-    param_real *__restrict kappa_arr,
-    param_real *__restrict alpha_arr,
-    param_real *__restrict beta_arr,
-    int *__restrict n_obs_arr,
-    int *__restrict ticks_arr,
+    param_real *PL_RESTRICT m_arr,
+    param_real *PL_RESTRICT kappa_arr,
+    param_real *PL_RESTRICT alpha_arr,
+    param_real *PL_RESTRICT beta_arr,
+    int *PL_RESTRICT n_obs_arr,
+    int *PL_RESTRICT ticks_arr,
     int idx,
     param_real ell,
     param_real ell_lag,
@@ -616,24 +728,95 @@ static PL_FORCE_INLINE void storvik_update_single_soa(
     param_real one_minus_phi,
     param_real one_minus_phi_sq,
     param_real inv_one_minus_phi,
-    param_real inv_one_minus_phi_sq)
+    param_real inv_one_minus_phi_sq,
+    /* Forgetting parameters */
+    param_real lambda,
+    param_real kappa_floor,
+    param_real alpha_floor,
+    /* Diagnostics (can be NULL) */
+    uint64_t *floor_hits_kappa,
+    uint64_t *floor_hits_alpha)
 {
+    /* Transform observation */
     param_real z = ell - phi * ell_lag;
     param_real z_scaled = z * inv_one_minus_phi;
     param_real var_scale = inv_one_minus_phi_sq;
 
+    /* Load current stats */
     param_real kappa_old = kappa_arr[idx];
     param_real m_old = m_arr[idx];
+    param_real alpha_old = alpha_arr[idx];
+    param_real beta_old = beta_arr[idx];
 
-    param_real kappa_new = kappa_old + one_minus_phi_sq;
-    param_real m_new = (kappa_old * m_old + z * one_minus_phi) / kappa_new;
+    /*═══════════════════════════════════════════════════════════════════════
+     * ADAPTIVE FORGETTING
+     *
+     * Discount old sufficient statistics before accumulating new data.
+     * This prevents model fossilization over time.
+     *
+     * Floors prevent posterior collapse:
+     *   κ → 0: posterior mean undefined
+     *   α → 0: inverse-gamma improper
+     *═══════════════════════════════════════════════════════════════════════*/
 
-    param_real alpha_new = alpha_arr[idx] + 0.5;
+    param_real kappa_discounted, alpha_discounted, beta_discounted;
 
+    if (lambda < 1.0)
+    {
+        /* Discount kappa with floor */
+        kappa_discounted = lambda * kappa_old;
+        if (kappa_discounted < kappa_floor)
+        {
+            kappa_discounted = kappa_floor;
+            if (floor_hits_kappa)
+                (*floor_hits_kappa)++;
+        }
+
+        /* Discount alpha (excess above floor) */
+        param_real alpha_excess = alpha_old - alpha_floor;
+        if (alpha_excess < 0)
+            alpha_excess = 0;
+        alpha_discounted = alpha_floor + lambda * alpha_excess;
+        if (alpha_discounted < alpha_floor)
+        {
+            alpha_discounted = alpha_floor;
+            if (floor_hits_alpha)
+                (*floor_hits_alpha)++;
+        }
+
+        /* Discount beta */
+        beta_discounted = lambda * beta_old;
+    }
+    else
+    {
+        /* No forgetting (lambda = 1.0) */
+        kappa_discounted = kappa_old;
+        alpha_discounted = alpha_old;
+        beta_discounted = beta_old;
+    }
+
+    /* Discounted mean contribution */
+    param_real m_weighted_discounted = kappa_discounted * m_old;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * ACCUMULATE NEW OBSERVATION
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    /* κ_new = λ·κ_old + (1-φ)² */
+    param_real kappa_new = kappa_discounted + one_minus_phi_sq;
+
+    /* m_new = (λ·κ_old·m_old + z·(1-φ)) / κ_new */
+    param_real m_new = (m_weighted_discounted + z * one_minus_phi) / kappa_new;
+
+    /* α_new = λ·α_old + 0.5 */
+    param_real alpha_new = alpha_discounted + 0.5;
+
+    /* β_new = λ·β_old + 0.5·(z_scaled - m_old)² / (1/κ_old + var_scale) */
     param_real diff = z_scaled - m_old;
-    param_real total_var = 1.0 / kappa_old + var_scale;
-    param_real beta_new = beta_arr[idx] + 0.5 * diff * diff / total_var;
+    param_real total_var = 1.0 / kappa_discounted + var_scale;
+    param_real beta_new = beta_discounted + 0.5 * diff * diff / total_var;
 
+    /* Store updated stats */
     m_arr[idx] = m_new;
     kappa_arr[idx] = kappa_new;
     alpha_arr[idx] = alpha_new;
@@ -655,7 +838,7 @@ static void storvik_sample_soa(ParamLearner *learner, StorvikSoA *soa, int idx, 
     param_real alpha = soa->alpha[idx];
     param_real beta = soa->beta[idx];
 
-    /* Gamma sampling */
+    /* Gamma sampling (Marsaglia-Tsang) */
     param_real d = alpha - 1.0 / 3.0;
     param_real c = 1.0 / sqrt(9.0 * d);
     param_real gamma_sample;
@@ -703,7 +886,7 @@ static void storvik_sample_soa(ParamLearner *learner, StorvikSoA *soa, int idx, 
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * EWSS (for comparison)
+ * EWSS
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static void ewss_update(EWSSStats *e, const RegimePrior *prior,
@@ -736,7 +919,7 @@ static void ewss_compute_mle(EWSSStats *e, const RegimePrior *prior, param_real 
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * MAIN UPDATE (P0: GLOBAL TICK-SKIP + HFT INTERVALS)
+ * MAIN UPDATE
  *═══════════════════════════════════════════════════════════════════════════*/
 
 void param_learn_update(ParamLearner *learner,
@@ -749,17 +932,11 @@ void param_learn_update(ParamLearner *learner,
     const ParamLearnConfig *cfg = &learner->config;
     learner->tick++;
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * P0 OPTIMIZATION: Global tick-skip
-     *
-     * Skip entire function 90% of ticks UNLESS triggered.
-     * This is the single biggest latency win: 19μs → 0μs on skipped ticks.
-     *═══════════════════════════════════════════════════════════════════════*/
+    /* P0: Global tick-skip */
     if (cfg->enable_global_tick_skip && !learner->force_next_update)
     {
         learner->ticks_since_full_update++;
 
-        /* Check if any particle has regime change (requires update) */
         bool any_regime_change = false;
         for (int i = 0; i < n && i < learner->n_particles; i++)
         {
@@ -770,13 +947,12 @@ void param_learn_update(ParamLearner *learner,
             }
         }
 
-        /* Skip if: no trigger AND not at modulo boundary */
         if (!any_regime_change &&
             !learner->structural_break_flag &&
             (learner->ticks_since_full_update % cfg->global_skip_modulo) != 0)
         {
             learner->ticks_skipped_global++;
-            return; /* EARLY EXIT - 0μs */
+            return;
         }
     }
 
@@ -818,10 +994,7 @@ void param_learn_update(ParamLearner *learner,
         return;
     }
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * SLEEPING STORVIK (primary)
-     *═══════════════════════════════════════════════════════════════════════*/
-
+    /* SLEEPING STORVIK */
     StorvikSoA *soa = param_learn_get_active_soa(learner);
     int nr = learner->n_regimes;
     int np = learner->n_particles;
@@ -847,12 +1020,12 @@ void param_learn_update(ParamLearner *learner,
     }
 
     /* Hoist SoA pointers */
-    param_real *__restrict m_arr = soa->m;
-    param_real *__restrict kappa_arr = soa->kappa;
-    param_real *__restrict alpha_arr = soa->alpha;
-    param_real *__restrict beta_arr = soa->beta;
-    int *__restrict n_obs_arr = soa->n_obs;
-    int *__restrict ticks_arr = soa->ticks_since_sample;
+    param_real *PL_RESTRICT m_arr = soa->m;
+    param_real *PL_RESTRICT kappa_arr = soa->kappa;
+    param_real *PL_RESTRICT alpha_arr = soa->alpha;
+    param_real *PL_RESTRICT beta_arr = soa->beta;
+    int *PL_RESTRICT n_obs_arr = soa->n_obs;
+    int *PL_RESTRICT ticks_arr = soa->ticks_since_sample;
 
     /* Process each regime */
     for (int r = 0; r < nr; r++)
@@ -869,7 +1042,23 @@ void param_learn_update(ParamLearner *learner,
         const param_real inv_one_minus_phi_sq = prior->inv_one_minus_phi_sq;
         const int sample_interval = cfg->sample_interval[r];
 
-        /* PHASE 1: Update sufficient statistics (always runs) */
+        /* Get forgetting parameters for this regime */
+        param_real lambda = 1.0; /* No forgetting by default */
+        if (cfg->enable_forgetting)
+        {
+            if (cfg->enable_regime_adaptive_forgetting)
+            {
+                lambda = cfg->forgetting_lambda_regime[r];
+            }
+            else
+            {
+                lambda = cfg->forgetting_lambda;
+            }
+        }
+        const param_real kappa_floor = cfg->forgetting_kappa_floor;
+        const param_real alpha_floor = cfg->forgetting_alpha_floor;
+
+        /* PHASE 1: Update sufficient statistics */
 #ifdef __GNUC__
 #pragma GCC ivdep
 #endif
@@ -883,12 +1072,15 @@ void param_learn_update(ParamLearner *learner,
                 m_arr, kappa_arr, alpha_arr, beta_arr, n_obs_arr, ticks_arr,
                 idx, p->ell, p->ell_lag,
                 phi, one_minus_phi, one_minus_phi_sq,
-                inv_one_minus_phi, inv_one_minus_phi_sq);
+                inv_one_minus_phi, inv_one_minus_phi_sq,
+                lambda, kappa_floor, alpha_floor,
+                &learner->forgetting_floor_hits_kappa,
+                &learner->forgetting_floor_hits_alpha);
 
             learner->total_stat_updates++;
         }
 
-        /* PHASE 2: Sampling (conditional - expensive) */
+        /* PHASE 2: Sampling (conditional) */
         for (int k = 0; k < count; k++)
         {
             int i = worklist[r][k];
@@ -933,7 +1125,7 @@ void param_learn_signal_structural_break(ParamLearner *learner)
     if (learner)
     {
         learner->structural_break_flag = true;
-        learner->force_next_update = true; /* Override global skip */
+        learner->force_next_update = true;
     }
 }
 
@@ -1058,7 +1250,7 @@ void param_learn_force_sample(ParamLearner *learner, int particle_idx, int regim
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * RESAMPLING (P1: DOUBLE-BUFFER POINTER SWAP)
+ * RESAMPLING (DOUBLE-BUFFER POINTER SWAP)
  *═══════════════════════════════════════════════════════════════════════════*/
 
 void param_learn_copy_ancestor(ParamLearner *learner, int dst_particle, int src_particle)
@@ -1096,13 +1288,6 @@ void param_learn_apply_resampling(ParamLearner *learner, const int *ancestors, i
     int nr = learner->n_regimes;
     int np = learner->n_particles;
 
-    /*═══════════════════════════════════════════════════════════════════════
-     * P1 OPTIMIZATION: Write to inactive buffer, then swap pointers
-     *
-     * Before: 7× memcpy back = 2.1μs
-     * After:  Pointer swap = 0μs
-     *═══════════════════════════════════════════════════════════════════════*/
-
     int active = learner->active_buffer;
     int inactive = 1 - active;
 
@@ -1114,12 +1299,11 @@ void param_learn_apply_resampling(ParamLearner *learner, const int *ancestors, i
     {
         int anc = ancestors[i];
         if (anc < 0 || anc >= np)
-            anc = i; /* Fallback to self */
+            anc = i;
 
         int dst_base = i * nr;
         int src_base = anc * nr;
 
-        /* Copy param_real arrays */
         memcpy(&dst->m[dst_base], &src->m[src_base], nr * sizeof(param_real));
         memcpy(&dst->kappa[dst_base], &src->kappa[src_base], nr * sizeof(param_real));
         memcpy(&dst->alpha[dst_base], &src->alpha[src_base], nr * sizeof(param_real));
@@ -1128,18 +1312,14 @@ void param_learn_apply_resampling(ParamLearner *learner, const int *ancestors, i
         memcpy(&dst->sigma2_cached[dst_base], &src->sigma2_cached[src_base], nr * sizeof(param_real));
         memcpy(&dst->sigma_cached[dst_base], &src->sigma_cached[src_base], nr * sizeof(param_real));
 
-        /* Copy int arrays */
         memcpy(&dst->n_obs[dst_base], &src->n_obs[src_base], nr * sizeof(int));
         memcpy(&dst->ticks_since_sample[dst_base], &src->ticks_since_sample[src_base], nr * sizeof(int));
     }
 
-    /* SWAP: Just flip the active index */
+    /* SWAP */
     learner->active_buffer = inactive;
-
-    /* Store fence to ensure writes are visible */
     STORE_FENCE();
 
-    /* Trigger resampling if configured */
     if (learner->config.sample_after_resampling)
     {
         StorvikSoA *soa = param_learn_get_active_soa(learner);
@@ -1153,7 +1333,6 @@ void param_learn_apply_resampling(ParamLearner *learner, const int *ancestors, i
         }
     }
 
-    /* Force next update to run (override global skip) */
     learner->force_next_update = true;
 }
 
@@ -1169,7 +1348,7 @@ void param_learn_print_summary(const ParamLearner *learner)
     const char *method_str[] = {"SLEEPING_STORVIK", "EWSS", "FIXED"};
 
     printf("\n╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║      Parameter Learner Summary (P99 OPTIMIZED)               ║\n");
+    printf("║   Parameter Learner Summary (P99 + ADAPTIVE FORGETTING)      ║\n");
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("║ Method: %-20s                               ║\n", method_str[learner->config.method]);
     printf("║ Particles: %-4d  Regimes: %-4d  Tick: %-8d               ║\n",
@@ -1204,8 +1383,38 @@ void param_learn_print_summary(const ParamLearner *learner)
     }
 
     printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ Adaptive Forgetting:                                         ║\n");
+    printf("║   Enabled: %s                                                ║\n",
+           learner->config.enable_forgetting ? "YES" : "NO ");
+
+    if (learner->config.enable_forgetting)
+    {
+        param_real lambda = learner->config.forgetting_lambda;
+        param_real n_eff = 1.0 / (1.0 - lambda);
+        printf("║   Lambda: %.4f  (N_eff ≈ %.0f)                              ║\n",
+               lambda, n_eff);
+        printf("║   Kappa floor: %.1f   Alpha floor: %.1f                       ║\n",
+               learner->config.forgetting_kappa_floor,
+               learner->config.forgetting_alpha_floor);
+        printf("║   Floor hits: κ=%llu  α=%llu                                  ║\n",
+               (unsigned long long)learner->forgetting_floor_hits_kappa,
+               (unsigned long long)learner->forgetting_floor_hits_alpha);
+
+        if (learner->config.enable_regime_adaptive_forgetting)
+        {
+            printf("║   Regime-adaptive: YES                                       ║\n");
+            for (int r = 0; r < learner->n_regimes && r < 4; r++)
+            {
+                param_real lam = learner->config.forgetting_lambda_regime[r];
+                printf("║     R%d: λ=%.4f (N_eff ≈ %.0f)                              ║\n",
+                       r, lam, 1.0 / (1.0 - lam));
+            }
+        }
+    }
+
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("║ Sampling Intervals:                                          ║\n");
-    for (int r = 0; r < learner->n_regimes; r++)
+    for (int r = 0; r < learner->n_regimes && r < 4; r++)
     {
         printf("║   R%d: every %3d ticks                                        ║\n",
                r, learner->config.sample_interval[r]);
@@ -1225,6 +1434,13 @@ void param_learn_print_regime_stats(const ParamLearner *learner, int regime)
 
     printf("\n─── Regime %d Statistics ───\n", regime);
     printf("Prior: μ=%.4f, φ=%.4f, σ=%.4f\n", p->m, p->phi, p->sigma_prior);
+
+    if (learner->config.enable_forgetting)
+    {
+        param_real lambda = param_learn_get_forgetting_lambda(learner, regime);
+        param_real n_eff = param_learn_get_effective_sample_size(learner, regime);
+        printf("Forgetting: λ=%.4f, N_eff=%.0f\n", lambda, n_eff);
+    }
 
     if (learner->config.method == PARAM_LEARN_EWSS)
     {

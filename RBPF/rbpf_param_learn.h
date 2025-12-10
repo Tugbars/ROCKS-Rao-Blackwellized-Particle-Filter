@@ -9,6 +9,12 @@
  *   - Global tick-skip for 90% duty cycle reduction
  *   - Aligned memory for AVX-512
  *
+ * Adaptive Forgetting (NEW):
+ *   - Source: RiskMetrics (1996), West & Harrison (1997)
+ *   - Prevents model fossilization by discounting sufficient statistics
+ *   - N_eff ≈ 1/(1-λ) where λ is the discount factor
+ *   - Regime-adaptive forgetting rates supported
+ *
  * Target: P99 < 25μs (down from 60μs)
  *
  * ═══════════════════════════════════════════════════════════════════════════
@@ -105,28 +111,31 @@ typedef PARAM_LEARN_REAL param_real;
 /* Force inline for hot path */
 #if defined(__GNUC__) || defined(__clang__)
 #define PL_FORCE_INLINE __attribute__((always_inline)) inline
+#define PL_RESTRICT __restrict__
 #elif defined(_MSC_VER)
 #define PL_FORCE_INLINE __forceinline
+#define PL_RESTRICT __restrict
 #else
 #define PL_FORCE_INLINE inline
+#define PL_RESTRICT
 #endif
 
     typedef struct
     {
         /* NIG Posterior Hyperparameters (updated every tick) */
-        param_real *__restrict m;
-        param_real *__restrict kappa;
-        param_real *__restrict alpha;
-        param_real *__restrict beta;
+        param_real *PL_RESTRICT m;
+        param_real *PL_RESTRICT kappa;
+        param_real *PL_RESTRICT alpha;
+        param_real *PL_RESTRICT beta;
 
         /* Cached Samples (updated only when "awake") */
-        param_real *__restrict mu_cached;
-        param_real *__restrict sigma2_cached;
-        param_real *__restrict sigma_cached;
+        param_real *PL_RESTRICT mu_cached;
+        param_real *PL_RESTRICT sigma2_cached;
+        param_real *PL_RESTRICT sigma_cached;
 
         /* Tracking */
-        int *__restrict n_obs;
-        int *__restrict ticks_since_sample;
+        int *PL_RESTRICT n_obs;
+        int *PL_RESTRICT ticks_since_sample;
     } StorvikSoA;
 
     /*═══════════════════════════════════════════════════════════════════════════
@@ -205,6 +214,42 @@ typedef PARAM_LEARN_REAL param_real;
          *───────────────────────────────────────────────────────────────────────*/
         bool enable_global_tick_skip;
         int global_skip_modulo; /* Run every N ticks (default: 10) */
+
+        /*─────────────────────────────────────────────────────────────────────────
+         * ADAPTIVE FORGETTING (RiskMetrics-style discount)
+         *
+         * Source: J.P. Morgan RiskMetrics (1996), West & Harrison (1997)
+         *
+         * Prevents model fossilization by exponentially discounting old data.
+         * Without forgetting, posteriors become too tight over time and the
+         * model cannot adapt to regime drift or structural changes.
+         *
+         * Effective sample size ≈ 1/(1-λ):
+         *   λ = 0.990 → N_eff ≈ 100  (fast adaptation, ~2 min memory)
+         *   λ = 0.995 → N_eff ≈ 200  (moderate)
+         *   λ = 0.997 → N_eff ≈ 333  (default, ~5 min memory)
+         *   λ = 0.999 → N_eff ≈ 1000 (slow, stable)
+         *
+         * Floors prevent posterior collapse:
+         *   κ → 0: posterior mean undefined (infinite variance)
+         *   α → 0: inverse-gamma becomes improper (no mode)
+         *───────────────────────────────────────────────────────────────────────*/
+        bool enable_forgetting;            /* Enable adaptive forgetting (default: true) */
+        param_real forgetting_lambda;      /* Discount factor (default: 0.997) */
+        param_real forgetting_kappa_floor; /* Min kappa to prevent collapse (default: 5.0) */
+        param_real forgetting_alpha_floor; /* Min alpha to keep proper (default: 3.0) */
+
+        /*─────────────────────────────────────────────────────────────────────────
+         * REGIME-ADAPTIVE FORGETTING (Optional)
+         *
+         * Different decay rates per regime for asymmetric learning:
+         *   R0 (calm):   High λ (slow forgetting) → trust historical params
+         *   R3 (crisis): Low λ (fast forgetting) → adapt quickly
+         *
+         * Creates desirable behavior: stable in calm, adaptive in crisis.
+         *───────────────────────────────────────────────────────────────────────*/
+        bool enable_regime_adaptive_forgetting;
+        param_real forgetting_lambda_regime[PARAM_LEARN_MAX_REGIMES];
 
     } ParamLearnConfig;
 
@@ -290,7 +335,11 @@ typedef PARAM_LEARN_REAL param_real;
         uint64_t samples_skipped_load;
         uint64_t samples_triggered_regime;
         uint64_t samples_triggered_break;
-        uint64_t ticks_skipped_global; /* New: count global skips */
+        uint64_t ticks_skipped_global;
+
+        /* Forgetting diagnostics */
+        uint64_t forgetting_floor_hits_kappa; /* Times kappa hit floor */
+        uint64_t forgetting_floor_hits_alpha; /* Times alpha hit floor */
 
     } ParamLearner;
 
@@ -300,6 +349,7 @@ typedef PARAM_LEARN_REAL param_real;
 
     /**
      * Default: HFT-optimized sleeping intervals [50, 20, 5, 1]
+     * Forgetting ENABLED by default (λ = 0.997, N_eff ≈ 333)
      *
      * CHANGED from always-awake to sleeping mode for P99 optimization.
      * Use param_learn_config_full_bayesian() if you need every-tick updates.
@@ -313,15 +363,29 @@ typedef PARAM_LEARN_REAL param_real;
 
     /**
      * Full Bayesian: sample every tick in all regimes.
+     * Forgetting DISABLED (true Bayesian accumulation).
      * Highest accuracy, highest latency (~45μs).
      */
     ParamLearnConfig param_learn_config_full_bayesian(void);
 
     /**
      * HFT mode: Aggressive sleeping + global tick-skip.
+     * Forgetting ENABLED with regime-adaptive rates.
      * Lowest latency (~5μs average), relies on triggers.
      */
     ParamLearnConfig param_learn_config_hft(void);
+
+    /**
+     * Stable mode: Slow forgetting (λ = 0.999, N_eff ≈ 1000).
+     * Good for assets with stable parameters.
+     */
+    ParamLearnConfig param_learn_config_stable(void);
+
+    /**
+     * No forgetting: Original behavior (parameters converge to global average).
+     * Not recommended for production on non-stationary data.
+     */
+    ParamLearnConfig param_learn_config_no_forgetting(void);
 
     /**
      * EWSS mode for comparison.
@@ -385,6 +449,52 @@ typedef PARAM_LEARN_REAL param_real;
 
     void param_learn_apply_resampling(ParamLearner *learner,
                                       const int *ancestors, int n);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API: Adaptive Forgetting
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Enable/disable adaptive forgetting at runtime
+     *
+     * @param learner  Parameter learner
+     * @param enable   true to enable, false to disable
+     * @param lambda   Discount factor (0 < λ ≤ 1), ignored if ≤ 0
+     */
+    void param_learn_set_forgetting(ParamLearner *learner, bool enable, param_real lambda);
+
+    /**
+     * Set regime-specific forgetting rate
+     *
+     * Enables regime-adaptive forgetting and sets λ for specified regime.
+     * Call for each regime you want to customize.
+     *
+     * @param learner  Parameter learner
+     * @param regime   Regime index
+     * @param lambda   Discount factor for this regime
+     */
+    void param_learn_set_regime_forgetting(ParamLearner *learner, int regime, param_real lambda);
+
+    /**
+     * Get effective sample size for a regime
+     *
+     * N_eff ≈ 1/(1-λ) for exponential forgetting.
+     * Returns actual tick count if forgetting is disabled.
+     *
+     * @param learner  Parameter learner
+     * @param regime   Regime index (-1 for global λ)
+     * @return         Effective sample size
+     */
+    param_real param_learn_get_effective_sample_size(const ParamLearner *learner, int regime);
+
+    /**
+     * Get forgetting lambda for a regime
+     *
+     * @param learner  Parameter learner
+     * @param regime   Regime index
+     * @return         Lambda value, or 1.0 if forgetting disabled
+     */
+    param_real param_learn_get_forgetting_lambda(const ParamLearner *learner, int regime);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API: Diagnostics
