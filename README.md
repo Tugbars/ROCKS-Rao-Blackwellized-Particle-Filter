@@ -24,7 +24,7 @@ A production-grade Rao-Blackwellized particle filter combining:
 - **Avg latency**: ~20-55μs (depending on configuration)
 - **P99 latency**: <120μs
 - **Outlier RMSE**: 0.73 (vs 1.55 baseline)
-- **Regime accuracy**: 70% across calm/crisis/recovery scenarios
+- **Regime accuracy**: 70% across calm/crisis/recovery scenarios, without utilizing any change detection algorithm, just by RBPF alone. 
 
 Optimized for Intel CPUs (Haswell+). Tested against 12σ flash crashes and fat-tailed crisis regimes.
 <img width="1187" height="217" alt="Screenshot 2025-12-10 190857" src="https://github.com/user-attachments/assets/df3240c9-80c1-492e-b50d-34b8edad4629" />
