@@ -539,6 +539,12 @@ rbpf_real_t rbpf_ksc_compute_outlier_fraction(
         weighted_sum += w * post_out;
     }
 
+    /* Final clamp to [0, 1] for numerical safety */
+    if (weighted_sum < RBPF_REAL(0.0))
+        weighted_sum = RBPF_REAL(0.0);
+    if (weighted_sum > RBPF_REAL(1.0))
+        weighted_sum = RBPF_REAL(1.0);
+
     return weighted_sum;
 }
 
@@ -832,6 +838,9 @@ rbpf_real_t rbpf_ksc_compute_outlier_fraction(
         weighted_sum += w * post_out;
     }
 
+    /* Final clamp to [0, 1] for numerical safety */
+    weighted_sum = fmaxf(0.0f, fminf(1.0f, weighted_sum));
+
     return weighted_sum;
 }
 
@@ -1070,6 +1079,9 @@ rbpf_real_t rbpf_ksc_compute_outlier_fraction(
 
         weighted_sum += w * post_out;
     }
+
+    /* Final clamp to [0, 1] for numerical safety */
+    weighted_sum = fmaxf(0.0f, fminf(1.0f, weighted_sum));
 
     return weighted_sum;
 }

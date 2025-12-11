@@ -45,6 +45,9 @@ if(RBPF_ENABLE_STORVIK)
         
         # Hawkes intensity
         hawkes/hawkes_intensity.c
+        
+        # MMPF (Multi-Model Particle Filter)
+        mmpf/mmpf_rocks.c
     )
 endif()
 
@@ -63,6 +66,7 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/hawkes
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
+        ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
 )
 
 target_link_libraries(rocks 
@@ -159,6 +163,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_rbpf_csv PRIVATE ${COMMON_DEFS})
     endif()
 
+    # MMPF correctness tests
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_correctness.c)
+        add_executable(test_mmpf_correctness
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_correctness.c
+        )
+        target_link_libraries(test_mmpf_correctness PRIVATE rocks)
+        target_compile_options(test_mmpf_correctness PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_mmpf_correctness PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
         add_executable(example_usage
@@ -232,6 +246,7 @@ if(RBPF_ENABLE_STORVIK)
         hawkes/hawkes_intensity.h
         pmmh/pmmh_mkl.h
         duration_tracker/duration_tracker_fast.h
+        mmpf/mmpf_rocks.h
     )
 endif()
 
