@@ -433,10 +433,20 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.global_mu_vol_init = RBPF_REAL(-4.4); /* log(0.012) ≈ 1.2% vol */
     cfg.global_mu_vol_alpha = RBPF_REAL(0.999);
 
-    /* Offsets in log-vol space */
-    cfg.mu_vol_offsets[MMPF_CALM] = RBPF_REAL(-1.0);  /* exp(-1) = 0.37× trend vol */
+    /* Offsets in log-vol space - WIDENED for clear discrimination
+     *
+     * Problem: With narrow offsets, when actual vol is between hypotheses,
+     * multiple models get similar likelihoods → indecisive weights.
+     *
+     * Solution: Wider separation means one hypothesis is clearly "right":
+     *   Calm:   -1.5 → exp(-1.5) = 0.22× baseline (was 0.37×)
+     *   Crisis: +2.0 → exp(+2.0) = 7.4× baseline  (was 4.5×)
+     *
+     * This creates bigger likelihood gaps → more decisive weights.
+     */
+    cfg.mu_vol_offsets[MMPF_CALM] = RBPF_REAL(-1.5);  /* exp(-1.5) = 0.22× trend vol */
     cfg.mu_vol_offsets[MMPF_TREND] = RBPF_REAL(0.0);  /* = baseline */
-    cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(1.5); /* exp(1.5) = 4.5× trend vol */
+    cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(2.0); /* exp(2.0) = 7.4× trend vol */
 
     /* Fair Weather Gate: freeze baseline during crisis to prevent corruption
      * Hysteresis prevents flickering: freeze at 50%, unfreeze at 40% */
@@ -801,11 +811,17 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         param_learn_broadcast_priors(&mmpf->ext[k]->storvik);
 
         /* CRITICAL: Sync initial params from Storvik → RBPF
-         * Only if learning sync is enabled. When disabled (for unit tests),
-         * RBPF uses fixed global hypothesis params for discrimination. */
+         * Only if learning sync is enabled. When disabled (for global baseline),
+         * RBPF uses params[r].mu_vol which we set from baseline + offsets. */
         if (cfg.enable_storvik_sync)
         {
             mmpf_sync_parameters(mmpf->ext[k]);
+        }
+        else
+        {
+            /* Explicitly disable particle-level params so RBPF uses
+             * our regime params (set from global baseline + offsets) */
+            mmpf->ext[k]->rbpf->use_learned_params = 0;
         }
     }
 
@@ -928,8 +944,19 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
         param_learn_reset(&mmpf->ext[k]->storvik);
         param_learn_broadcast_priors(&mmpf->ext[k]->storvik);
 
-        /* CRITICAL: Sync initial params from Storvik → RBPF */
-        mmpf_sync_parameters(mmpf->ext[k]);
+        /* Sync params from Storvik → RBPF ONLY if sync is enabled.
+         * With global baseline architecture, we want RBPF to use params[r].mu_vol
+         * which we set from baseline + offset, NOT Storvik-learned values. */
+        if (mmpf->config.enable_storvik_sync)
+        {
+            mmpf_sync_parameters(mmpf->ext[k]);
+        }
+        else
+        {
+            /* Explicitly disable particle-level params so RBPF uses
+             * our regime params (set from global baseline + offsets) */
+            mmpf->ext[k]->rbpf->use_learned_params = 0;
+        }
     }
 
     /* Reset weights */
