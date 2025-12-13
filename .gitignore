@@ -28,3 +28,10 @@ rbpf_ssa_integration/SSA_RBPF_BRIDGE.md
 test/.ipynb_checkpoints/rbpf_comparison_analysis-checkpoint.ipynb
 quant_stack_architecture.md
 RBPF/mmpf/bocpd_mmpf_architecture.md
+test/mmpf_real_data_test/plots/output_spy_5year_SVB_crisis.png
+test/mmpf_real_data_test/plots/output_spy_5year_Oct_2022_bottom.png
+test/mmpf_real_data_test/plots/output_spy_5year_overview.png
+test/mmpf_real_data_test/plots/output_spy_5year_latency.png
+test/mmpf_real_data_test/plots/output_spy_5year_Fed_hike_2022.png
+test/mmpf_real_data_test/plots/output_spy_5year_Aug_2024_selloff.png
+test/mmpf_real_data_test/output_spy_5year.csv

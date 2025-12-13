@@ -417,18 +417,41 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.n_ksc_regimes = 4;
     cfg.n_storvik_regimes = 4;
 
-    /* Calm: tight mean-reversion */
-    cfg.hypotheses[MMPF_CALM].mu_vol = RBPF_REAL(-1.0);
+    /*═══════════════════════════════════════════════════════════════════════
+     * GLOBAL BASELINE CONFIGURATION
+     *
+     * Offsets chosen for clear separation in log-vol space:
+     *   - Calm:   baseline - 1.0  →  ~2.7× lower vol than Trend
+     *   - Trend:  baseline + 0.0  →  reference point
+     *   - Crisis: baseline + 1.5  →  ~4.5× higher vol than Trend
+     *
+     * Initial baseline: log(0.012) ≈ -4.4 (1.2% daily vol, typical SPY)
+     * EWMA alpha: 0.999 → half-life ≈ 693 ticks (slow adaptation)
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    cfg.enable_global_baseline = 1;
+    cfg.global_mu_vol_init = RBPF_REAL(-4.4); /* log(0.012) ≈ 1.2% vol */
+    cfg.global_mu_vol_alpha = RBPF_REAL(0.999);
+
+    /* Offsets in log-vol space */
+    cfg.mu_vol_offsets[MMPF_CALM] = RBPF_REAL(-1.0);  /* exp(-1) = 0.37× trend vol */
+    cfg.mu_vol_offsets[MMPF_TREND] = RBPF_REAL(0.0);  /* = baseline */
+    cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(1.5); /* exp(1.5) = 4.5× trend vol */
+
+    /* Gated dynamics learning */
+    cfg.enable_gated_learning = 1;
+    cfg.gated_learning_threshold = RBPF_REAL(0.0); /* Soft gate (weight by prob) */
+
+    /* Initial hypothesis params (computed from global baseline + offsets) */
+    cfg.hypotheses[MMPF_CALM].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CALM];
     cfg.hypotheses[MMPF_CALM].phi = RBPF_REAL(0.98);
     cfg.hypotheses[MMPF_CALM].sigma_eta = RBPF_REAL(0.10);
 
-    /* Trend: moderate */
-    cfg.hypotheses[MMPF_TREND].mu_vol = RBPF_REAL(-0.5);
+    cfg.hypotheses[MMPF_TREND].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_TREND];
     cfg.hypotheses[MMPF_TREND].phi = RBPF_REAL(0.95);
     cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.20);
 
-    /* Crisis: explosive */
-    cfg.hypotheses[MMPF_CRISIS].mu_vol = RBPF_REAL(0.0);
+    cfg.hypotheses[MMPF_CRISIS].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CRISIS];
     cfg.hypotheses[MMPF_CRISIS].phi = RBPF_REAL(0.80);
     cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50);
 
@@ -438,7 +461,12 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.crisis_exit_boost = RBPF_REAL(0.92);
     cfg.min_mixing_prob = RBPF_REAL(0.01); /* 1% minimum transition probability */
     cfg.enable_adaptive_stickiness = 1;
-    cfg.enable_storvik_sync = 1; /* Enable by default; disable for hypothesis discrimination tests */
+
+    /* Storvik sync DISABLED by default when using global baseline.
+     * The baseline handles secular adaptation. Per-hypothesis μ_vol learning
+     * would cause convergence (Icarus Paradox). Only enable for special cases.
+     */
+    cfg.enable_storvik_sync = 0; /* OFF: global baseline provides adaptation */
 
     /* Zero return handling (HFT critical)
      * Policy: 0=skip update, 1=use floor, 2=censored interval (not implemented)
@@ -843,6 +871,25 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
     }
     mmpf->weighted_vol_std = RBPF_REAL(0.0); /* No uncertainty at init */
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * INITIALIZE GLOBAL BASELINE TRACKING
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    mmpf->global_mu_vol = cfg.global_mu_vol_init;
+    mmpf->prev_weighted_log_vol = cfg.global_mu_vol_init;
+
+    /* Initialize gated dynamics learners */
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        mmpf->gated_dynamics[k].sum_xy = 0.0;
+        mmpf->gated_dynamics[k].sum_xx = 0.0;
+        mmpf->gated_dynamics[k].sum_resid_sq = 0.0;
+        mmpf->gated_dynamics[k].sum_weight = 0.0;
+        mmpf->gated_dynamics[k].phi = (double)cfg.hypotheses[k].phi;
+        mmpf->gated_dynamics[k].sigma_eta = (double)cfg.hypotheses[k].sigma_eta;
+        mmpf->gated_dynamics[k].prev_state = (double)cfg.global_mu_vol_init;
+    }
+
     return mmpf;
 }
 
@@ -912,6 +959,38 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
     mmpf->total_steps = 0;
     mmpf->regime_switches = 0;
     mmpf->imm_mix_count = 0;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * RESET GLOBAL BASELINE
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    mmpf->global_mu_vol = log_vol;
+    mmpf->prev_weighted_log_vol = log_vol;
+
+    /* Reanchor hypotheses around new baseline */
+    if (mmpf->config.enable_global_baseline)
+    {
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            rbpf_real_t mu_k = log_vol + mmpf->config.mu_vol_offsets[k];
+            RBPF_Extended *ext = mmpf->ext[k];
+            for (int r = 0; r < ext->rbpf->n_regimes; r++)
+            {
+                ext->rbpf->params[r].mu_vol = mu_k;
+            }
+        }
+    }
+
+    /* Reset gated dynamics learners */
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        mmpf->gated_dynamics[k].sum_xy = 0.0;
+        mmpf->gated_dynamics[k].sum_xx = 0.0;
+        mmpf->gated_dynamics[k].sum_resid_sq = 0.0;
+        mmpf->gated_dynamics[k].sum_weight = 0.0;
+        /* Keep current phi/sigma_eta, just reset accumulators */
+        mmpf->gated_dynamics[k].prev_state = (double)log_vol;
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -920,6 +999,36 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
 
 void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 {
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 0: UPDATE GLOBAL BASELINE ("Climate")
+     *
+     * Use slow EWMA on previous tick's weighted log-vol output.
+     * This tracks secular drift (decade-scale) without chasing noise.
+     *
+     * Then reanchor each hypothesis = baseline + fixed offset.
+     * This preserves discrimination while allowing adaptation.
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    if (mmpf->config.enable_global_baseline)
+    {
+        /* Update baseline from previous output */
+        rbpf_real_t alpha = mmpf->config.global_mu_vol_alpha;
+        mmpf->global_mu_vol = alpha * mmpf->global_mu_vol + (RBPF_REAL(1.0) - alpha) * mmpf->prev_weighted_log_vol;
+
+        /* Reanchor each hypothesis */
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            rbpf_real_t mu_k = mmpf->global_mu_vol + mmpf->config.mu_vol_offsets[k];
+
+            /* Push to underlying RBPF regime params */
+            RBPF_Extended *ext = mmpf->ext[k];
+            for (int r = 0; r < ext->rbpf->n_regimes; r++)
+            {
+                ext->rbpf->params[r].mu_vol = mu_k;
+            }
+        }
+    }
 
     /* 1. Update stickiness from t-1 OCSN */
     update_transition_matrix(mmpf);
@@ -1191,6 +1300,94 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
     }
 
     mmpf->total_steps++;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 10: SAVE WEIGHTED LOG-VOL FOR NEXT TICK'S BASELINE UPDATE
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    mmpf->prev_weighted_log_vol = mmpf->weighted_log_vol;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 11: GATED DYNAMICS LEARNING (φ, σ_η per-hypothesis)
+     *
+     * Each hypothesis learns its OWN dynamics from data where IT is dominant.
+     * This is the "Structural Memory" effect: Crisis remembers how to be crisis
+     * even after years of calm, because it only learned from crisis data.
+     *
+     * We learn φ and σ_η, NOT μ_vol (that comes from global baseline).
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    if (mmpf->config.enable_gated_learning && !skip_update)
+    {
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            rbpf_real_t w_k = mmpf->weights[k];
+
+            /* Skip if below threshold */
+            if (w_k < mmpf->config.gated_learning_threshold)
+            {
+                /* Still update prev_state to keep tracking */
+                mmpf->gated_dynamics[k].prev_state = (double)mmpf->model_output[k].log_vol_mean;
+                continue;
+            }
+
+            /* Get current state estimate from this model */
+            rbpf_real_t x_curr = mmpf->model_output[k].log_vol_mean;
+            double x_prev = mmpf->gated_dynamics[k].prev_state;
+            double mu_k = (double)(mmpf->global_mu_vol + mmpf->config.mu_vol_offsets[k]);
+
+            /* Center around anchor */
+            double centered_prev = x_prev - mu_k;
+            double centered_curr = (double)x_curr - mu_k;
+
+            /* Accumulate weighted sufficient statistics */
+            double w = (double)w_k;
+            mmpf->gated_dynamics[k].sum_xy += w * centered_prev * centered_curr;
+            mmpf->gated_dynamics[k].sum_xx += w * centered_prev * centered_prev;
+
+            /* Residual using current φ estimate */
+            double phi = mmpf->gated_dynamics[k].phi;
+            double predicted = phi * centered_prev;
+            double residual = centered_curr - predicted;
+            mmpf->gated_dynamics[k].sum_resid_sq += w * residual * residual;
+            mmpf->gated_dynamics[k].sum_weight += w;
+
+            /* Update estimates when enough weight accumulated */
+            if (mmpf->gated_dynamics[k].sum_weight > 10.0)
+            {
+                /* φ = Σxy / Σxx (weighted OLS) */
+                double new_phi = mmpf->gated_dynamics[k].sum_xy /
+                                 (mmpf->gated_dynamics[k].sum_xx + 1e-10);
+                new_phi = fmax(0.5, fmin(0.999, new_phi)); /* Clamp to valid range */
+
+                /* σ_η = sqrt(Σresid² / Σw) */
+                double new_sigma = sqrt(mmpf->gated_dynamics[k].sum_resid_sq /
+                                        mmpf->gated_dynamics[k].sum_weight);
+                new_sigma = fmax(0.01, fmin(1.0, new_sigma)); /* Clamp */
+
+                mmpf->gated_dynamics[k].phi = new_phi;
+                mmpf->gated_dynamics[k].sigma_eta = new_sigma;
+
+                /* Push to RBPF */
+                RBPF_Extended *ext = mmpf->ext[k];
+                for (int r = 0; r < ext->rbpf->n_regimes; r++)
+                {
+                    ext->rbpf->params[r].theta = (rbpf_real_t)(1.0 - new_phi);
+                    ext->rbpf->params[r].sigma_vol = (rbpf_real_t)new_sigma;
+                }
+
+                /* Exponential forgetting (keeps it adaptive) */
+                double forget = 0.99;
+                mmpf->gated_dynamics[k].sum_xy *= forget;
+                mmpf->gated_dynamics[k].sum_xx *= forget;
+                mmpf->gated_dynamics[k].sum_resid_sq *= forget;
+                mmpf->gated_dynamics[k].sum_weight *= forget;
+            }
+
+            /* Save state for next tick */
+            mmpf->gated_dynamics[k].prev_state = (double)x_curr;
+        }
+    }
 
     /* Fill output structure if provided */
     if (output)

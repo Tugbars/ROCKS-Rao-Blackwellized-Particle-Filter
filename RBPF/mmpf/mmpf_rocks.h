@@ -187,6 +187,37 @@ extern "C"
         /* RNG seed */
         uint64_t rng_seed;
 
+        /*═══════════════════════════════════════════════════════════════════════
+         * GLOBAL BASELINE ("Climate vs Weather")
+         *
+         * The key insight: Learn ONE global baseline that tracks secular drift,
+         * then define hypotheses as FIXED OFFSETS from that baseline.
+         *
+         * μ_base = EWMA(weighted_log_vol)     ← adapts to decade
+         * μ_calm   = μ_base + offset_calm     ← fixed structure
+         * μ_trend  = μ_base + offset_trend    ← fixed structure
+         * μ_crisis = μ_base + offset_crisis   ← fixed structure
+         *
+         * This prevents the Icarus Paradox: hypotheses can't converge because
+         * their offsets are constants. Discrimination is structurally guaranteed.
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        int enable_global_baseline;                /* 1 = use adaptive baseline (recommended) */
+        rbpf_real_t global_mu_vol_init;            /* Initial baseline (e.g., log(0.01) = -4.6) */
+        rbpf_real_t global_mu_vol_alpha;           /* EWMA decay (0.999 = ~1000 tick half-life) */
+        rbpf_real_t mu_vol_offsets[MMPF_N_MODELS]; /* Relative offsets from baseline */
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * GATED DYNAMICS LEARNING
+         *
+         * When enabled, each hypothesis learns its OWN φ and σ_η from data
+         * where IT is dominant. Prevents "pollution" of Crisis learning from
+         * Calm data.
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        int enable_gated_learning;            /* 1 = weight dynamics updates by regime prob */
+        rbpf_real_t gated_learning_threshold; /* Min weight to update (0.0 = soft gate) */
+
     } MMPF_Config;
 
     /*═══════════════════════════════════════════════════════════════════════════
@@ -361,6 +392,31 @@ extern "C"
         /* Shock state */
         int shock_active;                     /* 1 if currently in shock mode */
         rbpf_real_t process_noise_multiplier; /* Applied to sigma_vol during shock */
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * GLOBAL BASELINE TRACKING STATE
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        rbpf_real_t global_mu_vol;         /* Current baseline (updated each tick) */
+        rbpf_real_t prev_weighted_log_vol; /* Previous output (for EWMA update) */
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * GATED DYNAMICS LEARNING STATE
+         *
+         * Per-hypothesis sufficient statistics for learning φ and σ_η.
+         * These are SEPARATE from Storvik's μ_vol learning (which we disable).
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        struct
+        {
+            double sum_xy;       /* Σ w × x_{t-1} × x_t */
+            double sum_xx;       /* Σ w × x_{t-1}² */
+            double sum_resid_sq; /* Σ w × (x_t - φ×x_{t-1})² */
+            double sum_weight;   /* Σ w (effective sample size) */
+            double phi;          /* Current learned φ */
+            double sigma_eta;    /* Current learned σ_η */
+            double prev_state;   /* x_{t-1} for this hypothesis */
+        } gated_dynamics[MMPF_N_MODELS];
 
     } MMPF_ROCKS;
 
