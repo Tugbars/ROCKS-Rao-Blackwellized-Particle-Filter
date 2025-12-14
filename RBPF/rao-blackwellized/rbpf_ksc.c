@@ -279,6 +279,8 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->student_t_enabled = 0;
 #endif
 
+    memset(&rbpf->mkl_workspace, 0, sizeof(rbpf->mkl_workspace));
+
     /* MKL fast math mode */
     vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
 
@@ -331,6 +333,8 @@ void rbpf_ksc_destroy(RBPF_KSC *rbpf)
     mkl_free(rbpf->particle_sigma_vol);
     mkl_free(rbpf->particle_mu_vol_tmp);
     mkl_free(rbpf->particle_sigma_vol_tmp);
+
+    rbpf_ksc_mkl_free(rbpf);
 
     /*═══════════════════════════════════════════════════════════════════════
      * STUDENT-T CLEANUP
