@@ -938,6 +938,17 @@ static void print_comparison(SummaryMetrics *metrics, TickRecord *records[NUM_MO
            metrics[0].avg_outlier_frac_on_outliers, metrics[1].avg_outlier_frac_on_outliers);
 
     printf("────────────────────────────────────────────────────────────────────────────\n");
+    printf("  ★ THE MONEY SHOT: Outlier Handling (lower is better)\n");
+    printf("────────────────────────────────────────────────────────────────────────────\n");
+
+    /* Spurious switches - THE KEY DIFFERENTIATOR */
+    printf("%-32s %15d %15d\n", "Spurious Crisis on Outlier",
+           metrics[0].spurious_switches_on_outlier, metrics[1].spurious_switches_on_outlier);
+    printf("%-32s %13d/%d %13d/%d\n", "Regime Stable After Outlier",
+           metrics[0].regime_stable_after_outlier, metrics[0].total_outliers_in_non_crisis,
+           metrics[1].regime_stable_after_outlier, metrics[1].total_outliers_in_non_crisis);
+
+    printf("────────────────────────────────────────────────────────────────────────────\n");
 
     /* Timing */
     printf("%-32s %15.2f %15.2f\n", "Median Latency (us)",
@@ -1057,6 +1068,25 @@ int main(int argc, char **argv)
     printf("4. What's the latency cost of MMPF?\n");
     printf("   → MMPF median latency: %.1f us (vs %.1f us single)\n",
            metrics[1].avg_latency_us, metrics[0].avg_latency_us);
+
+    printf("\n★ 5. THE MONEY SHOT: Does MMPF resist false alarms on outliers?\n");
+    printf("   → Spurious Crisis switches: Single=%d, MMPF=%d\n",
+           metrics[0].spurious_switches_on_outlier, metrics[1].spurious_switches_on_outlier);
+    printf("   → Regime stability after outlier: Single=%d/%d, MMPF=%d/%d\n",
+           metrics[0].regime_stable_after_outlier, metrics[0].total_outliers_in_non_crisis,
+           metrics[1].regime_stable_after_outlier, metrics[1].total_outliers_in_non_crisis);
+    if (metrics[1].spurious_switches_on_outlier < metrics[0].spurious_switches_on_outlier)
+    {
+        printf("   ✓ MMPF handles outliers better (fewer false alarms)\n");
+    }
+    else if (metrics[1].spurious_switches_on_outlier == metrics[0].spurious_switches_on_outlier)
+    {
+        printf("   = Both handle outliers equally\n");
+    }
+    else
+    {
+        printf("   ✗ Single RBPF handles outliers better (investigate!)\n");
+    }
 
     printf("════════════════════════════════════════════════════════════════\n");
 

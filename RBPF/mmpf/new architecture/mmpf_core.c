@@ -1666,6 +1666,10 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
             output->model_nu[k] = mmpf->learned_nu[k];
             output->model_lambda_mean[k] = mmpf->model_output[k].lambda_mean;
             output->model_nu_effective[k] = mmpf->model_output[k].nu_effective;
+
+            /* Learned parameters from Storvik (via swim lanes) */
+            output->learned_mu_vol[k] = (rbpf_real_t)mmpf->gated_dynamics[k].mu_vol;
+            output->learned_sigma_eta[k] = (rbpf_real_t)mmpf->gated_dynamics[k].sigma_eta;
         }
     }
 }

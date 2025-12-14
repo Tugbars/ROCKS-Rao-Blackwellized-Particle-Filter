@@ -339,6 +339,10 @@ extern "C"
         rbpf_real_t model_nu_effective[MMPF_N_MODELS]; /* Implied ν from λ variance */
         rbpf_real_t model_nu[MMPF_N_MODELS];          /* Current ν per model (fixed or learned) */
 
+         /* Storvik-learned parameters (swim lane bounded) */
+        rbpf_real_t learned_mu_vol[MMPF_N_MODELS];    /* Learned μ_vol per hypothesis */
+        rbpf_real_t learned_sigma_eta[MMPF_N_MODELS]; /* Learned σ_η per hypothesis */
+
     } MMPF_Output;
 
     /*═══════════════════════════════════════════════════════════════════════════
