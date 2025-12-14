@@ -542,26 +542,50 @@ MMPF_Config mmpf_config_defaults(void)
     /*═══════════════════════════════════════════════════════════════════════
      * IMM SETTINGS: "Switch, Don't Jump"
      *
-     * base_stickiness (0.98): 98% chance of staying in current regime
-     * min_stickiness (0.85):  Drops during high outlier periods
-     * crisis_exit_boost (0.92): Crisis exits faster (don't get stuck)
+     * STICKINESS (Regime persistence):
+     *   base_stickiness (0.98): P(stay) in normal conditions
+     *   min_stickiness (0.85):  P(stay) floor when outliers high
+     *   crisis_exit_boost (0.92): Multiplicative factor for Crisis exit
      *
-     * DIRICHLET PRIOR (replaces hard min_mixing_prob floor):
-     *   transition_prior_alpha: Pseudo-counts per regime ("I've seen α transitions")
-     *   transition_prior_mass:  Inertia ("My stickiness is worth N observations")
+     * DIRICHLET PRIOR (Regime warming):
      *
-     *   Floor ≈ α / (N + K×α) where K = 3 models
-     *   α=1.0, N=20 → floor ≈ 4.3% (similar to old 5% heuristic)
-     *   α=1.0, N=50 → floor ≈ 1.9% (more confident in stickiness)
+     *   Replaces the old heuristic: if (leave < 0.05) leave = 0.05
+     *
+     *   We use Bayesian smoothing so all regimes stay "warm":
+     *
+     *                      P_raw × N + α
+     *     P_smoothed = ─────────────────────
+     *                      N + K × α
+     *
+     *   transition_prior_alpha (α): Pseudo-counts per regime
+     *     - "I believe I've observed α transitions to each regime"
+     *     - Higher α → stronger pull toward uniform → more warming
+     *
+     *   transition_prior_mass (N): Observation mass
+     *     - "My stickiness estimate is worth N observations"
+     *     - Higher N → trust raw stickiness more → less warming
+     *
+     *   The natural FLOOR emerges as: α / (N + K×α)
+     *
+     *   ┌───────┬────────┬─────────┬───────────────────────────────┐
+     *   │   α   │   N    │  Floor  │  Interpretation               │
+     *   ├───────┼────────┼─────────┼───────────────────────────────┤
+     *   │  1.0  │   20   │  4.3%   │  Default (≈ old 5% heuristic) │
+     *   │  1.0  │   50   │  1.9%   │  Confident in stickiness      │
+     *   │  2.0  │   20   │  7.7%   │  Paranoid — strong warming    │
+     *   │  0.5  │   20   │  2.2%   │  Relaxed — minimal warming    │
+     *   └───────┴────────┴─────────┴───────────────────────────────┘
+     *
      *═══════════════════════════════════════════════════════════════════════*/
     cfg.base_stickiness = RBPF_REAL(0.98);
     cfg.min_stickiness = RBPF_REAL(0.85);
     cfg.crisis_exit_boost = RBPF_REAL(0.92);
     cfg.enable_adaptive_stickiness = 1;
 
-    /* Dirichlet prior for transition matrix smoothing */
-    cfg.transition_prior_alpha = RBPF_REAL(1.0); /* Uniform prior: 1 pseudo-count per regime */
-    cfg.transition_prior_mass = RBPF_REAL(20.0); /* Yields ~4.3% floor, smooth curve */
+    /* Dirichlet prior for transition matrix smoothing
+     * Default: α=1.0, N=20 → floor ≈ 4.3% (all regimes stay warm) */
+    cfg.transition_prior_alpha = RBPF_REAL(1.0);
+    cfg.transition_prior_mass = RBPF_REAL(20.0);
 
     cfg.enable_storvik_sync = 1;
 
@@ -624,21 +648,72 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
     /*═══════════════════════════════════════════════════════════════════════
      * DIRICHLET-SMOOTHED TRANSITION MATRIX
      *
-     * Instead of hard floor: if (leave < 0.05) leave = 0.05
-     * We use Laplace smoothing with interpretable prior:
+     * PROBLEM: We need all regimes to stay "warm" (never go to 0% probability)
+     * so they can respond instantly when conditions change.
      *
-     *   P_smoothed = (P_raw × N + α) / (N + K × α)
+     * OLD APPROACH (Heuristic):
+     *   if (leave < 0.05) leave = 0.05;  // Magic number, discontinuous kink
+     *
+     * NEW APPROACH (Bayesian):
+     *   Treat transition probabilities as having a Dirichlet prior.
+     *   Use Laplace smoothing (additive smoothing) to blend raw estimates
+     *   with uniform prior.
+     *
+     * ─────────────────────────────────────────────────────────────────────
+     * THE MATH
+     * ─────────────────────────────────────────────────────────────────────
+     *
+     * Dirichlet distribution: Dir(α₁, α₂, ..., αₖ)
+     *
+     * With uniform prior (α₁ = α₂ = ... = αₖ = α), the posterior mean is:
+     *
+     *                    P_raw × N + α
+     *   P_smoothed = ─────────────────────
+     *                    N + K × α
      *
      * Where:
-     *   α = prior pseudo-count ("I've seen α transitions to each regime")
-     *   N = stickiness mass ("My estimate is worth N observations")
-     *   K = number of models (3)
+     *   P_raw = raw transition probability from stickiness logic
+     *   N     = "observation mass" (how much we trust our stickiness estimate)
+     *   α     = prior pseudo-count (virtual observations per regime)
+     *   K     = number of regimes (3)
      *
-     * Effect:
-     *   - Creates smooth floor ≈ α / (N + K×α)
-     *   - All regimes stay "warm" proportional to prior strength
-     *   - No discontinuous kink in the probability surface
-     *   - Theoretically grounded (Bayesian, not heuristic)
+     * ─────────────────────────────────────────────────────────────────────
+     * INTERPRETATION
+     * ─────────────────────────────────────────────────────────────────────
+     *
+     * α = 1.0 means: "Before seeing any data, I believe I've observed
+     *                 1 transition to each regime."
+     *
+     * N = 20 means:  "My current stickiness estimate is worth 20 observations."
+     *
+     * The FLOOR (minimum transition probability) emerges naturally:
+     *
+     *                     α                    1.0
+     *   Floor = ───────────────── = ─────────────────── ≈ 4.3%
+     *            N + K × α           20 + 3 × 1.0
+     *
+     * ─────────────────────────────────────────────────────────────────────
+     * TUNING GUIDE
+     * ─────────────────────────────────────────────────────────────────────
+     *
+     *   α     N      Floor    Effect
+     *   ───   ───    ─────    ──────────────────────────────────
+     *   1.0   20     4.3%     Default — balanced warming
+     *   1.0   50     1.9%     Trust stickiness more, less warming
+     *   2.0   20     7.7%     Paranoid — strong warming
+     *   0.5   20     2.2%     Confident — minimal warming
+     *   1.0   10     7.7%     Uncertain about stickiness
+     *
+     * ─────────────────────────────────────────────────────────────────────
+     * WHY THIS IS BETTER THAN A HARD FLOOR
+     * ─────────────────────────────────────────────────────────────────────
+     *
+     * 1. Smooth: No discontinuous kink in the probability surface
+     * 2. Principled: It's a Bayesian prior, not a magic number
+     * 3. Interpretable: Parameters have clear meaning (pseudo-counts)
+     * 4. Symmetric: Also slightly regularizes the diagonal (stay probability)
+     * 5. Scales: Works correctly regardless of K (number of models)
+     *
      *═══════════════════════════════════════════════════════════════════════*/
 
     rbpf_real_t base = mmpf->config.base_stickiness;
@@ -646,12 +721,12 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
     rbpf_real_t outlier = mmpf->outlier_fraction;
 
     /* Dirichlet prior parameters */
-    rbpf_real_t alpha = mmpf->config.transition_prior_alpha;
-    rbpf_real_t N_mass = mmpf->config.transition_prior_mass;
+    rbpf_real_t alpha = mmpf->config.transition_prior_alpha; /* Pseudo-counts */
+    rbpf_real_t N_mass = mmpf->config.transition_prior_mass; /* Observation mass */
     rbpf_real_t K = (rbpf_real_t)MMPF_N_MODELS;
     rbpf_real_t denom = N_mass + K * alpha;
 
-    /* Adaptive stickiness based on outlier fraction */
+    /* Adaptive stickiness: drops when outliers are high (uncertain regime) */
     rbpf_real_t stickiness = base - (base - min_s) * outlier;
     mmpf->current_stickiness = stickiness;
 
@@ -659,12 +734,13 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
     {
         rbpf_real_t stay = stickiness;
 
-        /* Crisis exits faster (don't get stuck in crisis) */
+        /* Crisis exits faster — don't get stuck in crisis mode */
         if (i == MMPF_CRISIS)
         {
             stay *= mmpf->config.crisis_exit_boost;
         }
 
+        /* Raw leave probability (before smoothing) */
         rbpf_real_t leave = (RBPF_REAL(1.0) - stay) / (MMPF_N_MODELS - 1);
 
         /* Apply Dirichlet smoothing to each transition probability */
