@@ -27,17 +27,6 @@
 #include <omp.h>
 #include <mkl_vml.h>
 
-/*═══════════════════════════════════════════════════════════════════════════
- * STUDENT-T COMPILE-TIME SWITCH
- *
- * Set RBPF_ENABLE_STUDENT_T=0 before including header for Gaussian-only build.
- * Default is enabled (1).
- *═══════════════════════════════════════════════════════════════════════════*/
-
-#ifndef RBPF_ENABLE_STUDENT_T
-#define RBPF_ENABLE_STUDENT_T 0
-#endif
-
 #if RBPF_ENABLE_STUDENT_T
 /* Forward declarations for Student-t extension (defined in rbpf_ksc_student_t.c) */
 extern int rbpf_ksc_alloc_student_t(RBPF_KSC *rbpf);

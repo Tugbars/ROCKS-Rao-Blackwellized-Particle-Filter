@@ -69,6 +69,18 @@ extern "C"
 {
 #endif
 
+    /*═══════════════════════════════════════════════════════════════════════════
+     * STUDENT-T COMPILE-TIME SWITCH
+     *
+     * Set RBPF_ENABLE_STUDENT_T=0 before including header for Gaussian-only build.
+     * Or define via compiler flag: -DRBPF_ENABLE_STUDENT_T=0
+     * Default is enabled (1).
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+#ifndef RBPF_ENABLE_STUDENT_T
+#define RBPF_ENABLE_STUDENT_T 1 /* 1 = Student-t enabled, 0 = Gaussian only */
+#endif
+
     /*─────────────────────────────────────────────────────────────────────────────
      * CONFIGURATION
      *───────────────────────────────────────────────────────────────────────────*/
