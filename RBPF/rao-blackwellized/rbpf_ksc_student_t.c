@@ -33,24 +33,24 @@
 #define N_COMPONENTS_TOTAL 11
 
 /*═══════════════════════════════════════════════════════════════════════════
- * KSC CONSTANTS (Omori et al. 2007)
+ * KSC CONSTANTS (Omori et al. 2007) - FLOAT FOR MKL
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static const double KSC_PROB_ST[10] = {
-    0.00609, 0.04775, 0.13057, 0.20674, 0.22715,
-    0.18842, 0.12047, 0.05591, 0.01575, 0.00115};
+static const float KSC_PROB_ST[10] = {
+    0.00609f, 0.04775f, 0.13057f, 0.20674f, 0.22715f,
+    0.18842f, 0.12047f, 0.05591f, 0.01575f, 0.00115f};
 
-static const double KSC_MEAN_ST[10] = {
-    1.92677, 1.34744, 0.73504, 0.02266, -0.85173,
-    -1.97278, -3.46788, -5.55246, -8.68384, -14.65000};
+static const float KSC_MEAN_ST[10] = {
+    1.92677f, 1.34744f, 0.73504f, 0.02266f, -0.85173f,
+    -1.97278f, -3.46788f, -5.55246f, -8.68384f, -14.65000f};
 
-static const double KSC_VAR_ST[10] = {
-    0.11265, 0.17788, 0.26768, 0.40611, 0.62699,
-    0.98583, 1.57469, 2.54498, 4.16591, 7.33342};
+static const float KSC_VAR_ST[10] = {
+    0.11265f, 0.17788f, 0.26768f, 0.40611f, 0.62699f,
+    0.98583f, 1.57469f, 2.54498f, 4.16591f, 7.33342f};
 
-static const double KSC_LOG_PROB_ST[10] = {
-    -5.10168, -3.04155, -2.03518, -1.57656, -1.48204,
-    -1.66940, -2.11649, -2.88404, -4.15078, -6.76773};
+static const float KSC_LOG_PROB_ST[10] = {
+    -5.10168f, -3.04155f, -2.03518f, -1.57656f, -1.48204f,
+    -1.66940f, -2.11649f, -2.88404f, -4.15078f, -6.76773f};
 
 /*═══════════════════════════════════════════════════════════════════════════
  * FORWARD DECLARATIONS
@@ -567,16 +567,16 @@ rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * MKL WORKSPACE MANAGEMENT
+ * MKL WORKSPACE MANAGEMENT (FLOAT-NATIVE)
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static int ensure_mkl_workspace(RBPF_KSC *rbpf)
 {
     const int n_block = RBPF_MKL_BLOCK_SIZE;
     const int n_total_elems = n_block * N_COMPONENTS_TOTAL;
-    const size_t sz = sizeof(double);
+    const size_t sz = sizeof(float); /* Float workspace */
     size_t total_bytes;
-    double *base;
+    float *base;
 
     total_bytes = (7 * n_total_elems * sz) + (n_block * sz) + 1024;
 
@@ -599,22 +599,23 @@ static int ensure_mkl_workspace(RBPF_KSC *rbpf)
 
     rbpf->mkl_workspace.capacity_bytes = total_bytes;
 
-    base = (double *)rbpf->mkl_workspace.ptr_block;
-    rbpf->mkl_workspace.S_all = base;
+    /* Cast to float pointers */
+    base = (float *)rbpf->mkl_workspace.ptr_block;
+    rbpf->mkl_workspace.S_all = (double *)base;
     base += n_total_elems;
-    rbpf->mkl_workspace.log_S_all = base;
+    rbpf->mkl_workspace.log_S_all = (double *)base;
     base += n_total_elems;
-    rbpf->mkl_workspace.innov_all = base;
+    rbpf->mkl_workspace.innov_all = (double *)base;
     base += n_total_elems;
-    rbpf->mkl_workspace.log_lik_all = base;
+    rbpf->mkl_workspace.log_lik_all = (double *)base;
     base += n_total_elems;
-    rbpf->mkl_workspace.lik_all = base;
+    rbpf->mkl_workspace.lik_all = (double *)base;
     base += n_total_elems;
-    rbpf->mkl_workspace.mu_post_all = base;
+    rbpf->mkl_workspace.mu_post_all = (double *)base;
     base += n_total_elems;
-    rbpf->mkl_workspace.var_post_all = base;
+    rbpf->mkl_workspace.var_post_all = (double *)base;
     base += n_total_elems;
-    rbpf->mkl_workspace.max_log_lik = base;
+    rbpf->mkl_workspace.max_log_lik = (double *)base;
 
     return 0;
 }
@@ -633,7 +634,7 @@ void rbpf_ksc_mkl_free(RBPF_KSC *rbpf)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * MKL-OPTIMIZED UPDATE FUNCTION
+ * MKL-OPTIMIZED UPDATE FUNCTION (FLOAT-NATIVE)
  *═══════════════════════════════════════════════════════════════════════════*/
 
 rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
@@ -646,10 +647,10 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
     int i, k, gi, b_start;
     int base, idx;
     int n_total;
-    double H, H2, nu_d, nu_half, nu_plus_1_half, y_d;
-    double *S_all, *log_S_all, *innov_all, *log_lik_all;
-    double *lik_all, *mu_post_all, *var_post_all, *max_ll_buf;
-    double global_max_log_weight;
+    float H, H2, nu_f, nu_half, nu_plus_1_half, y_f;
+    float *S_all, *log_S_all, *innov_all, *log_lik_all;
+    float *lik_all, *mu_post_all, *var_post_all, *max_ll_buf;
+    float global_max_log_weight;
 
     /* Fallback if OCSN disabled */
     if (!ocsn || !ocsn->enabled)
@@ -663,23 +664,24 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
     }
 
     n_total = rbpf->n_particles;
-    H = 2.0;
-    H2 = 4.0;
-    nu_d = (double)nu;
-    nu_half = nu_d * 0.5;
-    nu_plus_1_half = (nu_d + 1.0) * 0.5;
-    y_d = (double)y;
+    H = 2.0f;
+    H2 = 4.0f;
+    nu_f = (float)nu;
+    nu_half = nu_f * 0.5f;
+    nu_plus_1_half = (nu_f + 1.0f) * 0.5f;
+    y_f = (float)y;
 
-    S_all = rbpf->mkl_workspace.S_all;
-    log_S_all = rbpf->mkl_workspace.log_S_all;
-    innov_all = rbpf->mkl_workspace.innov_all;
-    log_lik_all = rbpf->mkl_workspace.log_lik_all;
-    lik_all = rbpf->mkl_workspace.lik_all;
-    mu_post_all = rbpf->mkl_workspace.mu_post_all;
-    var_post_all = rbpf->mkl_workspace.var_post_all;
-    max_ll_buf = rbpf->mkl_workspace.max_log_lik;
+    /* Float workspace aliases (cast from double* storage) */
+    S_all = (float *)rbpf->mkl_workspace.S_all;
+    log_S_all = (float *)rbpf->mkl_workspace.log_S_all;
+    innov_all = (float *)rbpf->mkl_workspace.innov_all;
+    log_lik_all = (float *)rbpf->mkl_workspace.log_lik_all;
+    lik_all = (float *)rbpf->mkl_workspace.lik_all;
+    mu_post_all = (float *)rbpf->mkl_workspace.mu_post_all;
+    var_post_all = (float *)rbpf->mkl_workspace.var_post_all;
+    max_ll_buf = (float *)rbpf->mkl_workspace.max_log_lik;
 
-    global_max_log_weight = -1e30;
+    global_max_log_weight = -1e30f;
 
     /* Blocked loop */
     for (b_start = 0; b_start < n_total; b_start += RBPF_MKL_BLOCK_SIZE)
@@ -694,93 +696,91 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
         for (i = 0; i < n_batch; i++)
         {
             int r;
-            double mp, vp, innov_dom, var_eff, beta, lam, inv_lam;
-            double ocsn_var, ocsn_pi, log_1_minus_pi, log_pi;
+            float mp, vp, innov_dom, var_eff, beta, lam, inv_lam;
+            float ocsn_var, ocsn_pi, log_1_minus_pi, log_pi;
 
             gi = b_start + i;
             r = rbpf->regime[gi];
-            mp = (double)rbpf->mu_pred[gi];
-            vp = (double)rbpf->var_pred[gi];
+            mp = rbpf->mu_pred[gi];
+            vp = rbpf->var_pred[gi];
 
-            innov_dom = (y_d - KSC_MEAN_ST[4]) - H * mp;
-            if (innov_dom > 50.0)
-                innov_dom = 50.0;
-            else if (innov_dom < -50.0)
-                innov_dom = -50.0;
+            innov_dom = (y_f - (float)KSC_MEAN_ST[4]) - H * mp;
+            if (innov_dom > 50.0f)
+                innov_dom = 50.0f;
+            else if (innov_dom < -50.0f)
+                innov_dom = -50.0f;
 
-            var_eff = H2 * vp + KSC_VAR_ST[4];
-            beta = nu_half + 0.5 * innov_dom * innov_dom / var_eff;
-            if (beta < 0.1)
-                beta = 0.1;
-            else if (beta > 100.0)
-                beta = 100.0;
+            var_eff = H2 * vp + (float)KSC_VAR_ST[4];
+            beta = nu_half + 0.5f * innov_dom * innov_dom / var_eff;
+            if (beta < 0.1f)
+                beta = 0.1f;
+            else if (beta > 100.0f)
+                beta = 100.0f;
 
-            lam = (double)rbpf_pcg32_gamma(&rbpf->pcg[0],
-                                           (rbpf_real_t)nu_plus_1_half,
-                                           (rbpf_real_t)beta);
+            lam = rbpf_pcg32_gamma(&rbpf->pcg[0], nu_plus_1_half, beta);
 
-            if (lam != lam || lam <= 0.0)
-                lam = 1.0;
+            if (lam != lam || lam <= 0.0f)
+                lam = 1.0f;
             else if (lam < RBPF_LAMBDA_FLOOR)
                 lam = RBPF_LAMBDA_FLOOR;
             else if (lam > RBPF_LAMBDA_CEIL)
                 lam = RBPF_LAMBDA_CEIL;
 
-            rbpf->lambda[gi] = (rbpf_real_t)lam;
-            rbpf->log_lambda[gi] = (rbpf_real_t)log(lam);
+            rbpf->lambda[gi] = lam;
+            rbpf->log_lambda[gi] = logf(lam);
 
-            inv_lam = 1.0 / lam;
+            inv_lam = 1.0f / lam;
 
-            ocsn_var = (double)ocsn->regime[r].variance;
-            ocsn_pi = (double)ocsn->regime[r].prob;
+            ocsn_var = ocsn->regime[r].variance;
+            ocsn_pi = ocsn->regime[r].prob;
             if (ocsn_var < RBPF_OUTLIER_VAR_MIN)
                 ocsn_var = RBPF_OUTLIER_VAR_MIN;
             if (ocsn_var > RBPF_OUTLIER_VAR_MAX)
                 ocsn_var = RBPF_OUTLIER_VAR_MAX;
 
-            log_1_minus_pi = log(1.0 - ocsn_pi);
-            log_pi = log(ocsn_pi);
+            log_1_minus_pi = logf(1.0f - ocsn_pi);
+            log_pi = logf(ocsn_pi);
 
             base = i * N_COMPONENTS_TOTAL;
 
             for (k = 0; k < 10; k++)
             {
-                S_all[base + k] = H2 * vp + KSC_VAR_ST[k] * inv_lam;
-                innov_all[base + k] = y_d - KSC_MEAN_ST[k] - H * mp;
-                log_lik_all[base + k] = log_1_minus_pi + KSC_LOG_PROB_ST[k];
+                S_all[base + k] = H2 * vp + (float)KSC_VAR_ST[k] * inv_lam;
+                innov_all[base + k] = y_f - (float)KSC_MEAN_ST[k] - H * mp;
+                log_lik_all[base + k] = log_1_minus_pi + (float)KSC_LOG_PROB_ST[k];
             }
 
             S_all[base + 10] = H2 * vp + ocsn_var;
-            innov_all[base + 10] = y_d - H * mp;
+            innov_all[base + 10] = y_f - H * mp;
             log_lik_all[base + 10] = log_pi;
         }
 
-        /* Phase 2: Batched log(S) */
-        vdLn(n_batch_total, S_all, log_S_all);
+        /* Phase 2: Batched log(S) - FLOAT VERSION */
+        vsLn(n_batch_total, S_all, log_S_all);
 
 /* Phase 3: Complete log-likelihoods + Kalman updates */
-#pragma omp parallel for if (n_batch > 256) private(i, gi, base, k, idx)
+#pragma omp parallel for if (n_batch > 1024) private(i, gi, base, k, idx)
         for (i = 0; i < n_batch; i++)
         {
-            double mp_loc, vp_loc, H_vp, max_ll;
-            double S_loc, inv_S, innov_loc, ll, K_loc;
+            float mp_loc, vp_loc, H_vp, max_ll;
+            float S_loc, inv_S, innov_loc, ll, K_loc;
 
             gi = b_start + i;
-            mp_loc = (double)rbpf->mu_pred[gi];
-            vp_loc = (double)rbpf->var_pred[gi];
+            mp_loc = rbpf->mu_pred[gi];
+            vp_loc = rbpf->var_pred[gi];
             H_vp = H * vp_loc;
 
             base = i * N_COMPONENTS_TOTAL;
-            max_ll = -1e30;
+            max_ll = -1e30f;
 
             for (k = 0; k < N_COMPONENTS_TOTAL; k++)
             {
                 idx = base + k;
                 S_loc = S_all[idx];
-                inv_S = 1.0 / S_loc;
+                inv_S = 1.0f / S_loc;
                 innov_loc = innov_all[idx];
 
-                ll = log_lik_all[idx] - 0.5 * (log_S_all[idx] + innov_loc * innov_loc * inv_S);
+                ll = log_lik_all[idx] - 0.5f * (log_S_all[idx] + innov_loc * innov_loc * inv_S);
                 log_lik_all[idx] = ll;
 
                 if (ll > max_ll)
@@ -788,17 +788,17 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
 
                 K_loc = H_vp * inv_S;
                 mu_post_all[idx] = mp_loc + K_loc * innov_loc;
-                var_post_all[idx] = (1.0 - K_loc * H) * vp_loc;
+                var_post_all[idx] = (1.0f - K_loc * H) * vp_loc;
             }
 
             max_ll_buf[i] = max_ll;
         }
 
-/* Phase 4: Subtract max + batched exp */
-#pragma omp parallel for if (n_batch > 256) private(i, base, k)
+/* Phase 4: Subtract max + batched exp - FLOAT VERSION */
+#pragma omp parallel for if (n_batch > 1024) private(i, base, k)
         for (i = 0; i < n_batch; i++)
         {
-            double m;
+            float m;
             base = i * N_COMPONENTS_TOTAL;
             m = max_ll_buf[i];
             for (k = 0; k < N_COMPONENTS_TOTAL; k++)
@@ -807,22 +807,22 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
             }
         }
 
-        vdExp(n_batch_total, log_lik_all, lik_all);
+        vsExp(n_batch_total, log_lik_all, lik_all);
 
 /* Phase 5: GPB1 collapse */
-#pragma omp parallel for if (n_batch > 256) private(i, gi, base, k)
+#pragma omp parallel for if (n_batch > 1024) private(i, gi, base, k)
         for (i = 0; i < n_batch; i++)
         {
-            double sum_lik, mu_acc, mu2_acc;
-            double w, mk, vk;
-            double inv_sum, mu_new, var_new, ll_total;
+            float sum_lik, mu_acc, mu2_acc;
+            float w, mk, vk;
+            float inv_sum, mu_new, var_new, ll_total;
 
             gi = b_start + i;
             base = i * N_COMPONENTS_TOTAL;
 
-            sum_lik = 0.0;
-            mu_acc = 0.0;
-            mu2_acc = 0.0;
+            sum_lik = 0.0f;
+            mu_acc = 0.0f;
+            mu2_acc = 0.0f;
 
             for (k = 0; k < N_COMPONENTS_TOTAL; k++)
             {
@@ -835,32 +835,32 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
                 mu2_acc += w * (vk + mk * mk);
             }
 
-            inv_sum = 1.0 / (sum_lik + 1e-30);
+            inv_sum = 1.0f / (sum_lik + 1e-30f);
             mu_new = mu_acc * inv_sum;
             var_new = (mu2_acc * inv_sum) - (mu_new * mu_new);
 
-            if (var_new < 1e-6)
-                var_new = 1e-6;
+            if (var_new < 1e-6f)
+                var_new = 1e-6f;
             if (var_new != var_new)
-                var_new = (double)rbpf->var_pred[gi];
+                var_new = rbpf->var_pred[gi];
             if (mu_new != mu_new)
-                mu_new = (double)rbpf->mu_pred[gi];
+                mu_new = rbpf->mu_pred[gi];
 
-            rbpf->mu[gi] = (rbpf_real_t)mu_new;
-            rbpf->var[gi] = (rbpf_real_t)var_new;
+            rbpf->mu[gi] = mu_new;
+            rbpf->var[gi] = var_new;
 
-            ll_total = max_ll_buf[i] + log(sum_lik + 1e-30);
-            if (ll_total < -700.0)
-                ll_total = -700.0;
+            ll_total = max_ll_buf[i] + logf(sum_lik + 1e-30f);
+            if (ll_total < -700.0f)
+                ll_total = -700.0f;
 
-            rbpf->log_weight[gi] += (rbpf_real_t)ll_total;
+            rbpf->log_weight[gi] += ll_total;
         }
     }
 
     /* Phase 6: Global normalization */
     for (i = 0; i < n_total; i++)
     {
-        double lw = (double)rbpf->log_weight[i];
+        float lw = rbpf->log_weight[i];
         if (lw > global_max_log_weight)
         {
             global_max_log_weight = lw;
@@ -868,31 +868,29 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
     }
 
     {
-        double sum_weight = 0.0;
-        double inv_sum, log_marginal;
+        float sum_weight = 0.0f;
+        float inv_sum, log_marginal;
 
-#pragma omp parallel for reduction(+ : sum_weight) if (n_total > 256) private(i)
+#pragma omp parallel for reduction(+ : sum_weight) if (n_total > 1024) private(i)
         for (i = 0; i < n_total; i++)
         {
-            double lw, w;
-            lw = (double)rbpf->log_weight[i] - global_max_log_weight;
-            rbpf->log_weight[i] = (rbpf_real_t)lw;
-            w = exp(lw);
-            rbpf->w_norm[i] = (rbpf_real_t)w;
+            float lw, w;
+            lw = rbpf->log_weight[i] - global_max_log_weight;
+            rbpf->log_weight[i] = lw;
+            w = expf(lw);
+            rbpf->w_norm[i] = w;
             sum_weight += w;
         }
 
-        if (sum_weight < 1e-30)
-            sum_weight = 1e-30;
-        inv_sum = 1.0 / sum_weight;
+        if (sum_weight < 1e-30f)
+            sum_weight = 1e-30f;
+        inv_sum = 1.0f / sum_weight;
 
-        for (i = 0; i < n_total; i++)
-        {
-            rbpf->w_norm[i] = (rbpf_real_t)((double)rbpf->w_norm[i] * inv_sum);
-        }
+        /* Use MKL cblas_sscal for float */
+        cblas_sscal(n_total, inv_sum, rbpf->w_norm, 1);
 
-        log_marginal = global_max_log_weight + log(sum_weight) - log((double)n_total);
-        return (rbpf_real_t)exp(log_marginal);
+        log_marginal = global_max_log_weight + logf(sum_weight) - logf((float)n_total);
+        return expf(log_marginal);
     }
 }
 

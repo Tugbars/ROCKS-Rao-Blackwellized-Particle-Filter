@@ -232,6 +232,16 @@ if(RBPF_BUILD_BENCH)
     endif()
 endif()
 
+# Student-t MKL benchmark
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/bench_student_t.c)
+        add_executable(bench_student_t_mkl
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/bench_student_t.c
+        )
+        target_link_libraries(bench_student_t_mkl PRIVATE rocks)
+        target_compile_options(bench_student_t_mkl PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(bench_student_t_mkl PRIVATE ${COMMON_DEFS})
+    endif()
+
 #───────────────────────────────────────────────────────────────────────────────
 # Installation
 #───────────────────────────────────────────────────────────────────────────────
