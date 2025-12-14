@@ -289,6 +289,36 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
     rbpf_real_t *log_lambda = rbpf->log_lambda;
     const int *regime = rbpf->regime;
 
+    /* DIAGNOSTIC: Check predict outputs */
+    static int diag_count = 0;
+    if (diag_count < 3)
+    {
+        fprintf(stderr, "[Student-t DIAG %d] y=%.3f, mu_pred[0]=%.3f, var_pred[0]=%.6f, regime[0]=%d\n",
+                diag_count, (double)y, (double)mu_pred[0], (double)var_pred[0], regime[0]);
+        diag_count++;
+    }
+
+    /* DEFENSIVE: Check if predict was called and produced valid results */
+    if (mu_pred == NULL || var_pred == NULL)
+    {
+        fprintf(stderr, "Student-t: mu_pred or var_pred is NULL, falling back to Gaussian\n");
+        return rbpf_ksc_update(rbpf, y);
+    }
+
+    /* DEFENSIVE: Check first particle for NaN (indicates upstream problem) */
+    if (mu_pred[0] != mu_pred[0] || var_pred[0] != var_pred[0])
+    { /* NaN check */
+        fprintf(stderr, "Student-t: NaN in mu_pred/var_pred, falling back to Gaussian\n");
+        return rbpf_ksc_update(rbpf, y);
+    }
+
+    /* DEFENSIVE: Check observation */
+    if (y != y)
+    { /* NaN check */
+        fprintf(stderr, "Student-t: NaN observation, falling back to Gaussian\n");
+        return rbpf_ksc_update(rbpf, y);
+    }
+
     /* Per-regime λ accumulators */
     rbpf_real_t regime_sum_lambda[RBPF_MAX_REGIMES] = {0};
     rbpf_real_t regime_sum_lambda_sq[RBPF_MAX_REGIMES] = {0};
@@ -318,21 +348,52 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
         /* Predicted observation variance */
         rbpf_real_t v2_eff = H * H * var_pred[i] + ksc_var_eff;
 
+        /* DEFENSIVE: Ensure v2_eff is positive and finite */
+        if (v2_eff < RBPF_REAL(0.1))
+            v2_eff = RBPF_REAL(0.1);
+        if (v2_eff != v2_eff)
+            v2_eff = ksc_var_eff; /* NaN fallback */
+
         /* Innovation at λ=1 */
         rbpf_real_t y_pred = H * mu_pred[i] + ksc_mean_eff;
         rbpf_real_t innov = y - y_pred;
+
+        /* DEFENSIVE: Clamp extreme innovations */
+        if (innov > RBPF_REAL(50.0))
+            innov = RBPF_REAL(50.0);
+        if (innov < RBPF_REAL(-50.0))
+            innov = RBPF_REAL(-50.0);
+        if (innov != innov)
+            innov = RBPF_REAL(0.0); /* NaN fallback */
 
         /* Sample λ from Gamma posterior */
         rbpf_real_t alpha_post = (nu + RBPF_REAL(1.0)) / RBPF_REAL(2.0);
         rbpf_real_t beta_post = (nu + innov * innov / v2_eff) / RBPF_REAL(2.0);
 
-        /* Clamp beta_post to prevent numerical issues */
+        /* Clamp parameters to prevent numerical issues */
+        if (alpha_post < RBPF_REAL(0.5))
+            alpha_post = RBPF_REAL(0.5);
+        if (alpha_post > RBPF_REAL(50.0))
+            alpha_post = RBPF_REAL(50.0);
         if (beta_post < RBPF_REAL(0.1))
             beta_post = RBPF_REAL(0.1);
         if (beta_post > RBPF_REAL(100.0))
             beta_post = RBPF_REAL(100.0);
 
+        /* DEFENSIVE: Check for NaN in parameters */
+        if (alpha_post != alpha_post || beta_post != beta_post)
+        {
+            alpha_post = RBPF_REAL(2.5); /* Fallback: ν=4 equivalent */
+            beta_post = RBPF_REAL(2.5);
+        }
+
         rbpf_real_t lam = rbpf_pcg32_gamma(&rbpf->pcg[0], alpha_post, beta_post);
+
+        /* DEFENSIVE: Check gamma output */
+        if (lam != lam || lam <= RBPF_REAL(0.0))
+        {                         /* NaN or non-positive */
+            lam = RBPF_REAL(1.0); /* Fallback to Gaussian equivalent */
+        }
 
         /* Clamp λ */
         if (lam < RBPF_LAMBDA_FLOOR)
@@ -343,6 +404,15 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
         lambda[i] = lam;
         log_lambda[i] = rbpf_log(lam);
 
+        /* DIAGNOSTIC: Check lambda values for first few ticks */
+        static int lam_diag = 0;
+        if (lam_diag < 3 && i == 0)
+        {
+            fprintf(stderr, "[Student-t DIAG] Particle 0: nu=%.1f, innov=%.3f, v2_eff=%.3f, alpha=%.2f, beta=%.2f, lambda=%.4f\n",
+                    (double)nu, (double)innov, (double)v2_eff, (double)alpha_post, (double)beta_post, (double)lam);
+            lam_diag++;
+        }
+
         /* Accumulate for ν learning */
         regime_sum_lambda[r] += lam;
         regime_sum_lambda_sq[r] += lam * lam;
@@ -351,6 +421,12 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
 
         /* Shifted observation */
         rbpf_real_t y_shifted = y + log_lambda[i];
+
+        /* DEFENSIVE: Check y_shifted */
+        if (y_shifted != y_shifted)
+        {                  /* NaN check */
+            y_shifted = y; /* Fallback to unshifted (Gaussian equivalent) */
+        }
 
         /*═══════════════════════════════════════════════════════════════════
          * GPB1 COLLAPSE (NUMERICALLY STABLE)
@@ -404,11 +480,19 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
         rbpf_real_t sum_w = RBPF_REAL(0.0);
         rbpf_real_t w[KSC_N_COMPONENTS];
 
+        /* DEFENSIVE: Check max_log_lik is valid */
+        if (max_log_lik < RBPF_REAL(-500.0))
+            max_log_lik = RBPF_REAL(-500.0);
+
         for (int k = 0; k < KSC_N_COMPONENTS; k++)
         {
             w[k] = rbpf_exp(log_lik[k] - max_log_lik);
             sum_w += w[k];
         }
+
+        /* DEFENSIVE: Ensure sum_w is positive */
+        if (sum_w < RBPF_REAL(1e-30))
+            sum_w = RBPF_REAL(1e-30);
 
         /* Normalize weights */
         rbpf_real_t inv_sum_w = RBPF_REAL(1.0) / sum_w;
@@ -436,12 +520,43 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
         if (var_new < RBPF_REAL(1e-10))
             var_new = RBPF_REAL(1e-10);
 
+        /* DEFENSIVE: Check for NaN before storing */
+        if (mu_new != mu_new)
+        {                  /* NaN check */
+            mu_new = mu_p; /* Keep previous value */
+        }
+        if (var_new != var_new)
+        { /* NaN check */
+            var_new = var_p > RBPF_REAL(0.0) ? var_p : RBPF_REAL(0.01);
+        }
+
         /* Store updated state */
         mu[i] = mu_new;
         var[i] = var_new;
 
         /* Update particle log-weight */
         rbpf_real_t log_lik_total = max_log_lik + rbpf_log(sum_w);
+
+        /* [SAFETY FIX 2] Cap extremely negative likelihoods to prevent immediate kill.
+         * Also handle NaN from numerical edge cases. */
+        if (log_lik_total != log_lik_total)
+        { /* NaN check */
+            log_lik_total = RBPF_REAL(-700.0);
+        }
+        else if (log_lik_total < RBPF_REAL(-700.0))
+        {
+            log_lik_total = RBPF_REAL(-700.0);
+        }
+
+        /* DIAGNOSTIC: Check GPB1 output for first particle */
+        static int gpb1_diag = 0;
+        if (gpb1_diag < 3 && i == 0)
+        {
+            fprintf(stderr, "[Student-t DIAG] GPB1: mu_p=%.3f -> mu_new=%.3f, var_p=%.6f -> var_new=%.6f, log_lik=%.3f\n",
+                    (double)mu_p, (double)mu_new, (double)var_p, (double)var_new, (double)log_lik_total);
+            gpb1_diag++;
+        }
+
         log_weight[i] += log_lik_total;
 
         if (log_weight[i] > max_log_weight)
@@ -463,14 +578,73 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
         sum_weight += w;
     }
 
+    /* DEFENSIVE: Ensure sum_weight is positive */
+    if (sum_weight < RBPF_REAL(1e-30))
+        sum_weight = RBPF_REAL(1e-30);
+
     rbpf_real_t inv_sum = RBPF_REAL(1.0) / sum_weight;
     for (int i = 0; i < n; i++)
     {
         rbpf->w_norm[i] *= inv_sum;
     }
 
-    /* Marginal likelihood */
-    rbpf_real_t marginal_lik = max_log_weight + rbpf_log(sum_weight) - rbpf_log((rbpf_real_t)n);
+    /* NOTE: log_weight re-centering is handled in rbpf_ksc_resample()
+     * to prevent accumulated underflow. See Fix 1 in rbpf_ksc.c. */
+
+    /* Marginal likelihood (in log space for internal computation) */
+    rbpf_real_t log_marginal = max_log_weight + rbpf_log(sum_weight) - rbpf_log((rbpf_real_t)n);
+
+    /* DEFENSIVE: Ensure log_marginal is valid */
+    if (log_marginal != log_marginal)
+    {                                    /* NaN check */
+        log_marginal = RBPF_REAL(-10.0); /* Reasonable fallback */
+    }
+    if (log_marginal < RBPF_REAL(-500.0))
+        log_marginal = RBPF_REAL(-500.0);
+    if (log_marginal > RBPF_REAL(100.0))
+        log_marginal = RBPF_REAL(100.0);
+
+    /* CRITICAL: Final NaN check and recovery
+     * If any particle has NaN state, the entire filter output becomes NaN.
+     * This catches any edge cases we missed above. */
+    int nan_count = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (mu[i] != mu[i])
+        {                       /* NaN check */
+            mu[i] = mu_pred[i]; /* Fallback to predicted state */
+            nan_count++;
+        }
+        if (var[i] != var[i] || var[i] <= RBPF_REAL(0.0))
+        {
+            var[i] = var_pred[i] > RBPF_REAL(0.0) ? var_pred[i] : RBPF_REAL(0.1);
+        }
+    }
+    if (nan_count > 0)
+    {
+        static int nan_warn_count = 0;
+        if (nan_warn_count < 5)
+        {
+            fprintf(stderr, "[Student-t WARNING] Recovered %d NaN particles\n", nan_count);
+            nan_warn_count++;
+        }
+    }
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * CRITICAL FIX: Return LINEAR likelihood (positive), not log-likelihood!
+     *
+     * MMPF expects: model_likelihood > 0, then computes log(model_likelihood)
+     * We were returning: log_marginal (negative), causing log(negative) = NaN
+     *
+     * Convert log-likelihood to linear likelihood before returning.
+     * ══════════════════════════════════════════════════════════════════════ */
+    rbpf_real_t marginal_lik = rbpf_exp(log_marginal);
+
+    /* Clamp to reasonable positive range (float-safe) */
+    if (marginal_lik < RBPF_EPS)
+        marginal_lik = RBPF_EPS;
+    if (marginal_lik > RBPF_REAL(1e30))
+        marginal_lik = RBPF_REAL(1e30);
 
     /*═══════════════════════════════════════════════════════════════════════
      * UPDATE ν LEARNING STATISTICS

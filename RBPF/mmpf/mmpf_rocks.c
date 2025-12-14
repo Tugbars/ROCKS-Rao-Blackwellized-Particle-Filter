@@ -811,6 +811,24 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
             return NULL;
         }
 
+        /* ══════════════════════════════════════════════════════════════════
+         * [CRITICAL FIX] ALLOCATE STUDENT-T MEMORY
+         *
+         * The allocation in rbpf_ksc_create() is guarded by RBPF_ENABLE_STUDENT_T.
+         * We must explicitly allocate here to ensure lambda arrays exist.
+         * Without this, lambda pointers are NULL and Student-t falls back to
+         * Gaussian silently, leaving diagnostic values as NaN/garbage.
+         * ══════════════════════════════════════════════════════════════════ */
+        if (mmpf->ext[k]->rbpf->lambda == NULL)
+        {
+            if (rbpf_ksc_alloc_student_t(mmpf->ext[k]->rbpf) != 0)
+            {
+                fprintf(stderr, "MMPF: Failed to allocate Student-t memory for model %d\n", k);
+                mmpf_destroy(mmpf);
+                return NULL;
+            }
+        }
+
         /* Configure hypothesis parameters */
         MMPF_HypothesisParams *hp = &cfg.hypotheses[k];
         for (int r = 0; r < cfg.n_ksc_regimes; r++)
@@ -1150,6 +1168,20 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 
     if (mmpf->config.enable_global_baseline)
     {
+        /* ══════════════════════════════════════════════════════════════════
+         * [FIX 2A] NaN Guard: Prevent NaN infection of global baseline
+         *
+         * If previous output was NaN, do not update baseline this tick.
+         * This prevents the "Icarus Paradox" where one bad calculation
+         * infects global_mu_vol, which then infects all models, killing
+         * the entire filter permanently.
+         * ══════════════════════════════════════════════════════════════════ */
+        if (mmpf->prev_weighted_log_vol != mmpf->prev_weighted_log_vol)
+        {
+            /* Detected NaN in previous output - recover by using current global_mu_vol */
+            mmpf->prev_weighted_log_vol = mmpf->global_mu_vol;
+        }
+
         /* Fair Weather Gate with hysteresis */
         rbpf_real_t w_crisis = mmpf->weights[MMPF_CRISIS];
         int currently_frozen = (mmpf->baseline_frozen_ticks > 0);
@@ -1518,6 +1550,16 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         {
             /* Get current state estimate from this model */
             rbpf_real_t x_curr = mmpf->model_output[k].log_vol_mean;
+
+            /* ══════════════════════════════════════════════════════════════
+             * [FIX 2B] NaN Guard: If this model is dead (NaN), do not learn from it
+             * ══════════════════════════════════════════════════════════════ */
+            if (x_curr != x_curr)
+            {
+                /* Skip learning for this model but preserve prev_state */
+                continue;
+            }
+
             double x_prev = mmpf->gated_dynamics[k].prev_state;
 
             /* PURE WTA: Only dominant hypothesis learns, everyone else freezes */
