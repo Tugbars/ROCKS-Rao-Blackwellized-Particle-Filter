@@ -360,6 +360,62 @@ Tick 103:     5σ move — REAL CRISIS STARTING
 
 ---
 
+## Dirichlet-Smoothed Transition Matrix
+
+### The Problem
+
+All regimes must stay "warm" (never 0% probability) so they can respond instantly when conditions change. Crisis must always be "listening" even when Calm dominates.
+
+### Old Approach (Heuristic)
+
+```c
+if (leave < 0.05) leave = 0.05;  /* Magic number, discontinuous kink */
+```
+
+### New Approach (Bayesian)
+
+Treat transition probabilities as having a Dirichlet prior. Use Laplace smoothing:
+
+```
+                   P_raw × N + α
+P_smoothed = ─────────────────────
+                   N + K × α
+```
+
+Where:
+- **α** = prior pseudo-count ("I've observed α transitions to each regime")
+- **N** = observation mass ("My stickiness estimate is worth N observations")  
+- **K** = number of models (3)
+
+### The Natural Floor
+
+The minimum transition probability emerges naturally:
+
+```
+              α              1.0
+Floor = ───────────── = ─────────── ≈ 4.3%
+         N + K × α       20 + 3×1
+```
+
+### Tuning Guide
+
+| α | N | Floor | Effect |
+|---|---|-------|--------|
+| 1.0 | 20 | **4.3%** | Default — balanced warming |
+| 1.0 | 50 | 1.9% | Trust stickiness more |
+| 2.0 | 20 | 7.7% | Paranoid — strong warming |
+| 0.5 | 20 | 2.2% | Relaxed — minimal warming |
+
+### Why This is Better
+
+1. **Smooth** — No discontinuous kink in probability surface
+2. **Principled** — Bayesian prior, not magic number
+3. **Interpretable** — Parameters have clear meaning
+4. **Symmetric** — Also regularizes diagonal (stay probability)
+5. **Scales** — Works correctly regardless of K
+
+---
+
 ## The Three Cars
 
 | Car | Hypothesis | Suspension | Learning | Home Terrain |
@@ -392,6 +448,7 @@ mmpf/
 4. **Asymmetric learning** — Calm pinned, Trend aggressive, Crisis slow
 5. **Layered defense** — Student-t (elastic) + OCSN (hard cutoff)
 6. **Signal-appropriate forgetting** — Crisis ignores outliers (they're its job)
+7. **Principled warming** — Dirichlet prior keeps all regimes "listening"
 
 ---
 
@@ -406,3 +463,4 @@ mmpf/
 | Adaptive Forgetting | Fixed learning speed | Turbo for Trend, stiff for Crisis |
 | Weight Gate | Learn from data you don't own | Only dominant learns |
 | Pinned Calm | No stable reference floor | Invariant anchor |
+| Dirichlet Prior | Hard floor heuristic (magic 5%) | Principled Bayesian warming |
