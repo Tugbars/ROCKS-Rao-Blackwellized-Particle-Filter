@@ -875,6 +875,180 @@ void rbpf_ksc_resample_student_t(RBPF_KSC *rbpf, const int *indices)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * COMBINED STUDENT-T + OCSN UPDATE ("Switch, Don't Jump")
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+rbpf_real_t rbpf_ksc_update_student_t_robust(
+    RBPF_KSC *rbpf,
+    rbpf_real_t y,
+    rbpf_real_t nu,
+    const RBPF_RobustOCSN *ocsn)
+{
+    /* Fallback if OCSN disabled */
+    if (!ocsn || !ocsn->enabled)
+    {
+        return rbpf_ksc_update_student_t(rbpf, y);
+    }
+    
+    const int n = rbpf->n_particles;
+    const rbpf_real_t H = RBPF_REAL(2.0);
+    const rbpf_real_t H2 = RBPF_REAL(4.0);
+    const rbpf_real_t NEG_HALF = RBPF_REAL(-0.5);
+    const rbpf_real_t nu_half = nu * RBPF_REAL(0.5);
+    const rbpf_real_t nu_plus_1_half = (nu + RBPF_REAL(1.0)) * RBPF_REAL(0.5);
+
+    rbpf_real_t *restrict mu_pred = rbpf->mu_pred;
+    rbpf_real_t *restrict var_pred = rbpf->var_pred;
+    rbpf_real_t *restrict mu = rbpf->mu;
+    rbpf_real_t *restrict var = rbpf->var;
+    rbpf_real_t *restrict log_weight = rbpf->log_weight;
+    rbpf_real_t *restrict lambda = rbpf->lambda;
+    rbpf_real_t *restrict log_lambda = rbpf->log_lambda;
+    const int *restrict regime = rbpf->regime;
+
+    rbpf_real_t total_marginal = RBPF_REAL(0.0);
+
+    /* Temporary storage for 11 components (10 KSC + 1 outlier) */
+    rbpf_real_t log_liks[11];
+    rbpf_real_t lik_weights[11];
+    rbpf_real_t mu_posts[11];
+    rbpf_real_t var_posts[11];
+
+    for (int i = 0; i < n; i++)
+    {
+        const int r = regime[i];
+        const rbpf_real_t mu_p = mu_pred[i];
+        const rbpf_real_t var_p = var_pred[i];
+
+        /* OCSN parameters for this regime */
+        rbpf_real_t pi_out = ocsn->regime[r].prob;
+        rbpf_real_t var_out = ocsn->regime[r].variance;
+        
+        /* Clamp outlier variance to safe range */
+        if (var_out < RBPF_OUTLIER_VAR_MIN) var_out = RBPF_OUTLIER_VAR_MIN;
+        if (var_out > RBPF_OUTLIER_VAR_MAX) var_out = RBPF_OUTLIER_VAR_MAX;
+
+        const rbpf_real_t log_1_minus_pi = rbpf_log(RBPF_REAL(1.0) - pi_out);
+        const rbpf_real_t log_pi = rbpf_log(pi_out);
+
+        /* STEP 1: Sample λ from Student-t posterior */
+        rbpf_real_t innov_weighted = RBPF_REAL(0.0);
+        rbpf_real_t var_eff_weighted = RBPF_REAL(0.0);
+        rbpf_real_t sum_prob = RBPF_REAL(0.0);
+        
+        for (int k = 0; k < KSC_N_COMPONENTS; k++)
+        {
+            rbpf_real_t y_adj = y - KSC_MEAN[k];
+            rbpf_real_t innov = y_adj - H * mu_p;
+            rbpf_real_t ksc_var_eff = H2 * var_p + KSC_VAR[k];
+            
+            innov_weighted += KSC_PROB[k] * innov;
+            var_eff_weighted += KSC_PROB[k] * ksc_var_eff;
+            sum_prob += KSC_PROB[k];
+        }
+        
+        innov_weighted /= sum_prob;
+        var_eff_weighted /= sum_prob;
+        
+        if (innov_weighted > RBPF_REAL(50.0)) innov_weighted = RBPF_REAL(50.0);
+        if (innov_weighted < RBPF_REAL(-50.0)) innov_weighted = RBPF_REAL(-50.0);
+        
+        rbpf_real_t alpha_post = nu_plus_1_half;
+        rbpf_real_t innov_sq = innov_weighted * innov_weighted;
+        rbpf_real_t beta_post = nu_half + RBPF_REAL(0.5) * innov_sq / var_eff_weighted;
+        
+        if (alpha_post < RBPF_REAL(0.5)) alpha_post = RBPF_REAL(0.5);
+        if (alpha_post > RBPF_REAL(50.0)) alpha_post = RBPF_REAL(50.0);
+        if (beta_post < RBPF_REAL(0.1)) beta_post = RBPF_REAL(0.1);
+        if (beta_post > RBPF_REAL(100.0)) beta_post = RBPF_REAL(100.0);
+        
+        rbpf_real_t lam = rbpf_pcg32_gamma(&rbpf->pcg[0], alpha_post, beta_post);
+        
+        if (lam < RBPF_LAMBDA_FLOOR) lam = RBPF_LAMBDA_FLOOR;
+        if (lam > RBPF_LAMBDA_CEIL) lam = RBPF_LAMBDA_CEIL;
+        if (lam != lam) lam = RBPF_REAL(1.0);
+        
+        lambda[i] = lam;
+        log_lambda[i] = rbpf_log(lam);
+
+        /* STEP 2: Log-likelihoods for 10 KSC + 1 outlier */
+        rbpf_real_t max_log_lik = RBPF_REAL(-1e30);
+        const rbpf_real_t inv_lam = RBPF_REAL(1.0) / lam;
+
+        for (int k = 0; k < KSC_N_COMPONENTS; k++)
+        {
+            rbpf_real_t y_adj = y - KSC_MEAN[k];
+            rbpf_real_t innov = y_adj - H * mu_p;
+            rbpf_real_t v_k_scaled = KSC_VAR[k] * inv_lam;
+            rbpf_real_t S = H2 * var_p + v_k_scaled;
+            rbpf_real_t innov2_S = innov * innov / S;
+
+            log_liks[k] = log_1_minus_pi + KSC_LOG_PROB[k] +
+                          NEG_HALF * (rbpf_log(S) + innov2_S);
+            if (log_liks[k] > max_log_lik) max_log_lik = log_liks[k];
+
+            rbpf_real_t K = H * var_p / S;
+            mu_posts[k] = mu_p + K * innov;
+            var_posts[k] = (RBPF_REAL(1.0) - K * H) * var_p;
+        }
+
+        /* Outlier component (NOT λ-scaled - OCSN shield) */
+        {
+            rbpf_real_t innov = y - H * mu_p;
+            rbpf_real_t S = H2 * var_p + var_out;
+            rbpf_real_t innov2_S = innov * innov / S;
+
+            log_liks[10] = log_pi + NEG_HALF * (rbpf_log(S) + innov2_S);
+            if (log_liks[10] > max_log_lik) max_log_lik = log_liks[10];
+
+            rbpf_real_t K = H * var_p / S;
+            mu_posts[10] = mu_p + K * innov;
+            var_posts[10] = (RBPF_REAL(1.0) - K * H) * var_p;
+        }
+
+        /* STEP 3: GPB1 collapse */
+        rbpf_real_t lik_total = RBPF_REAL(0.0);
+        rbpf_real_t mu_accum = RBPF_REAL(0.0);
+        rbpf_real_t E_mu2_accum = RBPF_REAL(0.0);
+
+        for (int k = 0; k < 11; k++)
+        {
+            rbpf_real_t lik = rbpf_exp(log_liks[k] - max_log_lik);
+            lik_weights[k] = lik;
+            lik_total += lik;
+            mu_accum += lik * mu_posts[k];
+            E_mu2_accum += lik * (var_posts[k] + mu_posts[k] * mu_posts[k]);
+        }
+
+        rbpf_real_t inv_lik = RBPF_REAL(1.0) / (lik_total + RBPF_REAL(1e-30));
+        rbpf_real_t mu_new = mu_accum * inv_lik;
+        rbpf_real_t E_mu2 = E_mu2_accum * inv_lik;
+        rbpf_real_t var_new = E_mu2 - mu_new * mu_new;
+
+        if (var_new < RBPF_REAL(1e-6)) var_new = RBPF_REAL(1e-6);
+        if (var_new != var_new) var_new = var_p;
+        if (mu_new != mu_new) mu_new = mu_p;
+
+        mu[i] = mu_new;
+        var[i] = var_new;
+
+        /* STEP 4: Update log-weight */
+        rbpf_real_t log_lik_total = max_log_lik + rbpf_log(lik_total + RBPF_REAL(1e-30));
+        if (log_lik_total != log_lik_total) log_lik_total = RBPF_REAL(-700.0);
+        if (log_lik_total < RBPF_REAL(-700.0)) log_lik_total = RBPF_REAL(-700.0);
+        log_weight[i] += log_lik_total;
+
+        total_marginal += lik_total * rbpf_exp(max_log_lik);
+    }
+
+    rbpf_real_t marginal_lik = total_marginal / (rbpf_real_t)n;
+    if (marginal_lik < RBPF_EPS) marginal_lik = RBPF_EPS;
+    if (marginal_lik > RBPF_REAL(1e30)) marginal_lik = RBPF_REAL(1e30);
+
+    return marginal_lik;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * DEBUG
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -917,5 +1091,6 @@ void rbpf_ksc_print_student_t_config(const RBPF_KSC *rbpf)
 
     printf("╚══════════════════════════════════════════════════════════════╝\n");
 }
+
 
 #endif /* RBPF_ENABLE_STUDENT_T */
