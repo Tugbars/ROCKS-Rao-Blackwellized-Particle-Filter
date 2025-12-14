@@ -69,6 +69,7 @@ extern "C"
 {
 #endif
 
+
     /*═══════════════════════════════════════════════════════════════════════════
      * STUDENT-T COMPILE-TIME SWITCH
      *
@@ -80,6 +81,7 @@ extern "C"
 #ifndef RBPF_ENABLE_STUDENT_T
 #define RBPF_ENABLE_STUDENT_T 1 /* 1 = Student-t enabled, 0 = Gaussian only */
 #endif
+
 
     /*─────────────────────────────────────────────────────────────────────────────
      * CONFIGURATION
@@ -897,6 +899,30 @@ typedef float rbpf_real_t;
      * @return       Marginal likelihood
      */
     rbpf_real_t rbpf_ksc_update_student_t_nu(RBPF_KSC *rbpf, rbpf_real_t y, rbpf_real_t nu);
+
+    /**
+     * Combined Student-t + OCSN update ("Switch, Don't Jump")
+     *
+     * This combines two complementary mechanisms:
+     *   - Student-t (ν): Controls LIKELIHOOD for model comparison
+     *     High-ν rejects fat tails → loses weight, Low-ν expects fat tails → gains weight
+     *   - OCSN (huge variance): Controls KALMAN GAIN for state protection
+     *     When outlier detected, K → 0 → state doesn't move
+     *
+     * Key insight: High-ν Student-t does NOT protect the state!
+     *   ν=30: λ ≈ 0.24 → variance only 4x → K still significant
+     *   ν=3:  λ ≈ 0.04 → variance 25x → K small
+     * OCSN is required to truly freeze state during extreme events.
+     *
+     * @param rbpf   RBPF instance
+     * @param y      Transformed observation: y = log(r²)
+     * @param nu     Degrees of freedom for Student-t
+     * @param ocsn   OCSN configuration (outlier prob and variance per regime)
+     * @return       Marginal likelihood (LINEAR, not log)
+     */
+    rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
+                                                 rbpf_real_t nu,
+                                                 const RBPF_RobustOCSN *ocsn);
 
     /**
      * Combined step with Student-t observations

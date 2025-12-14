@@ -1338,15 +1338,25 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
         else
         {
-            /* 7c. Update step - Student-t or Gaussian
+            /* 7c. Update step - Combined Student-t + OCSN ("Switch, Don't Jump")
              *
-             * Student-t: Crisis (ν=3) assigns higher likelihood to fat tails
-             * This is the principled Bayesian solution - no hacks needed.
+             * Student-t: Controls LIKELIHOOD for model comparison
+             *   - High-ν (Calm): Rejects fat tails → loses Bayesian weight
+             *   - Low-ν (Crisis): Expects fat tails → gains Bayesian weight
+             *
+             * OCSN: Controls KALMAN GAIN for state protection
+             *   - When P(outlier) high → K ≈ 0 → state doesn't move
+             *   - Protects ALL models from state corruption
+             *
+             * Key insight: High-ν Student-t does NOT protect state!
+             *   ν=30: λ ≈ 0.24 → variance only 4x → K still significant
+             * OCSN is required to truly freeze state during extreme events.
              */
             if (mmpf->config.enable_student_t && rbpf->student_t_enabled)
             {
-                /* Student-t update with per-hypothesis ν */
-                marginal_lik = rbpf_ksc_update_student_t(rbpf, y_log);
+                /* Combined Student-t + OCSN update */
+                rbpf_real_t nu = mmpf->learned_nu[k];
+                marginal_lik = rbpf_ksc_update_student_t_robust(rbpf, y_log, nu, ocsn);
             }
             else if (ocsn->enabled)
             {

@@ -27,12 +27,26 @@
 #include <omp.h>
 #include <mkl_vml.h>
 
+/*═══════════════════════════════════════════════════════════════════════════
+ * STUDENT-T COMPILE-TIME SWITCH
+ *
+ * Set RBPF_ENABLE_STUDENT_T=0 before including header for Gaussian-only build.
+ * Default is enabled (1).
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#ifndef RBPF_ENABLE_STUDENT_T
+#define RBPF_ENABLE_STUDENT_T 1
+#endif
+
 #if RBPF_ENABLE_STUDENT_T
 /* Forward declarations for Student-t extension (defined in rbpf_ksc_student_t.c) */
 extern int rbpf_ksc_alloc_student_t(RBPF_KSC *rbpf);
 extern void rbpf_ksc_free_student_t(RBPF_KSC *rbpf);
 extern void rbpf_ksc_resample_student_t(RBPF_KSC *rbpf, const int *indices);
 extern rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y);
+extern rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
+                                                    rbpf_real_t nu,
+                                                    const RBPF_RobustOCSN *ocsn);
 #endif
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -2097,6 +2111,19 @@ void rbpf_ksc_resample_student_t(RBPF_KSC *rbpf, const int *indices)
 rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
 {
     /* Fall back to Gaussian update when Student-t is disabled */
+    return rbpf_ksc_update(rbpf, y);
+}
+
+rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
+                                             rbpf_real_t nu,
+                                             const RBPF_RobustOCSN *ocsn)
+{
+    (void)nu;
+    /* Fall back to OCSN-only when Student-t is disabled */
+    if (ocsn && ocsn->enabled)
+    {
+        return rbpf_ksc_update_robust(rbpf, y, ocsn);
+    }
     return rbpf_ksc_update(rbpf, y);
 }
 
