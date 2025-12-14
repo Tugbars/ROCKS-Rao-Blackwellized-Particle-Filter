@@ -442,22 +442,23 @@ MMPF_Config mmpf_config_defaults(void)
 
     /* Initial baseline + faster EWMA for responsiveness */
     cfg.global_mu_vol_init = RBPF_REAL(-4.4);  /* log(0.012) ≈ 1.2% vol */
-    cfg.global_mu_vol_alpha = RBPF_REAL(0.98); /* Fast: ~34 tick half-life */
+    cfg.global_mu_vol_alpha = RBPF_REAL(0.95); /* Faster: ~14 tick half-life (was 0.98) */
 
-    /* Offsets in log-vol space - WIDENED for clear discrimination
+    /* Offsets in log-vol space - TIGHTER for better tracking
      *
-     * Problem: With narrow offsets, when actual vol is between hypotheses,
-     * multiple models get similar likelihoods → indecisive weights.
+     * Previous issue: Wide offsets (+1.2 Crisis) caused overshooting because
+     * when Crisis activates, it pulls the estimate too high.
      *
-     * Solution: Wider separation means one hypothesis is clearly "right":
-     *   Calm:   -1.5 → exp(-1.5) = 0.22× baseline (was 0.37×)
-     *   Crisis: +2.0 → exp(+2.0) = 7.4× baseline  (was 4.5×)
+     * Tighter offsets:
+     *   Calm:   -1.0 → exp(-1.0) = 0.37× baseline
+     *   Crisis: +0.8 → exp(+0.8) = 2.2× baseline
      *
-     * This creates bigger likelihood gaps → more decisive weights.
+     * Combined with faster baseline (α=0.95), this should track better.
+     * Student-t ν still provides model differentiation during extremes.
      */
-    cfg.mu_vol_offsets[MMPF_CALM] = RBPF_REAL(-1.5);  /* exp(-1.5) = 0.22× trend vol */
+    cfg.mu_vol_offsets[MMPF_CALM] = RBPF_REAL(-1.0);  /* exp(-1.0) = 0.37× baseline (was -1.5) */
     cfg.mu_vol_offsets[MMPF_TREND] = RBPF_REAL(0.0);  /* = baseline */
-    cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(2.0); /* exp(2.0) = 7.4× trend vol */
+    cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(0.8); /* exp(0.8) = 2.2× baseline (was 1.2) */
 
     /* Fair Weather Gate: freeze baseline during crisis to prevent corruption */
     cfg.baseline_gate_on = RBPF_REAL(0.50);  /* Freeze when w_crisis > 50% */
@@ -481,11 +482,21 @@ MMPF_Config mmpf_config_defaults(void)
 
     cfg.enable_student_t = 1; /* ENABLED by default (recommended) */
 
-    /* Per-hypothesis ν (degrees of freedom)
-     * Lower ν = fatter tails = higher probability of extreme observations */
-    cfg.hypothesis_nu[MMPF_CALM] = RBPF_REAL(10.0);  /* Near-Gaussian tails */
-    cfg.hypothesis_nu[MMPF_TREND] = RBPF_REAL(5.0);  /* Moderate fat tails */
-    cfg.hypothesis_nu[MMPF_CRISIS] = RBPF_REAL(3.0); /* Heavy fat tails */
+    /* Per-hypothesis ν (degrees of freedom) - "Switch, Don't Jump" config
+     *
+     * KEY INSIGHT: ν controls LIKELIHOOD for model comparison
+     *   High-ν (Calm): Thin tails → rejects fat-tail events → loses Bayesian weight
+     *   Low-ν (Crisis): Fat tails → expects extreme events → gains Bayesian weight
+     *
+     * For a 5σ event:
+     *   ν=30 (Calm):   P ≈ 5×10⁻⁷  → "Impossible!" → likelihood tanks
+     *   ν=3  (Crisis): P ≈ 0.01    → "Expected!"   → likelihood high
+     *
+     * This makes Crisis WIN model comparison during extremes.
+     */
+    cfg.hypothesis_nu[MMPF_CALM] = RBPF_REAL(30.0);  /* Near-Gaussian: rejects outliers */
+    cfg.hypothesis_nu[MMPF_TREND] = RBPF_REAL(10.0); /* Moderate fat tails */
+    cfg.hypothesis_nu[MMPF_CRISIS] = RBPF_REAL(3.0); /* Heavy fat tails: loves outliers */
 
     /* Optional: WTA-gated ν learning (disabled by default)
      * Only dominant hypothesis learns its ν from data.
@@ -517,11 +528,11 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50);
     cfg.hypotheses[MMPF_CRISIS].nu = cfg.hypothesis_nu[MMPF_CRISIS];
 
-    /* IMM settings */
+    /* IMM settings - "Switch, Don't Jump" config */
     cfg.base_stickiness = RBPF_REAL(0.98);
     cfg.min_stickiness = RBPF_REAL(0.85);
     cfg.crisis_exit_boost = RBPF_REAL(0.92);
-    cfg.min_mixing_prob = RBPF_REAL(0.01); /* 1% minimum transition probability */
+    cfg.min_mixing_prob = RBPF_REAL(0.05); /* 5% minimum - ensures Crisis is always "listening" */
     cfg.enable_adaptive_stickiness = 1;
 
     /* DISABLE Storvik Sync - gated learning pushes params directly
@@ -540,12 +551,30 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.initial_weights[MMPF_TREND] = RBPF_REAL(0.3);
     cfg.initial_weights[MMPF_CRISIS] = RBPF_REAL(0.1);
 
-    /* Robust OCSN defaults */
+    /* Robust OCSN - "Switch, Don't Jump" STATE PROTECTION SHIELD
+     *
+     * KEY INSIGHT: Student-t ν controls LIKELIHOOD (model comparison),
+     * but it does NOT adequately protect STATE from corruption!
+     *
+     * The "Stiff Model Paradox":
+     *   - High-ν (Calm=30): λ ≈ 0.24 → variance only 4× → K still significant
+     *   - Low-ν (Crisis=3): λ ≈ 0.04 → variance 25× → K small
+     *   Student-t protects Crisis (which expects fat tails) but leaves Calm exposed!
+     *
+     * OCSN provides the missing protection:
+     *   - When outlier detected → K ≈ 0 → state doesn't move
+     *   - Works for ALL models regardless of their ν
+     *   - This is the "shield" that prevents state corruption during extremes
+     *
+     * Combined effect:
+     *   Student-t: Crisis WINS model comparison (likelihood)
+     *   OCSN:      ALL models' states are PROTECTED (Kalman gain)
+     */
     cfg.robust_ocsn.enabled = 1;
     for (int r = 0; r < PARAM_LEARN_MAX_REGIMES; r++)
     {
-        cfg.robust_ocsn.regime[r].prob = RBPF_REAL(0.01);
-        cfg.robust_ocsn.regime[r].variance = RBPF_OUTLIER_VAR_DEFAULT;
+        cfg.robust_ocsn.regime[r].prob = RBPF_REAL(0.05);      /* 5% outlier prior */
+        cfg.robust_ocsn.regime[r].variance = RBPF_REAL(150.0); /* HUGE → K ≈ 0 (was 80) */
     }
 
     /* Storvik config */

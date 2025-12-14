@@ -209,13 +209,16 @@ else:
 
 **Panic Drift (adaptive Crisis ceiling):**
 ```
-if w_crisis > 0.5 AND y_log > crisis_anchor:
-    gap = y_log - crisis_anchor
-    crisis_drift += 0.2 × gap
-else:
-    crisis_drift *= 0.95  (decay)
+# Compare observation to expected
+expected_log_y2 = 2 × log(σ)           # log(σ²)
+gap = log(y²) - expected_log_y2        # = log((return/vol)²)
 
-crisis_drift = min(crisis_drift, 1.5)  (cap)
+if gap > 2.0:  (return ~2.7× larger than vol)
+    crisis_drift += 0.15 × gap
+else:
+    crisis_drift *= 0.92  (decay)
+
+crisis_drift = min(crisis_drift, 2.0)  (cap)
 crisis_anchor_effective = baseline + 2.0 + crisis_drift
 ```
 
@@ -230,38 +233,60 @@ Fixed offsets guarantee discrimination but create a ceiling:
 - If baseline is 0.7% vol → Crisis cap at ~5.2% vol
 - But actual crash vol can hit 10-20% → filter under-estimates
 
+**The Chicken-and-Egg Problem:**
+When observation massively exceeds ALL anchors, likelihood spreads across hypotheses rather than concentrating on Crisis. So w_crisis never gets high enough to trigger a threshold-based drift.
+
 ### The Solution
 
-**Panic Drift** temporarily boosts the Crisis ceiling during extreme events:
+**Panic Drift** detects fat tails DIRECTLY by comparing observation to expected:
 
-1. **Trigger**: w_crisis > 50% AND observation exceeds Crisis anchor
-2. **Accumulate**: Drift grows proportional to how much observation exceeds anchor
-3. **Decay**: When crisis passes, drift decays back to zero (95% per tick)
-4. **Cap**: Maximum drift of +1.5 (Crisis can go from +2.0 to +3.5 offset)
+```
+gap = log(y²) - 2×log(σ) = log((return/vol)²)
+```
+
+1. **Trigger**: `gap > 2.0` (return ~2.7× larger than current vol estimate)
+2. **Accumulate**: Drift grows proportional to the gap
+3. **Decay**: When observations normalize, drift decays (92% per tick)
+4. **Cap**: Maximum drift of +2.0 (Crisis can go from +2.0 to +4.0 offset)
+
+### Example Calculation
+
+```
+Current estimate: log(σ) = -4.97 (0.7% vol)
+Expected: log(σ²) = 2×(-4.97) = -9.94
+
+Observe 3% return:
+  y² = 0.0009
+  log(y²) = -7.0
+  gap = -7.0 - (-9.94) = +2.94 > threshold(2.0) ✓
+  
+drift += 0.15 × 2.94 = +0.44
+Crisis anchor: -2.97 + 0.44 = -2.53 (7.9% vol)
+```
 
 ### Why This Works
 
-```
 Normal times:
-  Crisis = Baseline + 2.0 (fixed, guarantees discrimination)
+- Return matches expected volatility → gap ≈ 0
+- No drift accumulation
 
-Crisis detected with extreme observation:
-  Crisis = Baseline + 2.0 + drift (adaptive ceiling)
-  
-Crisis passes:
-  drift → 0 (reverts to structural default)
-```
+Fat tail detected:
+- Return much larger than expected → gap > threshold
+- Drift lifts Crisis ceiling to capture extreme observation
 
-This is the "Adrenaline" mechanism: emergency override of structural constraints that auto-reverts when danger passes.
+Observations normalize:
+- drift *= 0.92 each tick
+- Decays to ~0 after ~25 ticks
+- Reverts to structural default
 
 ### Configuration
 
 ```c
 cfg.enable_panic_drift = 1;
-cfg.panic_drift_threshold = 0.50;  /* Activate when w_crisis > 50% */
-cfg.panic_drift_rate = 0.20;       /* Accumulation speed */
-cfg.panic_drift_decay = 0.95;      /* Decay when not in panic */
-cfg.panic_drift_max = 1.50;        /* Max boost to Crisis offset */
+cfg.panic_drift_threshold = 2.0;   /* return ~2.7× larger than vol */
+cfg.panic_drift_rate = 0.15;       /* Accumulation speed */
+cfg.panic_drift_decay = 0.92;      /* Decay when not triggered */
+cfg.panic_drift_max = 2.0;         /* Max boost to Crisis offset */
 ```
 
 ---
