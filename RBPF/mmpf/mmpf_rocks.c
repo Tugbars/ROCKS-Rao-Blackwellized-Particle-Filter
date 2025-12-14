@@ -423,42 +423,41 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.n_storvik_regimes = 4;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * HYBRID ARCHITECTURE: Baseline (Level) + WTA Learning (Dynamics)
+     * FREE-FLOATING ARCHITECTURE: Each Hypothesis Learns Its Own Level
      *
-     * μ_vol: Controlled by Global Baseline + Fixed Offsets
-     *        This GUARANTEES discrimination (Calm < Trend < Crisis always)
+     * We built a Ferrari (RBPF) - don't hitch it to a wagon (EWMA).
      *
-     * φ, σ_η: Controlled by WTA Gated Learning
-     *         Each hypothesis learns its own dynamics from its own data
-     *         This gives "Structural Memory" - Crisis remembers how to be Crisis
+     * The particle filter calculates the optimal posterior at every tick.
+     * It KNOWS where volatility is. Forcing it to mean-revert to a lagging
+     * EWMA anchor tells the filter: "Ignore your optimal estimate."
      *
-     * ν (Student-t): Per-hypothesis tail thickness
-     *                Crisis expects fat tails (ν=3), Calm expects thin (ν=10)
-     *                This is the principled Bayesian way to handle fat tails
+     * Instead, each hypothesis learns its own μ_vol via WTA Gated Learning:
+     *   - Calm: Heavy ship, slow learning, rejects outliers → stays stable
+     *   - Trend: Agile boat, tracks waves → finds the level fast
+     *   - Crisis: Speedboat, chases everything → responds to extremes
+     *
+     * Differentiation comes from PHYSICS (ν, φ, σ_η), not fixed offsets.
      *═══════════════════════════════════════════════════════════════════════*/
 
-    /* ENABLE Global Baseline - controls μ_vol level for all hypotheses */
-    cfg.enable_global_baseline = 1;
+    /* DISABLE Global Baseline - let each hypothesis track its own level */
+    cfg.enable_global_baseline = 0;
 
-    /* Initial baseline + faster EWMA for responsiveness */
+    /* These are only used for initialization now (no runtime EWMA) */
     cfg.global_mu_vol_init = RBPF_REAL(-4.4);  /* log(0.012) ≈ 1.2% vol */
-    cfg.global_mu_vol_alpha = RBPF_REAL(0.95); /* Faster: ~14 tick half-life (was 0.98) */
+    cfg.global_mu_vol_alpha = RBPF_REAL(0.95); /* Unused when baseline disabled */
 
-    /* Offsets in log-vol space - TIGHTER for better tracking
+    /* Initial offsets (for initialization only - each hypothesis learns its own level)
      *
-     * Previous issue: Wide offsets (+1.2 Crisis) caused overshooting because
-     * when Crisis activates, it pulls the estimate too high.
+     * These set the STARTING positions before learning kicks in:
+     *   - Calm starts lower → learns slowly, stays stable
+     *   - Crisis starts higher → learns fast, responds to extremes
      *
-     * Tighter offsets:
-     *   Calm:   -1.0 → exp(-1.0) = 0.37× baseline
-     *   Crisis: +0.8 → exp(+0.8) = 2.2× baseline
-     *
-     * Combined with faster baseline (α=0.95), this should track better.
-     * Student-t ν still provides model differentiation during extremes.
+     * After ~10 ticks of data, WTA Gated Learning takes over and each
+     * hypothesis finds its own level based on the data it "owns".
      */
-    cfg.mu_vol_offsets[MMPF_CALM] = RBPF_REAL(-1.0);  /* exp(-1.0) = 0.37× baseline (was -1.5) */
-    cfg.mu_vol_offsets[MMPF_TREND] = RBPF_REAL(0.0);  /* = baseline */
-    cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(0.8); /* exp(0.8) = 2.2× baseline (was 1.2) */
+    cfg.mu_vol_offsets[MMPF_CALM] = RBPF_REAL(-0.5);  /* Start slightly below baseline */
+    cfg.mu_vol_offsets[MMPF_TREND] = RBPF_REAL(0.0);  /* Start at baseline */
+    cfg.mu_vol_offsets[MMPF_CRISIS] = RBPF_REAL(0.5); /* Start slightly above baseline */
 
     /* Fair Weather Gate: freeze baseline during crisis to prevent corruption */
     cfg.baseline_gate_on = RBPF_REAL(0.50);  /* Freeze when w_crisis > 50% */
@@ -482,21 +481,24 @@ MMPF_Config mmpf_config_defaults(void)
 
     cfg.enable_student_t = 1; /* ENABLED by default (recommended) */
 
-    /* Per-hypothesis ν (degrees of freedom) - "Switch, Don't Jump" config
+    /* Per-hypothesis ν (degrees of freedom) - PHYSICS-BASED DIFFERENTIATION
      *
-     * KEY INSIGHT: ν controls LIKELIHOOD for model comparison
-     *   High-ν (Calm): Thin tails → rejects fat-tail events → loses Bayesian weight
-     *   Low-ν (Crisis): Fat tails → expects extreme events → gains Bayesian weight
+     * ν controls how each model responds to outliers:
+     *   High-ν: "That's impossible!" → likelihood tanks → loses weight
+     *   Low-ν:  "That's expected!" → likelihood OK → maintains/gains weight
      *
-     * For a 5σ event:
-     *   ν=30 (Calm):   P ≈ 5×10⁻⁷  → "Impossible!" → likelihood tanks
-     *   ν=3  (Crisis): P ≈ 0.01    → "Expected!"   → likelihood high
+     * Calm (ν=20):   Near-Gaussian. Rejects fat tails strongly.
+     *                5σ event: P ≈ 10⁻⁶ → "This can't be calm conditions"
      *
-     * This makes Crisis WIN model comparison during extremes.
+     * Trend (ν=6):   Moderate tails. Accepts some outliers.
+     *                5σ event: P ≈ 10⁻³ → "Unusual but possible"
+     *
+     * Crisis (ν=3):  Heavy tails. Expects extremes.
+     *                5σ event: P ≈ 10⁻² → "This is what crisis looks like"
      */
-    cfg.hypothesis_nu[MMPF_CALM] = RBPF_REAL(30.0);  /* Near-Gaussian: rejects outliers */
-    cfg.hypothesis_nu[MMPF_TREND] = RBPF_REAL(10.0); /* Moderate fat tails */
-    cfg.hypothesis_nu[MMPF_CRISIS] = RBPF_REAL(3.0); /* Heavy fat tails: loves outliers */
+    cfg.hypothesis_nu[MMPF_CALM] = RBPF_REAL(20.0);  /* Near-Gaussian: ignores waves */
+    cfg.hypothesis_nu[MMPF_TREND] = RBPF_REAL(6.0);  /* Moderate: tracks waves */
+    cfg.hypothesis_nu[MMPF_CRISIS] = RBPF_REAL(3.0); /* Heavy tails: loves waves */
 
     /* Optional: WTA-gated ν learning (disabled by default)
      * Only dominant hypothesis learns its ν from data.
@@ -506,26 +508,42 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.nu_ceil = RBPF_REAL(30.0);          /* Maximum ν (near-Gaussian) */
     cfg.nu_learning_rate = RBPF_REAL(0.99); /* EWMA rate for ν learning */
 
-    /* ENABLE WTA Gated Learning - learns DYNAMICS only (φ, σ_η), NOT μ_vol
-     * μ_vol is controlled by baseline + offsets (preserves identity)
-     * φ, σ_η are learned per-hypothesis via WTA (structural memory) */
+    /* ENABLE WTA Gated Learning - learns EVERYTHING (μ_vol, φ, σ_η)
+     * Each hypothesis learns its own level AND dynamics from its own data.
+     * This replaces the EWMA baseline with per-hypothesis adaptive learning.
+     * Storvik becomes the new anchor - adaptive, per-model, Bayesian. */
     cfg.enable_gated_learning = 1;
     cfg.gated_learning_threshold = RBPF_REAL(0.0); /* Pure WTA */
 
-    /* Initial hypothesis params (computed from global baseline + offsets) */
+    /* Initial hypothesis params - PHYSICS provides differentiation
+     *
+     * Calm: Heavy, slow ship. High persistence, low volatility, thin tails.
+     *       Ignores "waves" (outliers). Learns level SLOWLY.
+     *
+     * Trend: Agile boat. Moderate persistence and volatility.
+     *        Tracks the waves. Learns level at medium speed.
+     *
+     * Crisis: Speedboat. Fast-moving, high volatility, fat tails.
+     *         Chases everything. Learns level FAST.
+     *
+     * This physics-based differentiation means:
+     *   - During calm: Calm wins (others see "impossible" stability)
+     *   - During trend: Trend wins (tracks changes)
+     *   - During crash: Crisis wins (expects fat tails, high vol)
+     */
     cfg.hypotheses[MMPF_CALM].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CALM];
-    cfg.hypotheses[MMPF_CALM].phi = RBPF_REAL(0.98);
-    cfg.hypotheses[MMPF_CALM].sigma_eta = RBPF_REAL(0.10);
+    cfg.hypotheses[MMPF_CALM].phi = RBPF_REAL(0.995);      /* Very persistent (slow) */
+    cfg.hypotheses[MMPF_CALM].sigma_eta = RBPF_REAL(0.05); /* Low vol-of-vol */
     cfg.hypotheses[MMPF_CALM].nu = cfg.hypothesis_nu[MMPF_CALM];
 
     cfg.hypotheses[MMPF_TREND].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_TREND];
-    cfg.hypotheses[MMPF_TREND].phi = RBPF_REAL(0.95);
-    cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.20);
+    cfg.hypotheses[MMPF_TREND].phi = RBPF_REAL(0.95);       /* Moderate persistence */
+    cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.15); /* Medium vol-of-vol */
     cfg.hypotheses[MMPF_TREND].nu = cfg.hypothesis_nu[MMPF_TREND];
 
     cfg.hypotheses[MMPF_CRISIS].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CRISIS];
-    cfg.hypotheses[MMPF_CRISIS].phi = RBPF_REAL(0.80);
-    cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50);
+    cfg.hypotheses[MMPF_CRISIS].phi = RBPF_REAL(0.85);       /* Fast mean reversion */
+    cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50); /* High vol-of-vol */
     cfg.hypotheses[MMPF_CRISIS].nu = cfg.hypothesis_nu[MMPF_CRISIS];
 
     /* IMM settings - "Switch, Don't Jump" config */
@@ -535,10 +553,16 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.min_mixing_prob = RBPF_REAL(0.05); /* 5% minimum - ensures Crisis is always "listening" */
     cfg.enable_adaptive_stickiness = 1;
 
-    /* DISABLE Storvik Sync - gated learning pushes params directly
-     * The gated learning in Step 11 handles parameter updates manually.
-     * Storvik's particle-level sync would override our hypothesis-level learning. */
-    cfg.enable_storvik_sync = 0;
+    /* Storvik Sync: ENABLED - proper Bayesian parameter learning
+     *
+     * With the EWMA baseline gone, Storvik becomes the anchor:
+     *   - Each hypothesis learns its own μ_vol from its data
+     *   - Adaptive forgetting prevents fossilization
+     *   - Per-hypothesis rates: Calm slow, Trend medium, Crisis fast
+     *
+     * This is the proper Bayesian solution - no more wagons!
+     */
+    cfg.enable_storvik_sync = 1;
 
     /* Zero return handling (HFT critical)
      * Policy: 0=skip update, 1=use floor, 2=censored interval (not implemented)
@@ -903,6 +927,47 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         }
         param_learn_broadcast_priors(&mmpf->ext[k]->storvik);
 
+        /*═══════════════════════════════════════════════════════════════════
+         * STORVIK FORGETTING RATES: Gated, Pinned Architecture
+         *
+         * KEY INSIGHT: We need one invariant reference point.
+         *
+         *   Calm:   PINNED (no learning) - the anchor/floor
+         *           Defines what "low vol" means. Never moves.
+         *           Without this rock, we lose our reference.
+         *
+         *   Trend:  Medium learner (λ=0.997, N_eff ≈ 333)
+         *           Tracks gradual vol regime changes.
+         *           The "working hypothesis" for normal markets.
+         *
+         *   Crisis: Fast learner (λ=0.990, N_eff ≈ 100)
+         *           Responds instantly to vol spikes.
+         *           Quick to adapt, quick to forget.
+         *
+         * GATING: Learning only happens when weight > 10%.
+         * This prevents "Leakage" where losing models slowly drift
+         * toward the winner's parameters.
+         *═══════════════════════════════════════════════════════════════════*/
+        {
+            param_real lambda;
+            switch (k)
+            {
+            case MMPF_CALM:
+                lambda = 0.999;
+                break; /* Pinned - won't be called */
+            case MMPF_TREND:
+                lambda = 0.997;
+                break; /* N_eff ≈ 333, medium */
+            case MMPF_CRISIS:
+                lambda = 0.990;
+                break; /* N_eff ≈ 100, fast */
+            default:
+                lambda = 0.997;
+                break;
+            }
+            param_learn_set_forgetting(&mmpf->ext[k]->storvik, true, lambda);
+        }
+
         /* CRITICAL: Sync initial params from Storvik → RBPF
          * Only if learning sync is enabled. When disabled (for global baseline),
          * RBPF uses params[r].mu_vol which we set from baseline + offsets. */
@@ -1175,6 +1240,93 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * STORVIK LEARNING: Per-Hypothesis Bayesian Parameter Learning
+ *
+ * Replaces the manual EWMA baseline with proper Bayesian learning.
+ * Each hypothesis learns its own μ_vol, σ_vol from the data it "owns".
+ *
+ * KEY INSIGHT: The particle filter IS the real-time estimator.
+ * Don't hitch a Ferrari (RBPF) to a wagon (EWMA).
+ *
+ * Per-hypothesis forgetting rates:
+ *   Calm:   λ=0.999 (N_eff ≈ 1000) - slow learner, stable anchor
+ *   Trend:  λ=0.997 (N_eff ≈ 333)  - medium, tracks changes
+ *   Crisis: λ=0.990 (N_eff ≈ 100)  - fast learner, responds instantly
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+static void mmpf_update_storvik_for_hypothesis(
+    MMPF_ROCKS *mmpf,
+    int k, /* hypothesis index */
+    int resampled)
+{
+    RBPF_Extended *ext = mmpf->ext[k];
+    RBPF_KSC *rbpf = ext->rbpf;
+
+    if (!ext->storvik_initialized)
+        return;
+
+    const int n = rbpf->n_particles;
+
+    /* Apply resampling to Storvik if particles were resampled */
+    if (resampled)
+    {
+        param_learn_apply_resampling(&ext->storvik, rbpf->indices, n);
+    }
+
+    /* Extract particle info into ParticleInfo array
+     *
+     * CRITICAL: w_norm must be valid (computed in rbpf_ksc_compute_outputs)
+     */
+    ParticleInfo *info = ext->particle_info;
+    const rbpf_real_t *w_norm = rbpf->w_norm;
+    const rbpf_real_t *mu = rbpf->mu;
+    const int *regime = rbpf->regime;
+    rbpf_real_t *ell_lag = ext->ell_lag_buffer;
+    int *prev_regime = ext->prev_regime;
+
+    for (int i = 0; i < n; i++)
+    {
+        info[i].regime = regime[i];
+        info[i].ell = (param_real)mu[i];
+        info[i].weight = (param_real)w_norm[i];
+
+        /* Handle lineage after resampling */
+        int parent = resampled ? rbpf->indices[i] : i;
+        info[i].ell_lag = (param_real)ell_lag[parent];
+        info[i].prev_regime = prev_regime[parent];
+    }
+
+    /* Update Storvik sufficient statistics */
+    param_learn_update(&ext->storvik, info, n);
+
+    /* Sync learned parameters back to RBPF
+     *
+     * Storvik learns (μ, σ) for each KSC regime within this hypothesis.
+     * We take regime 0's params as representative (they're similar across KSC regimes).
+     */
+    RegimeParams params;
+    param_learn_get_params(&ext->storvik, 0, 0, &params); /* particle 0, KSC regime 0 */
+
+    /* Push learned μ_vol and σ_vol to all KSC regimes */
+    for (int r = 0; r < rbpf->n_regimes; r++)
+    {
+        rbpf->params[r].mu_vol = (rbpf_real_t)params.mu;
+        rbpf->params[r].sigma_vol = (rbpf_real_t)params.sigma;
+    }
+
+    /* Update gated_dynamics for diagnostics and compatibility */
+    mmpf->gated_dynamics[k].mu_vol = params.mu;
+    mmpf->gated_dynamics[k].sigma_eta = params.sigma;
+
+    /* Save current state for next tick's ell_lag */
+    for (int i = 0; i < n; i++)
+    {
+        ell_lag[i] = mu[i];
+        prev_regime[i] = regime[i];
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * MAIN STEP
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -1422,6 +1574,50 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
             out->outlier_fraction = RBPF_REAL(0.0);
         }
 
+        /* 7g. GATED STORVIK UPDATE: Learn μ_vol and σ_vol for this hypothesis
+         *
+         * CRITICAL GATES to prevent mode collapse:
+         *
+         * Gate 1: WEIGHT GATE - Only learn if this model explains the data
+         *   If w < 10%, this model is "losing" - don't let it learn from
+         *   data it doesn't understand. Prevents "Leakage" where Calm slowly
+         *   becomes Semi-Calm during extended crises.
+         *
+         * Gate 2: CALM IS PINNED - The anchor model doesn't learn μ_vol
+         *   Calm provides the invariant "floor" reference. If Calm drifts up
+         *   during a grinding bear market, we lose our definition of "high vol".
+         *   Let Trend/Crisis chase the market; Calm stays the rock.
+         *
+         * Without these gates, the "Free-Floating Fleet" drifts into a clump.
+         */
+        if (!skip_update && mmpf->config.enable_storvik_sync)
+        {
+            /* Gate 1: Weight gate - only learn if meaningfully weighted */
+            rbpf_real_t w_k = mmpf->weights[k];
+            int passes_weight_gate = (w_k >= RBPF_REAL(0.10));
+
+            /* Gate 2: Calm is pinned - never learns (the anchor) */
+            int is_pinned = (k == MMPF_CALM);
+
+            if (passes_weight_gate && !is_pinned)
+            {
+                /* LEARN: This model is active and not pinned */
+                mmpf_update_storvik_for_hypothesis(mmpf, k, out->resampled);
+            }
+            else
+            {
+                /* NO LEARNING: Either pinned or below weight threshold
+                 * Still update lag buffers to keep particle info coherent */
+                RBPF_Extended *ext = mmpf->ext[k];
+                const int n = ext->rbpf->n_particles;
+                for (int i = 0; i < n; i++)
+                {
+                    ext->ell_lag_buffer[i] = ext->rbpf->mu[i];
+                    ext->prev_regime[i] = ext->rbpf->regime[i];
+                }
+            }
+        }
+
         /* Cache marginal likelihood */
         mmpf->model_likelihood[k] = marginal_lik;
     }
@@ -1560,117 +1756,134 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
     mmpf->prev_weighted_log_vol = mmpf->weighted_log_vol;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 11: WTA GATED DYNAMICS LEARNING (φ, σ_η only - NOT μ_vol)
+     * STEP 11: GATED DYNAMICS STATE TRACKING
      *
-     * HYBRID ARCHITECTURE:
-     *   - μ_vol is controlled by baseline + offsets (Step 0) - preserves identity
-     *   - φ, σ_η are learned per-hypothesis via WTA - structural memory
+     * With Storvik enabled, parameter learning happens in step 7g.
+     * This section just updates prev_state for diagnostics.
      *
-     * Only the dominant hypothesis (max weight) learns each tick.
-     * This gives each hypothesis its own behavioral dynamics learned from
-     * data where IT was the best explanation.
+     * When Storvik is disabled, we fall back to manual WTA learning.
      *═══════════════════════════════════════════════════════════════════════*/
 
-    if (mmpf->config.enable_gated_learning && !skip_update)
+    if (!skip_update)
     {
-        /* Find dominant hypothesis (Winner-Takes-All) */
-        int dominant = 0;
-        rbpf_real_t max_w = mmpf->weights[0];
-        for (int k = 1; k < MMPF_N_MODELS; k++)
+        if (mmpf->config.enable_storvik_sync)
         {
-            if (mmpf->weights[k] > max_w)
+            /* STORVIK MODE: Just update prev_state for diagnostics
+             * Actual learning already happened in mmpf_update_storvik_for_hypothesis() */
+            for (int k = 0; k < MMPF_N_MODELS; k++)
             {
-                max_w = mmpf->weights[k];
-                dominant = k;
+                rbpf_real_t x_curr = mmpf->model_output[k].log_vol_mean;
+                if (x_curr == x_curr)
+                { /* NaN guard */
+                    mmpf->gated_dynamics[k].prev_state = (double)x_curr;
+                }
             }
         }
-
-        for (int k = 0; k < MMPF_N_MODELS; k++)
+        else if (mmpf->config.enable_gated_learning)
         {
-            /* Get current state estimate from this model */
-            rbpf_real_t x_curr = mmpf->model_output[k].log_vol_mean;
-
-            /* ══════════════════════════════════════════════════════════════
-             * [FIX 2B] NaN Guard: If this model is dead (NaN), do not learn from it
-             * ══════════════════════════════════════════════════════════════ */
-            if (x_curr != x_curr)
+            /* MANUAL MODE: WTA gated learning (fallback when Storvik disabled) */
+            int dominant = 0;
+            rbpf_real_t max_w = mmpf->weights[0];
+            for (int k = 1; k < MMPF_N_MODELS; k++)
             {
-                /* Skip learning for this model but preserve prev_state */
-                continue;
+                if (mmpf->weights[k] > max_w)
+                {
+                    max_w = mmpf->weights[k];
+                    dominant = k;
+                }
             }
 
-            double x_prev = mmpf->gated_dynamics[k].prev_state;
-
-            /* PURE WTA: Only dominant hypothesis learns, everyone else freezes */
-            if (k != dominant)
+            for (int k = 0; k < MMPF_N_MODELS; k++)
             {
-                mmpf->gated_dynamics[k].prev_state = (double)x_curr;
-                continue;
-            }
+                rbpf_real_t x_curr = mmpf->model_output[k].log_vol_mean;
 
-            double w = 1.0; /* Full weight - we're the winner */
+                if (x_curr != x_curr)
+                {
+                    continue; /* NaN guard */
+                }
 
-            /*═══════════════════════════════════════════════════════════════
-             * φ LEARNING (autoregression coefficient)
-             *
-             * Center around BASELINE-CONTROLLED μ_vol (set in Step 0)
-             * This ensures φ learning doesn't fight the structural anchors.
-             *═══════════════════════════════════════════════════════════════*/
+                double x_prev = mmpf->gated_dynamics[k].prev_state;
 
-            double mu_k = mmpf->gated_dynamics[k].mu_vol; /* From baseline + offset */
-            double centered_prev = x_prev - mu_k;
-            double centered_curr = (double)x_curr - mu_k;
+                if (k != dominant)
+                {
+                    mmpf->gated_dynamics[k].prev_state = (double)x_curr;
+                    continue;
+                }
 
-            mmpf->gated_dynamics[k].sum_xy += w * centered_prev * centered_curr;
-            mmpf->gated_dynamics[k].sum_xx += w * centered_prev * centered_prev;
+                double w = 1.0;
 
-            /*═══════════════════════════════════════════════════════════════
-             * σ_η LEARNING (innovation volatility)
-             *═══════════════════════════════════════════════════════════════*/
+                /* Manual μ_vol EWMA (only used when Storvik disabled) */
+                double mu_alpha;
+                switch (k)
+                {
+                case MMPF_CALM:
+                    mu_alpha = 0.995;
+                    break;
+                case MMPF_TREND:
+                    mu_alpha = 0.98;
+                    break;
+                case MMPF_CRISIS:
+                    mu_alpha = 0.90;
+                    break;
+                default:
+                    mu_alpha = 0.98;
+                    break;
+                }
 
-            double phi = mmpf->gated_dynamics[k].phi;
-            double predicted = phi * centered_prev;
-            double residual = centered_curr - predicted;
-            mmpf->gated_dynamics[k].sum_resid_sq += w * residual * residual;
-            mmpf->gated_dynamics[k].sum_w_sigma += w;
-
-            /* Update φ and σ_η when enough weight accumulated */
-            if (mmpf->gated_dynamics[k].sum_w_sigma > 10.0)
-            {
-                /* φ = Σxy / Σxx (weighted OLS) */
-                double new_phi = mmpf->gated_dynamics[k].sum_xy /
-                                 (mmpf->gated_dynamics[k].sum_xx + 1e-10);
-                /* Clamp φ to realistic range for daily vol dynamics:
-                 * φ < 0.80 would mean >20% mean reversion per day - unrealistic
-                 * φ > 0.995 would mean near-random-walk - also unrealistic */
-                new_phi = fmax(0.80, fmin(0.995, new_phi));
-
-                /* σ_η = sqrt(Σresid² / Σw) */
-                double new_sigma = sqrt(mmpf->gated_dynamics[k].sum_resid_sq /
-                                        mmpf->gated_dynamics[k].sum_w_sigma);
-                new_sigma = fmax(0.01, fmin(1.0, new_sigma));
-
-                mmpf->gated_dynamics[k].phi = new_phi;
-                mmpf->gated_dynamics[k].sigma_eta = new_sigma;
+                double old_mu = mmpf->gated_dynamics[k].mu_vol;
+                double new_mu = mu_alpha * old_mu + (1.0 - mu_alpha) * (double)x_curr;
+                mmpf->gated_dynamics[k].mu_vol = new_mu;
 
                 /* Push to RBPF */
                 RBPF_Extended *ext = mmpf->ext[k];
                 for (int r = 0; r < ext->rbpf->n_regimes; r++)
                 {
-                    ext->rbpf->params[r].theta = (rbpf_real_t)(1.0 - new_phi);
-                    ext->rbpf->params[r].sigma_vol = (rbpf_real_t)new_sigma;
+                    ext->rbpf->params[r].mu_vol = (rbpf_real_t)new_mu;
                 }
 
-                /* Slower forgetting for dynamics than μ_vol */
-                double forget_dyn = 0.99;
-                mmpf->gated_dynamics[k].sum_xy *= forget_dyn;
-                mmpf->gated_dynamics[k].sum_xx *= forget_dyn;
-                mmpf->gated_dynamics[k].sum_resid_sq *= forget_dyn;
-                mmpf->gated_dynamics[k].sum_w_sigma *= forget_dyn;
-            }
+                /* φ learning (Storvik doesn't learn φ, so we keep this) */
+                double mu_k = mmpf->gated_dynamics[k].mu_vol;
+                double centered_prev = x_prev - mu_k;
+                double centered_curr = (double)x_curr - mu_k;
 
-            /* Save state for next tick */
-            mmpf->gated_dynamics[k].prev_state = (double)x_curr;
+                mmpf->gated_dynamics[k].sum_xy += w * centered_prev * centered_curr;
+                mmpf->gated_dynamics[k].sum_xx += w * centered_prev * centered_prev;
+
+                /* σ_η learning */
+                double phi = mmpf->gated_dynamics[k].phi;
+                double predicted = phi * centered_prev;
+                double residual = centered_curr - predicted;
+                mmpf->gated_dynamics[k].sum_resid_sq += w * residual * residual;
+                mmpf->gated_dynamics[k].sum_w_sigma += w;
+
+                if (mmpf->gated_dynamics[k].sum_w_sigma > 10.0)
+                {
+                    double new_phi = mmpf->gated_dynamics[k].sum_xy /
+                                     (mmpf->gated_dynamics[k].sum_xx + 1e-10);
+                    new_phi = fmax(0.80, fmin(0.995, new_phi));
+
+                    double new_sigma = sqrt(mmpf->gated_dynamics[k].sum_resid_sq /
+                                            mmpf->gated_dynamics[k].sum_w_sigma);
+                    new_sigma = fmax(0.01, fmin(1.0, new_sigma));
+
+                    mmpf->gated_dynamics[k].phi = new_phi;
+                    mmpf->gated_dynamics[k].sigma_eta = new_sigma;
+
+                    for (int r = 0; r < ext->rbpf->n_regimes; r++)
+                    {
+                        ext->rbpf->params[r].theta = (rbpf_real_t)(1.0 - new_phi);
+                        ext->rbpf->params[r].sigma_vol = (rbpf_real_t)new_sigma;
+                    }
+
+                    double forget_dyn = 0.99;
+                    mmpf->gated_dynamics[k].sum_xy *= forget_dyn;
+                    mmpf->gated_dynamics[k].sum_xx *= forget_dyn;
+                    mmpf->gated_dynamics[k].sum_resid_sq *= forget_dyn;
+                    mmpf->gated_dynamics[k].sum_w_sigma *= forget_dyn;
+                }
+
+                mmpf->gated_dynamics[k].prev_state = (double)x_curr;
+            }
         }
     }
 
