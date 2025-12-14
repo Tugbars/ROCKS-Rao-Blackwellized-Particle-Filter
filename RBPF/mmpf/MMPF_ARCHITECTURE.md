@@ -37,15 +37,15 @@ The architecture separates **level** (where is volatility?) from **identity** (w
 │                                                             │
 │    ┌──────────┐    ┌──────────┐    ┌──────────┐            │
 │    │   RBPF   │    │   RBPF   │    │   RBPF   │            │
-│    │   Calm   │    │  Trend   │    │  Crisis  │            │
-│    │  φ=0.98  │    │  φ=0.95  │    │  φ=0.80  │            │
-│    └────┬─────┘    └────┬─────┘    └────┬─────┘            │
-│         │               │               │                   │
-│         └───────────────┼───────────────┘                   │
-│                         │                                   │
-│                         ▼                                   │
-│              IMM Weight Update                              │
-│         (Bayesian model comparison)                         │
+│    │   Calm   │    │  Trend   │    │  Crisis  │◄──┐        │
+│    │  φ=0.98  │    │  φ=0.95  │    │  φ=0.80  │   │        │
+│    └────┬─────┘    └────┬─────┘    └────┬─────┘   │        │
+│         │               │               │         │        │
+│         └───────────────┼───────────────┘    PANIC DRIFT   │
+│                         │                   (fat tails)    │
+│                         ▼                         │        │
+│              IMM Weight Update ───────────────────┘        │
+│         (Bayesian model comparison)                        │
 └─────────────────────────────┬───────────────────────────────┘
                               │
                               ▼
@@ -207,6 +207,63 @@ else:
     freeze (preserve structural memory)
 ```
 
+**Panic Drift (adaptive Crisis ceiling):**
+```
+if w_crisis > 0.5 AND y_log > crisis_anchor:
+    gap = y_log - crisis_anchor
+    crisis_drift += 0.2 × gap
+else:
+    crisis_drift *= 0.95  (decay)
+
+crisis_drift = min(crisis_drift, 1.5)  (cap)
+crisis_anchor_effective = baseline + 2.0 + crisis_drift
+```
+
+---
+
+## Panic Drift: Adaptive Fat Tail Capture
+
+### The Problem
+
+Fixed offsets guarantee discrimination but create a ceiling:
+- Crisis anchor = Baseline + 2.0 = exp(+2.0) × baseline ≈ 7.4× baseline
+- If baseline is 0.7% vol → Crisis cap at ~5.2% vol
+- But actual crash vol can hit 10-20% → filter under-estimates
+
+### The Solution
+
+**Panic Drift** temporarily boosts the Crisis ceiling during extreme events:
+
+1. **Trigger**: w_crisis > 50% AND observation exceeds Crisis anchor
+2. **Accumulate**: Drift grows proportional to how much observation exceeds anchor
+3. **Decay**: When crisis passes, drift decays back to zero (95% per tick)
+4. **Cap**: Maximum drift of +1.5 (Crisis can go from +2.0 to +3.5 offset)
+
+### Why This Works
+
+```
+Normal times:
+  Crisis = Baseline + 2.0 (fixed, guarantees discrimination)
+
+Crisis detected with extreme observation:
+  Crisis = Baseline + 2.0 + drift (adaptive ceiling)
+  
+Crisis passes:
+  drift → 0 (reverts to structural default)
+```
+
+This is the "Adrenaline" mechanism: emergency override of structural constraints that auto-reverts when danger passes.
+
+### Configuration
+
+```c
+cfg.enable_panic_drift = 1;
+cfg.panic_drift_threshold = 0.50;  /* Activate when w_crisis > 50% */
+cfg.panic_drift_rate = 0.20;       /* Accumulation speed */
+cfg.panic_drift_decay = 0.95;      /* Decay when not in panic */
+cfg.panic_drift_max = 1.50;        /* Max boost to Crisis offset */
+```
+
 ---
 
 ## Summary
@@ -217,6 +274,7 @@ The MMPF Hybrid Architecture achieves robust regime detection by:
 2. **Decoupling identity from dynamics** — μ_vol is structural, φ/σ_η are learned
 3. **Protecting specialist knowledge** — WTA prevents catastrophic forgetting
 4. **Tracking non-stationarity** — EWMA baseline adapts to secular drift
+5. **Capturing fat tails** — Panic Drift lifts Crisis ceiling during extreme events
 
 This is principled engineering: a real-time approximation of hierarchical Bayesian inference that runs in microseconds while preserving essential statistical structure.
 

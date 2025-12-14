@@ -365,10 +365,19 @@ static int run_mmpf_on_data(
         if ((t + 1) % progress_interval == 0)
         {
             int pct = (t + 1) * 100 / ds->n_rows;
-            printf("  %3d%% (%d/%d) - latency: %.1f μs, baseline: %.3f, frozen: %s\n",
-                   pct, t + 1, ds->n_rows, stats->total_time_us / (t + 1),
-                   (double)mmpf->global_mu_vol,
-                   mmpf->baseline_frozen_ticks > 0 ? "YES" : "no");
+            if ((double)mmpf->crisis_drift > 0.01)
+            {
+                printf("  %3d%% (%d/%d) - latency: %.1f μs, baseline: %.3f, PANIC DRIFT: +%.2f\n",
+                       pct, t + 1, ds->n_rows, stats->total_time_us / (t + 1),
+                       (double)mmpf->global_mu_vol,
+                       (double)mmpf->crisis_drift);
+            }
+            else
+            {
+                printf("  %3d%% (%d/%d) - latency: %.1f μs, baseline: %.3f\n",
+                       pct, t + 1, ds->n_rows, stats->total_time_us / (t + 1),
+                       (double)mmpf->global_mu_vol);
+            }
         }
     }
 
@@ -379,6 +388,8 @@ static int run_mmpf_on_data(
     printf("    Baseline frozen: %s (%d ticks)\n",
            mmpf->baseline_frozen_ticks > 0 ? "YES" : "no",
            mmpf->baseline_frozen_ticks);
+    printf("    Panic drift:     %.3f (Crisis ceiling boost)\n",
+           (double)mmpf->crisis_drift);
 
     /* Show per-hypothesis state */
     printf("\n  Per-hypothesis (μ_vol from baseline, φ/σ_η from WTA learning):\n");
@@ -484,6 +495,10 @@ int main(int argc, char *argv[])
     printf("    μ_vol control:    Baseline + Offsets (α=%.3f)\n",
            (double)mmpf->config.global_mu_vol_alpha);
     printf("    Dynamics control: WTA Gated Learning (φ, σ_η)\n");
+    printf("    Panic drift:      %s (gap>%.1f, max=+%.1f)\n",
+           mmpf->config.enable_panic_drift ? "ON" : "OFF",
+           (double)mmpf->config.panic_drift_threshold,
+           (double)mmpf->config.panic_drift_max);
     printf("    Storvik sync:     %s\n", mmpf->config.enable_storvik_sync ? "ON" : "OFF");
     printf("\n");
     printf("    Offsets: Calm=%.2f, Trend=%.2f, Crisis=%.2f\n",

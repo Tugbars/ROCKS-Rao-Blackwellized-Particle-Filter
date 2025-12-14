@@ -940,8 +940,8 @@ void rbpf_ksc_predict(RBPF_KSC *rbpf)
      * Storvik mode:  use_learned_params=1, liu_west.enabled=0
      * Liu-West mode: use_learned_params=1, liu_west.enabled=1 (after warmup)
      */
-    const int use_particles = rbpf->use_learned_params || 
-                              (rbpf->liu_west.enabled && 
+    const int use_particles = rbpf->use_learned_params ||
+                              (rbpf->liu_west.enabled &&
                                rbpf->liu_west.tick_count >= rbpf->liu_west.warmup_ticks);
 
     rbpf_real_t *restrict mu = rbpf->mu;
@@ -1427,7 +1427,7 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
  *───────────────────────────────────────────────────────────────────────────*/
 
 void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
-                                     RBPF_KSC_Output *out)
+                              RBPF_KSC_Output *out)
 {
     const int n = rbpf->n_particles;
     const int n_regimes = rbpf->n_regimes;

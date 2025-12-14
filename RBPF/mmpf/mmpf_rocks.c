@@ -454,6 +454,16 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.baseline_gate_on = RBPF_REAL(0.50);  /* Freeze when w_crisis > 50% */
     cfg.baseline_gate_off = RBPF_REAL(0.40); /* Unfreeze when w_crisis < 40% */
 
+    /* Panic Drift: allow Crisis ceiling to float up during extreme events
+     * Detects fat tails DIRECTLY: if observation exceeds estimate by gap_threshold,
+     * drift accumulates. When observations normalize, drift decays back to zero.
+     * This captures fat tails without needing Crisis to already be dominant. */
+    cfg.enable_panic_drift = 1;
+    cfg.panic_drift_threshold = RBPF_REAL(1.0); /* Gap in log-space (~2.7× in vol) */
+    cfg.panic_drift_rate = RBPF_REAL(0.30);     /* Accumulation rate (faster) */
+    cfg.panic_drift_decay = RBPF_REAL(0.90);    /* Decay factor (faster reversion) */
+    cfg.panic_drift_max = RBPF_REAL(2.0);       /* Max drift: Crisis can go from +2.0 to +4.0 */
+
     /* ENABLE WTA Gated Learning - learns DYNAMICS only (φ, σ_η), NOT μ_vol
      * μ_vol is controlled by baseline + offsets (preserves identity)
      * φ, σ_η are learned per-hypothesis via WTA (structural memory) */
@@ -900,7 +910,8 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
 
     mmpf->global_mu_vol = cfg.global_mu_vol_init;
     mmpf->prev_weighted_log_vol = cfg.global_mu_vol_init;
-    mmpf->baseline_frozen_ticks = 0; /* Not frozen at start */
+    mmpf->baseline_frozen_ticks = 0;     /* Not frozen at start */
+    mmpf->crisis_drift = RBPF_REAL(0.0); /* No panic drift at start */
 
     /* Initialize gated dynamics learners with per-hypothesis μ_vol */
     for (int k = 0; k < MMPF_N_MODELS; k++)
@@ -1010,7 +1021,8 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
 
     mmpf->global_mu_vol = log_vol;
     mmpf->prev_weighted_log_vol = log_vol;
-    mmpf->baseline_frozen_ticks = 0; /* Not frozen after reset */
+    mmpf->baseline_frozen_ticks = 0;     /* Not frozen after reset */
+    mmpf->crisis_drift = RBPF_REAL(0.0); /* No panic drift after reset */
 
     /* Reanchor hypotheses around new baseline */
     if (mmpf->config.enable_global_baseline)
@@ -1180,6 +1192,69 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         if (y_log < mmpf->config.min_log_return_sq)
         {
             y_log = mmpf->config.min_log_return_sq;
+        }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * PANIC DRIFT: Adaptive Crisis Ceiling for Fat Tails
+     *
+     * Detects fat tails DIRECTLY from observation vs estimate gap.
+     * If observation massively exceeds our current weighted estimate,
+     * this IS a fat tail regardless of which hypothesis is winning.
+     *
+     * Example: Current estimate = 1% vol (log = -4.6)
+     *          Observation y_log = -2.3 → implies 10% vol
+     *          Gap = -2.3 - (-4.6) = +2.3 (huge!)
+     *          This triggers drift even if Crisis probability is low.
+     *
+     * The drift helps Crisis become more competitive for extreme observations.
+     * When observations return to normal, drift decays back to zero.
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    if (mmpf->config.enable_panic_drift && !skip_update)
+    {
+        /* Use PREVIOUS weighted estimate (from last tick) as reference */
+        rbpf_real_t current_estimate = mmpf->prev_weighted_log_vol;
+        rbpf_real_t gap = y_log - current_estimate;
+
+        /* Trigger if observation exceeds estimate by threshold */
+        if (gap > mmpf->config.panic_drift_threshold)
+        {
+            /* Fat tail detected! Observation much louder than estimate.
+             * Drift the Crisis ceiling up toward the observation */
+            mmpf->crisis_drift += mmpf->config.panic_drift_rate * gap;
+        }
+        else
+        {
+            /* Normal observation - decay drift back to zero */
+            mmpf->crisis_drift *= mmpf->config.panic_drift_decay;
+        }
+
+        /* Cap the drift for safety */
+        if (mmpf->crisis_drift > mmpf->config.panic_drift_max)
+        {
+            mmpf->crisis_drift = mmpf->config.panic_drift_max;
+        }
+        if (mmpf->crisis_drift < RBPF_REAL(0.0))
+        {
+            mmpf->crisis_drift = RBPF_REAL(0.0);
+        }
+
+        /* Apply drift to Crisis anchor (reanchor Crisis RBPF) */
+        if (mmpf->crisis_drift > RBPF_REAL(0.01))
+        { /* Only if meaningful drift */
+            rbpf_real_t crisis_anchor = mmpf->global_mu_vol + mmpf->config.mu_vol_offsets[MMPF_CRISIS];
+            rbpf_real_t new_crisis_mu = crisis_anchor + mmpf->crisis_drift;
+
+            /* Push to Crisis RBPF */
+            RBPF_Extended *ext = mmpf->ext[MMPF_CRISIS];
+            for (int r = 0; r < ext->rbpf->n_regimes; r++)
+            {
+                ext->rbpf->params[r].mu_vol = new_crisis_mu;
+            }
+
+            /* Also update gated learner's anchor */
+            mmpf->gated_dynamics[MMPF_CRISIS].mu_vol = (double)new_crisis_mu;
         }
     }
 

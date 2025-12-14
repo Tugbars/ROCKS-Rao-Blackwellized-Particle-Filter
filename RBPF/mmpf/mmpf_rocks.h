@@ -228,6 +228,26 @@ extern "C"
         rbpf_real_t baseline_gate_off; /* Unfreeze when w_crisis < this (default: 0.4) */
 
         /*═══════════════════════════════════════════════════════════════════════
+         * PANIC DRIFT (Adaptive Crisis Ceiling)
+         *
+         * During extreme events, the fixed Crisis offset may be too low to capture
+         * fat tails. Detects fat tails DIRECTLY by comparing observation to estimate.
+         *
+         * If observation exceeds current weighted estimate by more than gap_threshold
+         * (in log-space), drift accumulates. When observations normalize, drift decays.
+         *
+         * This captures fat tails without needing Crisis to already be dominant -
+         * solving the chicken-and-egg problem where extreme observations spread
+         * probability across all hypotheses rather than concentrating on Crisis.
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        int enable_panic_drift;            /* 1 = allow Crisis ceiling to float up */
+        rbpf_real_t panic_drift_threshold; /* Gap threshold in log-space (default: 1.0) */
+        rbpf_real_t panic_drift_rate;      /* How fast drift accumulates (default: 0.3) */
+        rbpf_real_t panic_drift_decay;     /* How fast drift decays (default: 0.90) */
+        rbpf_real_t panic_drift_max;       /* Maximum drift allowed (default: 2.0) */
+
+        /*═══════════════════════════════════════════════════════════════════════
          * GATED DYNAMICS LEARNING
          *
          * When enabled, each hypothesis learns its OWN φ and σ_η from data
@@ -424,6 +444,15 @@ extern "C"
         rbpf_real_t global_mu_vol;         /* Current baseline (updated each tick) */
         rbpf_real_t prev_weighted_log_vol; /* Previous output (for EWMA update) */
         int baseline_frozen_ticks;         /* Ticks since baseline was frozen (0 = not frozen) */
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * PANIC DRIFT STATE
+         *
+         * During extreme events, the fixed Crisis offset may be too low.
+         * Panic Drift allows the Crisis ceiling to float up temporarily.
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        rbpf_real_t crisis_drift; /* Current drift added to Crisis offset */
 
         /*═══════════════════════════════════════════════════════════════════════
          * GATED LEARNING STATE (per-hypothesis)
