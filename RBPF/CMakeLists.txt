@@ -16,6 +16,8 @@ option(RBPF_ENABLE_STORVIK "Enable Sleeping Storvik parameter learning" ON)
 set(ROCKS_SOURCES
     # Core Rao-Blackwellized particle filter
     rao-blackwellized/rbpf_ksc.c
+
+    rao-blackwellized/rbpf_ksc_student_t.c
     
     # Auxiliary particle filter
     apf/rbpf_apf.c

@@ -257,15 +257,15 @@ extern "C"
          * This replaces the old Panic Drift mechanism with a principled approach.
          *═══════════════════════════════════════════════════════════════════════*/
 
-        int enable_student_t;                     /* 1 = use Student-t observations (recommended) */
+        int enable_student_t;                   /* 1 = use Student-t observations (recommended) */
         rbpf_real_t hypothesis_nu[MMPF_N_MODELS]; /* Per-hypothesis ν (degrees of freedom) */
 
         /* Optional: WTA-gated ν learning
          * Only dominant hypothesis learns its ν from data.
          * This gives "structural memory" — Crisis remembers how fat-tailed it is. */
-        int enable_nu_learning;       /* 1 = learn ν via Storvik auxiliary stats */
-        rbpf_real_t nu_floor;         /* Minimum ν (default: 2.5) */
-        rbpf_real_t nu_ceil;          /* Maximum ν (default: 30.0) */
+        int enable_nu_learning;      /* 1 = learn ν via Storvik auxiliary stats */
+        rbpf_real_t nu_floor;        /* Minimum ν (default: 2.5) */
+        rbpf_real_t nu_ceil;         /* Maximum ν (default: 30.0) */
         rbpf_real_t nu_learning_rate; /* EWMA rate for ν learning (default: 0.99) */
 
         /*═══════════════════════════════════════════════════════════════════════
@@ -331,10 +331,10 @@ extern "C"
         int update_skipped; /* 1 if observation was treated as censored */
 
         /* Student-t diagnostics */
-        int student_t_active;                          /* 1 if Student-t was used this tick */
-        rbpf_real_t model_lambda_mean[MMPF_N_MODELS];  /* E[λ] per model (1.0 = Gaussian) */
+        int student_t_active;                      /* 1 if Student-t was used this tick */
+        rbpf_real_t model_lambda_mean[MMPF_N_MODELS]; /* E[λ] per model (1.0 = Gaussian) */
         rbpf_real_t model_nu_effective[MMPF_N_MODELS]; /* Implied ν from λ variance */
-        rbpf_real_t model_nu[MMPF_N_MODELS];           /* Current ν per model (fixed or learned) */
+        rbpf_real_t model_nu[MMPF_N_MODELS];          /* Current ν per model (fixed or learned) */
 
     } MMPF_Output;
 

@@ -5,6 +5,7 @@
  * Uses Hybrid Architecture:
  *   - μ_vol: Controlled by Global Baseline + Fixed Offsets (identity)
  *   - φ, σ_η: Controlled by WTA Gated Learning (dynamics)
+ *   - ν (Student-t): Per-hypothesis tail thickness (structural)
  *
  * Just run the executable - no arguments needed.
  *
@@ -13,16 +14,18 @@
  *
  * Output CSV format:
  *   timestamp,return,vol,log_vol,vol_std,w_calm,w_trend,w_crisis,
- *   dominant,outlier_frac,ess_min,latency_us,global_baseline,baseline_frozen,event
+ *   dominant,outlier_frac,ess_min,latency_us,global_baseline,baseline_frozen,
+ *   nu_calm,nu_trend,nu_crisis,event
  */
 
 /*═══════════════════════════════════════════════════════════════════════════
  * BUILD CONFIGURATION - Change these and rebuild to experiment
  *═══════════════════════════════════════════════════════════════════════════*/
 
-/* Data files */
-#define INPUT_FILE "spy_5year.csv"
-#define OUTPUT_FILE "output_spy_5year.csv"
+/* Data files - paths relative to build/RBPF/Release directory */
+#define DATA_DIR "../../../test/mmpf_real_data_test/"
+#define INPUT_FILE DATA_DIR "spy_5year.csv"
+#define OUTPUT_FILE DATA_DIR "output_spy_5year.csv"
 
 /* Filter configuration */
 #define N_PARTICLES 512
@@ -208,7 +211,7 @@ static Dataset *load_csv(const char *filename)
  * MMPF CONFIGURATION
  *
  * Uses mmpf_config_defaults() directly - the global baseline architecture
- * is the default configuration. No command-line options needed.
+ * with Student-t observations is the default configuration.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static MMPF_ROCKS *create_mmpf(int n_particles, double baseline_vol)
@@ -250,6 +253,11 @@ typedef struct
     int ticks_trend;
     int ticks_crisis;
 
+    /* Student-t diagnostics */
+    int student_t_active;
+    double avg_lambda_calm;   /* Average λ (1.0 = Gaussian behavior) */
+    double avg_lambda_crisis; /* < 1.0 indicates fat tail scaling active */
+
 } RunStats;
 
 static int run_mmpf_on_data(
@@ -267,14 +275,20 @@ static int run_mmpf_on_data(
 
     /* CSV header */
     fprintf(fp, "timestamp,return,vol,log_vol,vol_std,w_calm,w_trend,w_crisis,"
-                "dominant,outlier_frac,ess_min,latency_us,global_baseline,baseline_frozen,event\n");
+                "dominant,outlier_frac,ess_min,latency_us,global_baseline,baseline_frozen,"
+                "nu_calm,nu_trend,nu_crisis,event\n");
 
     /* Initialize stats */
     memset(stats, 0, sizeof(RunStats));
     stats->min_latency_us = 1e9;
+    stats->student_t_active = mmpf->config.enable_student_t;
 
     MMPF_Output out;
     MMPF_Hypothesis prev_dom = MMPF_CALM;
+
+    /* Accumulators for λ statistics */
+    double sum_lambda_calm = 0.0;
+    double sum_lambda_crisis = 0.0;
 
     /* Progress tracking */
     int progress_interval = ds->n_rows / 20;
@@ -343,8 +357,15 @@ static int run_mmpf_on_data(
 
         prev_dom = dom;
 
+        /* Accumulate λ statistics (Student-t scale factors) */
+        if (out.student_t_active)
+        {
+            sum_lambda_calm += (double)out.model_lambda_mean[MMPF_CALM];
+            sum_lambda_crisis += (double)out.model_lambda_mean[MMPF_CRISIS];
+        }
+
         /* Write output row */
-        fprintf(fp, "%s,%.8f,%.8f,%.6f,%.8f,%.6f,%.6f,%.6f,%d,%.6f,%.2f,%.2f,%.4f,%d,%s\n",
+        fprintf(fp, "%s,%.8f,%.8f,%.6f,%.8f,%.6f,%.6f,%.6f,%d,%.6f,%.2f,%.2f,%.4f,%d,%.1f,%.1f,%.1f,%s\n",
                 row->timestamp,
                 row->ret,
                 vol,
@@ -359,26 +380,28 @@ static int run_mmpf_on_data(
                 latency,
                 (double)mmpf->global_mu_vol,
                 mmpf->baseline_frozen_ticks > 0 ? 1 : 0,
+                (double)out.model_nu[MMPF_CALM],
+                (double)out.model_nu[MMPF_TREND],
+                (double)out.model_nu[MMPF_CRISIS],
                 row->event);
 
         /* Progress */
         if ((t + 1) % progress_interval == 0)
         {
             int pct = (t + 1) * 100 / ds->n_rows;
-            if ((double)mmpf->crisis_drift > 0.01)
-            {
-                printf("  %3d%% (%d/%d) - latency: %.1f μs, baseline: %.3f, PANIC DRIFT: +%.2f\n",
-                       pct, t + 1, ds->n_rows, stats->total_time_us / (t + 1),
-                       (double)mmpf->global_mu_vol,
-                       (double)mmpf->crisis_drift);
-            }
-            else
-            {
-                printf("  %3d%% (%d/%d) - latency: %.1f μs, baseline: %.3f\n",
-                       pct, t + 1, ds->n_rows, stats->total_time_us / (t + 1),
-                       (double)mmpf->global_mu_vol);
-            }
+            printf("  %3d%% (%d/%d) - latency: %.1f μs, baseline: %.3f, dominant: %s\n",
+                   pct, t + 1, ds->n_rows, stats->total_time_us / (t + 1),
+                   (double)mmpf->global_mu_vol,
+                   dom == MMPF_CALM ? "Calm" : dom == MMPF_TREND ? "Trend"
+                                                                 : "CRISIS");
         }
+    }
+
+    /* Compute average λ statistics */
+    if (ds->n_rows > 0)
+    {
+        stats->avg_lambda_calm = sum_lambda_calm / ds->n_rows;
+        stats->avg_lambda_crisis = sum_lambda_crisis / ds->n_rows;
     }
 
     /* Final state summary */
@@ -388,20 +411,19 @@ static int run_mmpf_on_data(
     printf("    Baseline frozen: %s (%d ticks)\n",
            mmpf->baseline_frozen_ticks > 0 ? "YES" : "no",
            mmpf->baseline_frozen_ticks);
-    printf("    Panic drift:     %.3f (Crisis ceiling boost)\n",
-           (double)mmpf->crisis_drift);
 
     /* Show per-hypothesis state */
     printf("\n  Per-hypothesis (μ_vol from baseline, φ/σ_η from WTA learning):\n");
     const char *names[] = {"Calm", "Trend", "Crisis"};
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        printf("    %s:  μ_vol=%.3f (%.2f%%), φ=%.3f, σ_η=%.3f\n",
+        printf("    %s:  μ_vol=%.3f (%.2f%%), φ=%.3f, σ_η=%.3f, ν=%.1f\n",
                names[k],
                mmpf->gated_dynamics[k].mu_vol,
                exp(mmpf->gated_dynamics[k].mu_vol) * 100,
                mmpf->gated_dynamics[k].phi,
-               mmpf->gated_dynamics[k].sigma_eta);
+               mmpf->gated_dynamics[k].sigma_eta,
+               (double)mmpf->learned_nu[k]);
     }
 
     fclose(fp);
@@ -442,6 +464,15 @@ static void print_stats(const RunStats *stats, int n_rows)
     printf("    Crisis: %5d ticks (%5.1f%%)\n",
            stats->ticks_crisis, 100.0 * stats->ticks_crisis / n_rows);
     printf("\n");
+
+    if (stats->student_t_active)
+    {
+        printf("  Student-t Diagnostics:\n");
+        printf("    Avg λ (Calm):   %.4f  (1.0 = Gaussian, <1.0 = fat tail scaling)\n",
+               stats->avg_lambda_calm);
+        printf("    Avg λ (Crisis): %.4f\n", stats->avg_lambda_crisis);
+        printf("\n");
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -455,7 +486,7 @@ int main(int argc, char *argv[])
 
     printf("\n");
     printf("════════════════════════════════════════════════════════════\n");
-    printf("  MMPF Real Data Test (Hybrid Architecture)\n");
+    printf("  MMPF Real Data Test (Hybrid Architecture + Student-t)\n");
     printf("════════════════════════════════════════════════════════════\n\n");
     printf("  Input:      %s\n", INPUT_FILE);
     printf("  Output:     %s\n", OUTPUT_FILE);
@@ -495,12 +526,23 @@ int main(int argc, char *argv[])
     printf("    μ_vol control:    Baseline + Offsets (α=%.3f)\n",
            (double)mmpf->config.global_mu_vol_alpha);
     printf("    Dynamics control: WTA Gated Learning (φ, σ_η)\n");
-    printf("    Panic drift:      %s (gap>%.1f, max=+%.1f)\n",
-           mmpf->config.enable_panic_drift ? "ON" : "OFF",
-           (double)mmpf->config.panic_drift_threshold,
-           (double)mmpf->config.panic_drift_max);
     printf("    Storvik sync:     %s\n", mmpf->config.enable_storvik_sync ? "ON" : "OFF");
     printf("\n");
+
+    printf("  Student-t Observation Model:\n");
+    printf("    Enabled:          %s\n", mmpf->config.enable_student_t ? "YES" : "no");
+    if (mmpf->config.enable_student_t)
+    {
+        printf("    ν (Calm):         %.1f  (near-Gaussian tails)\n",
+               (double)mmpf->config.hypothesis_nu[MMPF_CALM]);
+        printf("    ν (Trend):        %.1f  (moderate fat tails)\n",
+               (double)mmpf->config.hypothesis_nu[MMPF_TREND]);
+        printf("    ν (Crisis):       %.1f  (heavy fat tails)\n",
+               (double)mmpf->config.hypothesis_nu[MMPF_CRISIS]);
+        printf("    ν learning:       %s\n", mmpf->config.enable_nu_learning ? "ON" : "OFF");
+    }
+    printf("\n");
+
     printf("    Offsets: Calm=%.2f, Trend=%.2f, Crisis=%.2f\n",
            (double)mmpf->config.mu_vol_offsets[MMPF_CALM],
            (double)mmpf->config.mu_vol_offsets[MMPF_TREND],
@@ -515,10 +557,11 @@ int main(int argc, char *argv[])
     printf("  Initial μ_vol (from baseline %.3f + offsets):\n", (double)mmpf->global_mu_vol);
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        printf("    %s: μ_vol=%.3f (%.2f%% vol)\n",
+        printf("    %s: μ_vol=%.3f (%.2f%% vol), ν=%.1f\n",
                model_names[k],
                mmpf->gated_dynamics[k].mu_vol,
-               exp(mmpf->gated_dynamics[k].mu_vol) * 100);
+               exp(mmpf->gated_dynamics[k].mu_vol) * 100,
+               (double)mmpf->learned_nu[k]);
     }
     printf("\n");
 
