@@ -10,7 +10,13 @@
  *   - Regularization after resample (prevents Kalman state degeneracy)
  *   - Self-aware detection signals (no external model)
  *
- * Latency target: <15μs for 1000 particles
+ * Student-t Extension (optional):
+ *   - Compile with RBPF_ENABLE_STUDENT_T=1 (default) for fat-tail support
+ *   - Compile with RBPF_ENABLE_STUDENT_T=0 for Gaussian-only (minimal overhead)
+ *   - Runtime switch via rbpf_ksc_enable_student_t() / rbpf_ksc_disable_student_t()
+ *
+ * Latency target: <15μs for 1000 particles (Gaussian)
+ *                 <20μs for 1000 particles (Student-t)
  */
 
 #include "rbpf_ksc.h"
@@ -20,6 +26,25 @@
 #include <math.h>
 #include <omp.h>
 #include <mkl_vml.h>
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * STUDENT-T COMPILE-TIME SWITCH
+ *
+ * Set RBPF_ENABLE_STUDENT_T=0 before including header for Gaussian-only build.
+ * Default is enabled (1).
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#ifndef RBPF_ENABLE_STUDENT_T
+#define RBPF_ENABLE_STUDENT_T 1
+#endif
+
+#if RBPF_ENABLE_STUDENT_T
+/* Forward declarations for Student-t extension (defined in rbpf_ksc_student_t.c) */
+extern int rbpf_ksc_alloc_student_t(RBPF_KSC *rbpf);
+extern void rbpf_ksc_free_student_t(RBPF_KSC *rbpf);
+extern void rbpf_ksc_resample_student_t(RBPF_KSC *rbpf, const int *indices);
+extern rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y);
+#endif
 
 /*─────────────────────────────────────────────────────────────────────────────
  * OMORI, CHIB, SHEPHARD & NAKAJIMA (2007) MIXTURE PARAMETERS
@@ -231,6 +256,26 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
 
     rbpf->use_learned_params = 0;
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * STUDENT-T ALLOCATION
+     *
+     * Allocate auxiliary variable arrays for Student-t observation model.
+     * These are only used when student_t_enabled is set at runtime.
+     *═══════════════════════════════════════════════════════════════════════*/
+#if RBPF_ENABLE_STUDENT_T
+    if (rbpf_ksc_alloc_student_t(rbpf) < 0)
+    {
+        rbpf_ksc_destroy(rbpf);
+        return NULL;
+    }
+#else
+    /* Gaussian-only build: set pointers to NULL */
+    rbpf->lambda = NULL;
+    rbpf->lambda_tmp = NULL;
+    rbpf->log_lambda = NULL;
+    rbpf->student_t_enabled = 0;
+#endif
+
     /* MKL fast math mode */
     vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
 
@@ -283,6 +328,13 @@ void rbpf_ksc_destroy(RBPF_KSC *rbpf)
     mkl_free(rbpf->particle_sigma_vol);
     mkl_free(rbpf->particle_mu_vol_tmp);
     mkl_free(rbpf->particle_sigma_vol_tmp);
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STUDENT-T CLEANUP
+     *═══════════════════════════════════════════════════════════════════════*/
+#if RBPF_ENABLE_STUDENT_T
+    rbpf_ksc_free_student_t(rbpf);
+#endif
 
     mkl_free(rbpf);
 }
@@ -383,6 +435,14 @@ void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag)
     for (int i = 0; i < RBPF_MAX_SMOOTH_LAG; i++)
     {
         rbpf->smooth_history[i].valid = 0;
+    }
+}
+
+void rbpf_ksc_set_learned_params_mode(RBPF_KSC *rbpf, int enable)
+{
+    if (rbpf)
+    {
+        rbpf->use_learned_params = enable;
     }
 }
 
@@ -906,6 +966,23 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
     /* Reset Liu-West tick counter */
     rbpf->liu_west.tick_count = 0;
     rbpf->liu_west.ticks_since_resample = 0;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STUDENT-T INITIALIZATION
+     *
+     * Initialize λ arrays to 1.0 (Gaussian equivalent)
+     *═══════════════════════════════════════════════════════════════════════*/
+#if RBPF_ENABLE_STUDENT_T
+    if (rbpf->lambda != NULL)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            rbpf->lambda[i] = RBPF_REAL(1.0);
+            if (rbpf->log_lambda)
+                rbpf->log_lambda[i] = RBPF_REAL(0.0);
+        }
+    }
+#endif
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -1419,6 +1496,19 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
         rbpf_ksc_liu_west_resample(rbpf, indices);
     }
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * STUDENT-T RESAMPLE
+     *
+     * Resample the auxiliary variable λ arrays to match particle indices.
+     * Must be done AFTER main particle resample but BEFORE Liu-West.
+     *═══════════════════════════════════════════════════════════════════════*/
+#if RBPF_ENABLE_STUDENT_T
+    if (rbpf->student_t_enabled)
+    {
+        rbpf_ksc_resample_student_t(rbpf, indices);
+    }
+#endif
+
     return 1;
 }
 
@@ -1711,6 +1801,59 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
             out->regime_probs_smooth[r] = out->regime_probs[r];
         }
     }
+
+    /*========================================================================
+     * STUDENT-T OUTPUT DIAGNOSTICS
+     *======================================================================*/
+    out->student_t_active = 0;
+    out->lambda_mean = RBPF_REAL(1.0);
+    out->lambda_var = RBPF_REAL(0.0);
+    out->nu_effective = RBPF_NU_CEIL;
+
+#if RBPF_ENABLE_STUDENT_T
+    if (rbpf->student_t_enabled && rbpf->lambda != NULL)
+    {
+        out->student_t_active = 1;
+
+        /* Compute λ statistics */
+        rbpf_real_t sum_lam = RBPF_REAL(0.0);
+        rbpf_real_t sum_lam_sq = RBPF_REAL(0.0);
+
+        for (int i = 0; i < n; i++)
+        {
+            sum_lam += w_norm[i] * rbpf->lambda[i];
+            sum_lam_sq += w_norm[i] * rbpf->lambda[i] * rbpf->lambda[i];
+        }
+
+        out->lambda_mean = sum_lam;
+        out->lambda_var = sum_lam_sq - sum_lam * sum_lam;
+        if (out->lambda_var < RBPF_REAL(0.0))
+            out->lambda_var = RBPF_REAL(0.0);
+
+        /* Implied ν from observed λ variance: Var[λ] = 2/ν → ν = 2/Var[λ] */
+        if (out->lambda_var > RBPF_REAL(0.01))
+        {
+            out->nu_effective = RBPF_REAL(2.0) / out->lambda_var;
+        }
+        else
+        {
+            out->nu_effective = RBPF_NU_CEIL; /* Near-Gaussian */
+        }
+
+        /* Copy learned ν estimates */
+        for (int r = 0; r < n_regimes; r++)
+        {
+            if (rbpf->student_t[r].learn_nu)
+            {
+                out->learned_nu[r] = rbpf->student_t_stats[r].nu_estimate;
+            }
+            else
+            {
+                out->learned_nu[r] = rbpf->student_t[r].nu;
+            }
+        }
+    }
+#endif
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -1736,13 +1879,31 @@ void rbpf_ksc_step(RBPF_KSC *rbpf, rbpf_real_t obs, RBPF_KSC_Output *output)
     /* 2. Kalman predict */
     rbpf_ksc_predict(rbpf);
 
-    /* 3. Mixture Kalman update */
-    rbpf_real_t marginal_lik = rbpf_ksc_update(rbpf, y);
+    /* 3. Mixture Kalman update
+     *
+     * Runtime branch: Gaussian vs Student-t observation model
+     * When Student-t is enabled, route to specialized update function
+     * that samples auxiliary variables λ and shifts observations.
+     */
+    rbpf_real_t marginal_lik;
+
+#if RBPF_ENABLE_STUDENT_T
+    if (rbpf->student_t_enabled)
+    {
+        marginal_lik = rbpf_ksc_update_student_t(rbpf, y);
+    }
+    else
+    {
+        marginal_lik = rbpf_ksc_update(rbpf, y);
+    }
+#else
+    marginal_lik = rbpf_ksc_update(rbpf, y);
+#endif
 
     /* 4. Compute outputs (before resample) */
     rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
 
-    /* 5. Resample if needed (includes Liu-West update) */
+    /* 5. Resample if needed (includes Liu-West update + Student-t λ resample) */
     output->resampled = rbpf_ksc_resample(rbpf);
 
     /* 6. Liu-West: increment tick counter and populate learned params */
@@ -1818,6 +1979,24 @@ void rbpf_ksc_print_config(const RBPF_KSC *rbpf)
                rbpf->liu_west.min_mu_vol, rbpf->liu_west.max_mu_vol);
     }
 
+#if RBPF_ENABLE_STUDENT_T
+    printf("\n  Student-t Observation Model:\n");
+    printf("    Compiled:    YES\n");
+    printf("    Enabled:     %s\n", rbpf->student_t_enabled ? "YES" : "NO");
+    if (rbpf->student_t_enabled)
+    {
+        printf("    Per-regime ν:\n");
+        for (int r = 0; r < rbpf->n_regimes; r++)
+        {
+            printf("      R%d: ν=%.2f%s\n", r, rbpf->student_t[r].nu,
+                   rbpf->student_t[r].learn_nu ? " (learning)" : "");
+        }
+    }
+#else
+    printf("\n  Student-t Observation Model:\n");
+    printf("    Compiled:    NO (Gaussian-only build)\n");
+#endif
+
     printf("\n  Per-regime parameters (initial):\n");
     printf("  %-8s %8s %8s %8s\n", "Regime", "theta", "mu_vol", "sigma_vol");
     for (int r = 0; r < rbpf->n_regimes; r++)
@@ -1827,3 +2006,103 @@ void rbpf_ksc_print_config(const RBPF_KSC *rbpf)
                r, p->theta, p->mu_vol, p->sigma_vol);
     }
 }
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * STUDENT-T STUBS (when compiled without RBPF_ENABLE_STUDENT_T)
+ *
+ * These allow code to call Student-t API without #ifdefs everywhere.
+ * The functions do nothing but the code compiles and links cleanly.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#if !RBPF_ENABLE_STUDENT_T
+
+void rbpf_ksc_enable_student_t(RBPF_KSC *rbpf, rbpf_real_t nu)
+{
+    (void)rbpf;
+    (void)nu;
+    /* No-op in Gaussian-only build */
+}
+
+void rbpf_ksc_disable_student_t(RBPF_KSC *rbpf)
+{
+    (void)rbpf;
+}
+
+void rbpf_ksc_set_student_t_nu(RBPF_KSC *rbpf, int regime, rbpf_real_t nu)
+{
+    (void)rbpf;
+    (void)regime;
+    (void)nu;
+}
+
+rbpf_real_t rbpf_ksc_get_nu(const RBPF_KSC *rbpf, int regime)
+{
+    (void)rbpf;
+    (void)regime;
+    return RBPF_REAL(1e30); /* "Infinite" ν = Gaussian */
+}
+
+void rbpf_ksc_enable_nu_learning(RBPF_KSC *rbpf, int regime, rbpf_real_t learning_rate)
+{
+    (void)rbpf;
+    (void)regime;
+    (void)learning_rate;
+}
+
+void rbpf_ksc_disable_nu_learning(RBPF_KSC *rbpf, int regime)
+{
+    (void)rbpf;
+    (void)regime;
+}
+
+void rbpf_ksc_get_lambda_stats(const RBPF_KSC *rbpf, int regime,
+                               rbpf_real_t *mean_out, rbpf_real_t *var_out,
+                               rbpf_real_t *n_eff_out)
+{
+    (void)rbpf;
+    (void)regime;
+    if (mean_out)
+        *mean_out = RBPF_REAL(1.0);
+    if (var_out)
+        *var_out = RBPF_REAL(0.0);
+    if (n_eff_out)
+        *n_eff_out = RBPF_REAL(0.0);
+}
+
+void rbpf_ksc_reset_nu_learning(RBPF_KSC *rbpf, int regime)
+{
+    (void)rbpf;
+    (void)regime;
+}
+
+void rbpf_ksc_step_student_t(RBPF_KSC *rbpf, rbpf_real_t obs, RBPF_KSC_Output *output)
+{
+    /* Fall back to Gaussian step */
+    rbpf_ksc_step(rbpf, obs, output);
+}
+
+void rbpf_ksc_step_student_t_nu(RBPF_KSC *rbpf, rbpf_real_t obs, rbpf_real_t nu,
+                                RBPF_KSC_Output *output)
+{
+    (void)nu;
+    rbpf_ksc_step(rbpf, obs, output);
+}
+
+int rbpf_ksc_alloc_student_t(RBPF_KSC *rbpf)
+{
+    (void)rbpf;
+    return 0; /* Success (no-op) */
+}
+
+void rbpf_ksc_free_student_t(RBPF_KSC *rbpf)
+{
+    (void)rbpf;
+}
+
+void rbpf_ksc_resample_student_t(RBPF_KSC *rbpf, const int *indices)
+{
+    (void)rbpf;
+    (void)indices;
+}
+
+#endif /* !RBPF_ENABLE_STUDENT_T */
