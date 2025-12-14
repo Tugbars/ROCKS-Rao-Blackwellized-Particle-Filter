@@ -2,8 +2,11 @@
  * @file test_mmpf_real_data.c
  * @brief Run MMPF on real market data (SPY 5-year daily)
  *
+ * Uses Hybrid Architecture:
+ *   - μ_vol: Controlled by Global Baseline + Fixed Offsets (identity)
+ *   - φ, σ_η: Controlled by WTA Gated Learning (dynamics)
+ *
  * Just run the executable - no arguments needed.
- * Change BUILD CONFIGURATION below and rebuild to experiment.
  *
  * Input CSV format:
  *   timestamp,close,return[,event]
@@ -362,7 +365,7 @@ static int run_mmpf_on_data(
         if ((t + 1) % progress_interval == 0)
         {
             int pct = (t + 1) * 100 / ds->n_rows;
-            printf("  %3d%% (%d/%d) - avg latency: %.1f μs, baseline: %.3f, frozen: %s\n",
+            printf("  %3d%% (%d/%d) - latency: %.1f μs, baseline: %.3f, frozen: %s\n",
                    pct, t + 1, ds->n_rows, stats->total_time_us / (t + 1),
                    (double)mmpf->global_mu_vol,
                    mmpf->baseline_frozen_ticks > 0 ? "YES" : "no");
@@ -376,6 +379,19 @@ static int run_mmpf_on_data(
     printf("    Baseline frozen: %s (%d ticks)\n",
            mmpf->baseline_frozen_ticks > 0 ? "YES" : "no",
            mmpf->baseline_frozen_ticks);
+
+    /* Show per-hypothesis state */
+    printf("\n  Per-hypothesis (μ_vol from baseline, φ/σ_η from WTA learning):\n");
+    const char *names[] = {"Calm", "Trend", "Crisis"};
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        printf("    %s:  μ_vol=%.3f (%.2f%%), φ=%.3f, σ_η=%.3f\n",
+               names[k],
+               mmpf->gated_dynamics[k].mu_vol,
+               exp(mmpf->gated_dynamics[k].mu_vol) * 100,
+               mmpf->gated_dynamics[k].phi,
+               mmpf->gated_dynamics[k].sigma_eta);
+    }
 
     fclose(fp);
 
@@ -428,7 +444,7 @@ int main(int argc, char *argv[])
 
     printf("\n");
     printf("════════════════════════════════════════════════════════════\n");
-    printf("  MMPF Real Data Test (Global Baseline Architecture)\n");
+    printf("  MMPF Real Data Test (Hybrid Architecture)\n");
     printf("════════════════════════════════════════════════════════════\n\n");
     printf("  Input:      %s\n", INPUT_FILE);
     printf("  Output:     %s\n", OUTPUT_FILE);
@@ -464,42 +480,30 @@ int main(int argc, char *argv[])
     }
 
     /* Print configuration */
-    printf("  Global Baseline Architecture:\n");
+    printf("  Hybrid Architecture:\n");
+    printf("    μ_vol control:    Baseline + Offsets (α=%.3f)\n",
+           (double)mmpf->config.global_mu_vol_alpha);
+    printf("    Dynamics control: WTA Gated Learning (φ, σ_η)\n");
     printf("    Storvik sync:     %s\n", mmpf->config.enable_storvik_sync ? "ON" : "OFF");
-    printf("    Global baseline:  %s\n", mmpf->config.enable_global_baseline ? "ON" : "OFF");
-    printf("    Gated learning:   %s\n", mmpf->config.enable_gated_learning ? "ON" : "OFF");
     printf("\n");
-    printf("    Initial baseline: %.3f (%.3f%% vol)\n",
-           (double)mmpf->config.global_mu_vol_init,
-           exp((double)mmpf->config.global_mu_vol_init) * 100);
     printf("    Offsets: Calm=%.2f, Trend=%.2f, Crisis=%.2f\n",
            (double)mmpf->config.mu_vol_offsets[MMPF_CALM],
            (double)mmpf->config.mu_vol_offsets[MMPF_TREND],
            (double)mmpf->config.mu_vol_offsets[MMPF_CRISIS]);
     printf("\n");
-    printf("    Effective vol levels:\n");
-    printf("      Calm:   %.3f%% (× %.2f)\n",
-           exp((double)mmpf->config.global_mu_vol_init + (double)mmpf->config.mu_vol_offsets[MMPF_CALM]) * 100,
-           exp((double)mmpf->config.mu_vol_offsets[MMPF_CALM]));
-    printf("      Trend:  %.3f%% (baseline)\n",
-           exp((double)mmpf->config.global_mu_vol_init) * 100);
-    printf("      Crisis: %.3f%% (× %.2f)\n",
-           exp((double)mmpf->config.global_mu_vol_init + (double)mmpf->config.mu_vol_offsets[MMPF_CRISIS]) * 100,
-           exp((double)mmpf->config.mu_vol_offsets[MMPF_CRISIS]));
-    printf("\n");
 
     /* Initialize filter */
     mmpf_reset(mmpf, (rbpf_real_t)init_vol);
 
-    /* Verify use_learned_params is OFF */
-    printf("  Hypothesis state after reset:\n");
+    /* Show initial state */
+    const char *model_names[] = {"Calm", "Trend", "Crisis"};
+    printf("  Initial μ_vol (from baseline %.3f + offsets):\n", (double)mmpf->global_mu_vol);
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        const char *names[] = {"Calm", "Trend", "Crisis"};
-        printf("    %s: mu_vol=%.3f, use_learned_params=%d\n",
-               names[k],
-               (double)mmpf->ext[k]->rbpf->params[0].mu_vol,
-               mmpf->ext[k]->rbpf->use_learned_params);
+        printf("    %s: μ_vol=%.3f (%.2f%% vol)\n",
+               model_names[k],
+               mmpf->gated_dynamics[k].mu_vol,
+               exp(mmpf->gated_dynamics[k].mu_vol) * 100);
     }
     printf("\n");
 

@@ -426,21 +426,32 @@ extern "C"
         int baseline_frozen_ticks;         /* Ticks since baseline was frozen (0 = not frozen) */
 
         /*═══════════════════════════════════════════════════════════════════════
-         * GATED DYNAMICS LEARNING STATE
+         * GATED LEARNING STATE (per-hypothesis)
          *
-         * Per-hypothesis sufficient statistics for learning φ and σ_η.
-         * These are SEPARATE from Storvik's μ_vol learning (which we disable).
+         * Each hypothesis learns its OWN parameters from data where IT is dominant.
+         * This prevents convergence: Crisis learns from crisis data, Calm from calm.
+         *
+         * Learns: μ_vol, φ, σ_η (all three key SV parameters)
          *═══════════════════════════════════════════════════════════════════════*/
 
         struct
         {
-            double sum_xy;       /* Σ w × x_{t-1} × x_t */
-            double sum_xx;       /* Σ w × x_{t-1}² */
+            /* μ_vol learning (weighted running mean) */
+            double sum_x;    /* Σ w × log_vol (for mean) */
+            double sum_w_mu; /* Σ w for μ_vol learning */
+            double mu_vol;   /* Current learned μ_vol */
+
+            /* φ learning (autoregression coefficient) */
+            double sum_xy; /* Σ w × x_{t-1} × x_t */
+            double sum_xx; /* Σ w × x_{t-1}² */
+            double phi;    /* Current learned φ */
+
+            /* σ_η learning (innovation volatility) */
             double sum_resid_sq; /* Σ w × (x_t - φ×x_{t-1})² */
-            double sum_weight;   /* Σ w (effective sample size) */
-            double phi;          /* Current learned φ */
+            double sum_w_sigma;  /* Σ w for σ_η learning */
             double sigma_eta;    /* Current learned σ_η */
-            double prev_state;   /* x_{t-1} for this hypothesis */
+
+            double prev_state; /* x_{t-1} for this hypothesis */
         } gated_dynamics[MMPF_N_MODELS];
 
     } MMPF_ROCKS;
