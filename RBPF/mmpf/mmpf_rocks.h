@@ -171,6 +171,9 @@ extern "C"
         rbpf_real_t crisis_exit_boost; /* Crisis exits faster: 0.92 multiplier */
         rbpf_real_t min_mixing_prob;   /* Minimum transition probability (prevents lock-in): 0.01 */
 
+        rbpf_real_t transition_prior_alpha;  /* Dirichlet pseudo-counts (default: 1.0) */
+        rbpf_real_t transition_prior_mass;   /* Observation mass (default: 20.0) */
+
         /* OCSN-driven adaptive stickiness */
         int enable_adaptive_stickiness; /* 1 = adjust stickiness based on outliers */
 
