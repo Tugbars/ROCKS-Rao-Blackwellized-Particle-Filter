@@ -35,7 +35,7 @@
  *═══════════════════════════════════════════════════════════════════════════*/
 
 #ifndef RBPF_ENABLE_STUDENT_T
-#define RBPF_ENABLE_STUDENT_T 1
+#define RBPF_ENABLE_STUDENT_T 0
 #endif
 
 #if RBPF_ENABLE_STUDENT_T
@@ -2103,6 +2103,12 @@ void rbpf_ksc_resample_student_t(RBPF_KSC *rbpf, const int *indices)
 {
     (void)rbpf;
     (void)indices;
+}
+
+rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
+{
+    /* Fall back to Gaussian update when Student-t is disabled */
+    return rbpf_ksc_update(rbpf, y);
 }
 
 #endif /* !RBPF_ENABLE_STUDENT_T */

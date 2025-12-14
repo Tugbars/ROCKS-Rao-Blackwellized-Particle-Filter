@@ -7,6 +7,11 @@
  */
 
 #include "rbpf_ksc.h"
+
+/* Only compile this file when Student-t is enabled.
+ * When disabled, stubs in rbpf_ksc.c provide no-op implementations. */
+#if RBPF_ENABLE_STUDENT_T
+
 #include <string.h>
 #include <stdio.h>
 
@@ -289,33 +294,21 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
     rbpf_real_t *log_lambda = rbpf->log_lambda;
     const int *regime = rbpf->regime;
 
-    /* DIAGNOSTIC: Check predict outputs */
-    static int diag_count = 0;
-    if (diag_count < 3)
-    {
-        fprintf(stderr, "[Student-t DIAG %d] y=%.3f, mu_pred[0]=%.3f, var_pred[0]=%.6f, regime[0]=%d\n",
-                diag_count, (double)y, (double)mu_pred[0], (double)var_pred[0], regime[0]);
-        diag_count++;
-    }
-
     /* DEFENSIVE: Check if predict was called and produced valid results */
     if (mu_pred == NULL || var_pred == NULL)
     {
-        fprintf(stderr, "Student-t: mu_pred or var_pred is NULL, falling back to Gaussian\n");
         return rbpf_ksc_update(rbpf, y);
     }
 
     /* DEFENSIVE: Check first particle for NaN (indicates upstream problem) */
     if (mu_pred[0] != mu_pred[0] || var_pred[0] != var_pred[0])
-    { /* NaN check */
-        fprintf(stderr, "Student-t: NaN in mu_pred/var_pred, falling back to Gaussian\n");
+    {
         return rbpf_ksc_update(rbpf, y);
     }
 
     /* DEFENSIVE: Check observation */
     if (y != y)
-    { /* NaN check */
-        fprintf(stderr, "Student-t: NaN observation, falling back to Gaussian\n");
+    {
         return rbpf_ksc_update(rbpf, y);
     }
 
@@ -403,15 +396,6 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
 
         lambda[i] = lam;
         log_lambda[i] = rbpf_log(lam);
-
-        /* DIAGNOSTIC: Check lambda values for first few ticks */
-        static int lam_diag = 0;
-        if (lam_diag < 3 && i == 0)
-        {
-            fprintf(stderr, "[Student-t DIAG] Particle 0: nu=%.1f, innov=%.3f, v2_eff=%.3f, alpha=%.2f, beta=%.2f, lambda=%.4f\n",
-                    (double)nu, (double)innov, (double)v2_eff, (double)alpha_post, (double)beta_post, (double)lam);
-            lam_diag++;
-        }
 
         /* Accumulate for ν learning */
         regime_sum_lambda[r] += lam;
@@ -548,15 +532,6 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
             log_lik_total = RBPF_REAL(-700.0);
         }
 
-        /* DIAGNOSTIC: Check GPB1 output for first particle */
-        static int gpb1_diag = 0;
-        if (gpb1_diag < 3 && i == 0)
-        {
-            fprintf(stderr, "[Student-t DIAG] GPB1: mu_p=%.3f -> mu_new=%.3f, var_p=%.6f -> var_new=%.6f, log_lik=%.3f\n",
-                    (double)mu_p, (double)mu_new, (double)var_p, (double)var_new, (double)log_lik_total);
-            gpb1_diag++;
-        }
-
         log_weight[i] += log_lik_total;
 
         if (log_weight[i] > max_log_weight)
@@ -607,26 +582,15 @@ rbpf_real_t rbpf_ksc_update_student_t(RBPF_KSC *rbpf, rbpf_real_t y)
     /* CRITICAL: Final NaN check and recovery
      * If any particle has NaN state, the entire filter output becomes NaN.
      * This catches any edge cases we missed above. */
-    int nan_count = 0;
     for (int i = 0; i < n; i++)
     {
         if (mu[i] != mu[i])
         {                       /* NaN check */
             mu[i] = mu_pred[i]; /* Fallback to predicted state */
-            nan_count++;
         }
         if (var[i] != var[i] || var[i] <= RBPF_REAL(0.0))
         {
             var[i] = var_pred[i] > RBPF_REAL(0.0) ? var_pred[i] : RBPF_REAL(0.1);
-        }
-    }
-    if (nan_count > 0)
-    {
-        static int nan_warn_count = 0;
-        if (nan_warn_count < 5)
-        {
-            fprintf(stderr, "[Student-t WARNING] Recovered %d NaN particles\n", nan_count);
-            nan_warn_count++;
         }
     }
 
@@ -953,3 +917,5 @@ void rbpf_ksc_print_student_t_config(const RBPF_KSC *rbpf)
 
     printf("╚══════════════════════════════════════════════════════════════╝\n");
 }
+
+#endif /* RBPF_ENABLE_STUDENT_T */
