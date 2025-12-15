@@ -282,6 +282,8 @@ extern "C"
         int enable_gated_learning;            /* 1 = weight dynamics updates by regime prob */
         rbpf_real_t gated_learning_threshold; /* Min weight to update (0.0 = soft gate) */
 
+        rbpf_real_t crisis_entry_boost; /* Crisis enters faster when outliers high (default: 3.0) */
+
     } MMPF_Config;
 
     /*═══════════════════════════════════════════════════════════════════════════

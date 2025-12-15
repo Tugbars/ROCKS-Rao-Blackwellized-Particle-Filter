@@ -591,10 +591,10 @@ static void run_mmpf_full(SyntheticData *data, TickRecord *records,
         rec->is_outlier = data->is_outlier[t];
         rec->outlier_sigma = data->outlier_sigma[t];
 
-        /* Estimates */
-        rec->est_log_vol = output.log_vol_mean;
-        rec->est_vol = output.vol_mean;
-        rec->vol_std = output.vol_std;
+        /* Estimates (using header field names) */
+        rec->est_log_vol = output.log_volatility;
+        rec->est_vol = output.volatility;
+        rec->vol_std = output.volatility_std;
 
         /* Hypothesis */
         rec->est_hypothesis = output.dominant;
@@ -603,11 +603,11 @@ static void run_mmpf_full(SyntheticData *data, TickRecord *records,
             rec->hypothesis_weights[h] = output.weights[h];
         }
 
-        /* Health */
-        rec->ess = output.dominant_ess;
+        /* Health (using header field names) */
+        rec->ess = output.model_ess[output.dominant];
         for (int h = 0; h < 3; h++)
         {
-            rec->ess_per_hypo[h] = output.ess[h];
+            rec->ess_per_hypo[h] = output.model_ess[h];
         }
 
         /* Minimum weight (Dirichlet prior check) */

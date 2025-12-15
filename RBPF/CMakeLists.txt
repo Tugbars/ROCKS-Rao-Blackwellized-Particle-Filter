@@ -48,8 +48,9 @@ if(RBPF_ENABLE_STORVIK)
         # Hawkes intensity
         hawkes/hawkes_intensity.c
         
-        # MMPF (Multi-Model Particle Filter)
-        mmpf/mmpf_rocks.c
+        # MMPF (Multi-Model Particle Filter) - Split architecture
+        mmpf/mmpf_core.c
+        mmpf/mmpf_api.c
     )
 endif()
 
@@ -175,6 +176,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_mmpf_correctness PRIVATE ${COMMON_DEFS})
     endif()
 
+    # MMPF vs Single RBPF comparison test
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_comparison.c)
+        add_executable(test_mmpf_comparison
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_comparison.c
+        )
+        target_link_libraries(test_mmpf_comparison PRIVATE rocks)
+        target_compile_options(test_mmpf_comparison PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_mmpf_comparison PRIVATE ${COMMON_DEFS})
+    endif()
+
     # MMPF real data integration test
     if(RBPF_ENABLE_STORVIK)
         add_executable(test_mmpf_real_data
@@ -269,6 +280,7 @@ if(RBPF_ENABLE_STORVIK)
         pmmh/pmmh_mkl.h
         duration_tracker/duration_tracker_fast.h
         mmpf/mmpf_rocks.h
+        mmpf/mmpf_internal.h
     )
 endif()
 
