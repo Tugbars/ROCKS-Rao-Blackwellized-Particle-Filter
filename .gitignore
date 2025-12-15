@@ -35,3 +35,14 @@ test/mmpf_real_data_test/plots/output_spy_5year_latency.png
 test/mmpf_real_data_test/plots/output_spy_5year_Fed_hike_2022.png
 test/mmpf_real_data_test/plots/output_spy_5year_Aug_2024_selloff.png
 test/mmpf_real_data_test/output_spy_5year.csv
+RBPF/mmpf/csv/tracking_error.png
+RBPF/mmpf/csv/crisis_zoom.png
+RBPF/mmpf/csv/dirichlet_check.png
+RBPF/mmpf/csv/ess_comparison.png
+RBPF/mmpf/csv/flash_crash_zoom.png
+RBPF/mmpf/csv/log_vol_comparison.png
+RBPF/mmpf/csv/mmpf_comparison_analysis.ipynb
+RBPF/mmpf/csv/mmpf_weights.png
+RBPF/mmpf/csv/regime_detection.png
+RBPF/mmpf/csv/rmse_by_scenario.png
+RBPF/mmpf/csv/.ipynb_checkpoints/mmpf_comparison_analysis-checkpoint.ipynb
