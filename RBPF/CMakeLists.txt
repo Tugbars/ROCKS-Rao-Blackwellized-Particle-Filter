@@ -92,6 +92,19 @@ endif()
 add_library(rbpf_ksc ALIAS rocks)
 
 #───────────────────────────────────────────────────────────────────────────────
+# BOCPD Library (sibling directory)
+#───────────────────────────────────────────────────────────────────────────────
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c)
+    add_library(bocpd STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c
+    )
+    target_include_directories(bocpd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD)
+    target_compile_options(bocpd PRIVATE ${COMMON_FLAGS})
+    target_compile_definitions(bocpd PRIVATE ${COMMON_DEFS})
+endif()
+
+#───────────────────────────────────────────────────────────────────────────────
 # Test Executables
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -194,6 +207,17 @@ if(RBPF_BUILD_TESTS)
         target_link_libraries(test_mmpf_real_data PRIVATE rocks)
         target_compile_options(test_mmpf_real_data PRIVATE ${COMMON_FLAGS})
         target_compile_definitions(test_mmpf_real_data PRIVATE ${COMMON_DEFS})
+    endif()
+
+    # BOCPD standalone test
+    if(TARGET bocpd AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c)
+        add_executable(test_bocpd
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c
+        )
+        target_link_libraries(test_bocpd PRIVATE bocpd m)
+        target_include_directories(test_bocpd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD)
+        target_compile_options(test_bocpd PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_bocpd PRIVATE ${COMMON_DEFS})
     endif()
 
     # Example usage

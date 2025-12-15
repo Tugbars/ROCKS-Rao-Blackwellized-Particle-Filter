@@ -18,53 +18,61 @@
  * INTERLEAVED BLOCK ACCESSORS
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static inline double iblk_get(const double *buf, size_t idx, size_t field_offset) {
+static inline double iblk_get(const double *buf, size_t idx, size_t field_offset)
+{
     size_t block = idx / 4;
     size_t lane = idx & 3;
     return buf[block * BOCPD_IBLK_DOUBLES + field_offset / 8 + lane];
 }
 
-static inline void iblk_set(double *buf, size_t idx, size_t field_offset, double val) {
+static inline void iblk_set(double *buf, size_t idx, size_t field_offset, double val)
+{
     size_t block = idx / 4;
     size_t lane = idx & 3;
     buf[block * BOCPD_IBLK_DOUBLES + field_offset / 8 + lane] = val;
 }
 
-#define IBLK_GET_MU(buf, i)      iblk_get(buf, i, BOCPD_IBLK_MU)
-#define IBLK_GET_C1(buf, i)      iblk_get(buf, i, BOCPD_IBLK_C1)
-#define IBLK_GET_C2(buf, i)      iblk_get(buf, i, BOCPD_IBLK_C2)
+#define IBLK_GET_MU(buf, i) iblk_get(buf, i, BOCPD_IBLK_MU)
+#define IBLK_GET_C1(buf, i) iblk_get(buf, i, BOCPD_IBLK_C1)
+#define IBLK_GET_C2(buf, i) iblk_get(buf, i, BOCPD_IBLK_C2)
 #define IBLK_GET_INV_SSN(buf, i) iblk_get(buf, i, BOCPD_IBLK_INV_SSN)
-#define IBLK_GET_KAPPA(buf, i)   iblk_get(buf, i, BOCPD_IBLK_KAPPA)
-#define IBLK_GET_ALPHA(buf, i)   iblk_get(buf, i, BOCPD_IBLK_ALPHA)
-#define IBLK_GET_BETA(buf, i)    iblk_get(buf, i, BOCPD_IBLK_BETA)
-#define IBLK_GET_SS_N(buf, i)    iblk_get(buf, i, BOCPD_IBLK_SS_N)
+#define IBLK_GET_KAPPA(buf, i) iblk_get(buf, i, BOCPD_IBLK_KAPPA)
+#define IBLK_GET_ALPHA(buf, i) iblk_get(buf, i, BOCPD_IBLK_ALPHA)
+#define IBLK_GET_BETA(buf, i) iblk_get(buf, i, BOCPD_IBLK_BETA)
+#define IBLK_GET_SS_N(buf, i) iblk_get(buf, i, BOCPD_IBLK_SS_N)
 
-#define IBLK_SET_MU(buf, i, v)      iblk_set(buf, i, BOCPD_IBLK_MU, v)
-#define IBLK_SET_C1(buf, i, v)      iblk_set(buf, i, BOCPD_IBLK_C1, v)
-#define IBLK_SET_C2(buf, i, v)      iblk_set(buf, i, BOCPD_IBLK_C2, v)
+#define IBLK_SET_MU(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_MU, v)
+#define IBLK_SET_C1(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_C1, v)
+#define IBLK_SET_C2(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_C2, v)
 #define IBLK_SET_INV_SSN(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_INV_SSN, v)
-#define IBLK_SET_KAPPA(buf, i, v)   iblk_set(buf, i, BOCPD_IBLK_KAPPA, v)
-#define IBLK_SET_ALPHA(buf, i, v)   iblk_set(buf, i, BOCPD_IBLK_ALPHA, v)
-#define IBLK_SET_BETA(buf, i, v)    iblk_set(buf, i, BOCPD_IBLK_BETA, v)
-#define IBLK_SET_SS_N(buf, i, v)    iblk_set(buf, i, BOCPD_IBLK_SS_N, v)
+#define IBLK_SET_KAPPA(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_KAPPA, v)
+#define IBLK_SET_ALPHA(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_ALPHA, v)
+#define IBLK_SET_BETA(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_BETA, v)
+#define IBLK_SET_SS_N(buf, i, v) iblk_set(buf, i, BOCPD_IBLK_SS_N, v)
 
 /*═══════════════════════════════════════════════════════════════════════════
  * FAST MATH
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static inline double fast_log(double x) {
-    union { double d; uint64_t u; } u = {.d = x};
+static inline double fast_log(double x)
+{
+    union
+    {
+        double d;
+        uint64_t u;
+    } u = {.d = x};
     int64_t e = (int64_t)((u.u >> 52) & 0x7FF) - 1023;
     u.u = (u.u & 0x000FFFFFFFFFFFFFULL) | 0x3FF0000000000000ULL;
     double m = u.d;
     double t = (m - 1.0) / (m + 1.0);
     double t2 = t * t;
-    double poly = 1.0 + t2 * (0.3333333333333333 + t2 * (0.2 + 
-                       t2 * (0.1428571428571429 + t2 * 0.1111111111111111)));
+    double poly = 1.0 + t2 * (0.3333333333333333 + t2 * (0.2 +
+                                                         t2 * (0.1428571428571429 + t2 * 0.1111111111111111)));
     return (double)e * 0.6931471805599453 + 2.0 * t * poly;
 }
 
-static inline __m256d fast_log_avx2(__m256d x) {
+static inline __m256d fast_log_avx2(__m256d x)
+{
     const __m256d one = _mm256_set1_pd(1.0);
     const __m256d two = _mm256_set1_pd(2.0);
     const __m256d ln2 = _mm256_set1_pd(0.6931471805599453);
@@ -97,7 +105,8 @@ static inline __m256d fast_log_avx2(__m256d x) {
     return _mm256_fmadd_pd(e, ln2, _mm256_mul_pd(two, _mm256_mul_pd(t, poly)));
 }
 
-static inline double fast_lgamma_stirling(double x) {
+static inline double fast_lgamma_stirling(double x)
+{
     const double half_ln2pi = 0.9189385332046727;
     const double s1 = 0.0833333333333333333;
     const double s2 = -0.00277777777777777778;
@@ -118,7 +127,8 @@ static inline double fast_lgamma_stirling(double x) {
     return base + correction * inv_x;
 }
 
-static inline double fast_lgamma_lanczos(double x) {
+static inline double fast_lgamma_lanczos(double x)
+{
     const double half_ln2pi = 0.9189385332046727;
     const double g = 4.7421875;
     const double c0 = 1.000000000190015;
@@ -127,16 +137,18 @@ static inline double fast_lgamma_lanczos(double x) {
     const double c3 = 24.01409824083091;
     const double c4 = -1.231739572450155;
     const double c5 = 0.001208650973866179;
-    double Ag = c0 + c1/x + c2/(x+1) + c3/(x+2) + c4/(x+3) + c5/(x+4);
+    double Ag = c0 + c1 / x + c2 / (x + 1) + c3 / (x + 2) + c4 / (x + 3) + c5 / (x + 4);
     double t = x + g - 0.5;
     return half_ln2pi + (x - 0.5) * fast_log(t) - t + fast_log(Ag);
 }
 
-static inline double fast_lgamma(double x) {
+static inline double fast_lgamma(double x)
+{
     return (x > 40.0) ? fast_lgamma_stirling(x) : fast_lgamma_lanczos(x);
 }
 
-static inline __m256d lgamma_stirling_avx2(__m256d x) {
+static inline __m256d lgamma_stirling_avx2(__m256d x)
+{
     const __m256d half = _mm256_set1_pd(0.5);
     const __m256d one = _mm256_set1_pd(1.0);
     const __m256d half_ln2pi = _mm256_set1_pd(0.9189385332046727);
@@ -162,7 +174,8 @@ static inline __m256d lgamma_stirling_avx2(__m256d x) {
     return _mm256_add_pd(base, correction);
 }
 
-static inline __m256d lgamma_lanczos_avx2(__m256d x) {
+static inline __m256d lgamma_lanczos_avx2(__m256d x)
+{
     const __m256d half = _mm256_set1_pd(0.5);
     const __m256d one = _mm256_set1_pd(1.0);
     const __m256d half_ln2pi = _mm256_set1_pd(0.9189385332046727);
@@ -197,14 +210,17 @@ static inline __m256d lgamma_lanczos_avx2(__m256d x) {
     return _mm256_add_pd(result, ln_Ag);
 }
 
-static inline __m256d fast_lgamma_avx2(__m256d x) {
+static inline __m256d fast_lgamma_avx2(__m256d x)
+{
     const __m256d forty = _mm256_set1_pd(40.0);
     __m256d mask_large = _mm256_cmp_pd(x, forty, _CMP_GT_OQ);
     int mask_bits = _mm256_movemask_pd(mask_large);
-    
-    if (mask_bits == 0) return lgamma_lanczos_avx2(x);
-    if (mask_bits == 0xF) return lgamma_stirling_avx2(x);
-    
+
+    if (mask_bits == 0)
+        return lgamma_lanczos_avx2(x);
+    if (mask_bits == 0xF)
+        return lgamma_stirling_avx2(x);
+
     __m256d result_small = lgamma_lanczos_avx2(x);
     __m256d result_large = lgamma_stirling_avx2(x);
     return _mm256_blendv_pd(result_small, result_large, mask_large);
@@ -215,7 +231,8 @@ static inline __m256d fast_lgamma_avx2(__m256d x) {
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static inline void store_shifted_field(double *buf, size_t block_idx,
-                                       size_t field_offset, __m256d vals) {
+                                       size_t field_offset, __m256d vals)
+{
     __m256d rotated = _mm256_permute4x64_pd(vals, 0x93);
     double *block_k = buf + block_idx * BOCPD_IBLK_DOUBLES + field_offset / 8;
     double *block_k1 = buf + (block_idx + 1) * BOCPD_IBLK_DOUBLES + field_offset / 8;
@@ -231,57 +248,68 @@ static inline void store_shifted_field(double *buf, size_t block_idx,
  * HAZARD FUNCTIONS
  *═══════════════════════════════════════════════════════════════════════════*/
 
-int bocpd_hazard_init_constant(bocpd_hazard_t *h, double lambda, size_t max_run) {
-    if (!h || lambda <= 0.0 || max_run < 16) return -1;
-    
+int bocpd_hazard_init_constant(bocpd_hazard_t *h, double lambda, size_t max_run)
+{
+    if (!h || lambda <= 0.0 || max_run < 16)
+        return -1;
+
     memset(h, 0, sizeof(*h));
     h->type = HAZARD_CONSTANT;
     h->max_run_length = max_run;
     h->params.constant.lambda = lambda;
-    
+
     h->h = (double *)malloc(max_run * sizeof(double));
     h->one_minus_h = (double *)malloc(max_run * sizeof(double));
-    if (!h->h || !h->one_minus_h) {
+    if (!h->h || !h->one_minus_h)
+    {
         bocpd_hazard_free(h);
         return -1;
     }
-    
+
     double hval = 1.0 / lambda;
     double omh = 1.0 - hval;
-    for (size_t i = 0; i < max_run; i++) {
+    for (size_t i = 0; i < max_run; i++)
+    {
         h->h[i] = hval;
         h->one_minus_h[i] = omh;
     }
     return 0;
 }
 
-int bocpd_hazard_init_power_law(bocpd_hazard_t *h, double alpha, size_t max_run) {
-    if (!h || alpha <= 0.0 || max_run < 16) return -1;
-    
+int bocpd_hazard_init_power_law(bocpd_hazard_t *h, double alpha, size_t max_run)
+{
+    if (!h || alpha <= 0.0 || max_run < 16)
+        return -1;
+
     memset(h, 0, sizeof(*h));
     h->type = HAZARD_POWER_LAW;
     h->max_run_length = max_run;
     h->params.power_law.alpha = alpha;
-    
+
     h->h = (double *)malloc(max_run * sizeof(double));
     h->one_minus_h = (double *)malloc(max_run * sizeof(double));
-    if (!h->h || !h->one_minus_h) {
+    if (!h->h || !h->one_minus_h)
+    {
         bocpd_hazard_free(h);
         return -1;
     }
-    
-    for (size_t r = 0; r < max_run; r++) {
+
+    for (size_t r = 0; r < max_run; r++)
+    {
         double hval = alpha / (double)(r + 1);
-        if (hval > 1.0) hval = 1.0;
+        if (hval > 1.0)
+            hval = 1.0;
         h->h[r] = hval;
         h->one_minus_h[r] = 1.0 - hval;
     }
     return 0;
 }
 
-int bocpd_hazard_init_learned(bocpd_hazard_t *h, double a, double b, size_t max_run) {
-    if (!h || a <= 0.0 || b <= 0.0 || max_run < 16) return -1;
-    
+int bocpd_hazard_init_learned(bocpd_hazard_t *h, double a, double b, size_t max_run)
+{
+    if (!h || a <= 0.0 || b <= 0.0 || max_run < 16)
+        return -1;
+
     memset(h, 0, sizeof(*h));
     h->type = HAZARD_LEARNED;
     h->max_run_length = max_run;
@@ -289,50 +317,59 @@ int bocpd_hazard_init_learned(bocpd_hazard_t *h, double a, double b, size_t max_
     h->params.learned.b = b;
     h->params.learned.n_obs = 0;
     h->params.learned.n_cp = 0;
-    
+
     h->h = (double *)malloc(max_run * sizeof(double));
     h->one_minus_h = (double *)malloc(max_run * sizeof(double));
-    if (!h->h || !h->one_minus_h) {
+    if (!h->h || !h->one_minus_h)
+    {
         bocpd_hazard_free(h);
         return -1;
     }
-    
+
     double hval = a / (a + b);
     double omh = 1.0 - hval;
-    for (size_t i = 0; i < max_run; i++) {
+    for (size_t i = 0; i < max_run; i++)
+    {
         h->h[i] = hval;
         h->one_minus_h[i] = omh;
     }
     return 0;
 }
 
-void bocpd_hazard_learn_update(bocpd_hazard_t *h, int is_changepoint, size_t decay_window) {
-    if (!h || h->type != HAZARD_LEARNED) return;
-    
+void bocpd_hazard_learn_update(bocpd_hazard_t *h, int is_changepoint, size_t decay_window)
+{
+    if (!h || h->type != HAZARD_LEARNED)
+        return;
+
     h->params.learned.n_obs++;
-    if (is_changepoint) h->params.learned.n_cp++;
-    
+    if (is_changepoint)
+        h->params.learned.n_cp++;
+
     /* Apply decay if needed */
-    if (decay_window > 0 && h->params.learned.n_obs > decay_window) {
+    if (decay_window > 0 && h->params.learned.n_obs > decay_window)
+    {
         double ratio = (double)decay_window / h->params.learned.n_obs;
         h->params.learned.n_obs = decay_window;
         h->params.learned.n_cp = (size_t)(h->params.learned.n_cp * ratio);
     }
-    
+
     /* Update hazard tables */
     double a = h->params.learned.a + h->params.learned.n_cp;
     double b = h->params.learned.b + h->params.learned.n_obs - h->params.learned.n_cp;
     double hval = a / (a + b);
     double omh = 1.0 - hval;
-    
-    for (size_t i = 0; i < h->max_run_length; i++) {
+
+    for (size_t i = 0; i < h->max_run_length; i++)
+    {
         h->h[i] = hval;
         h->one_minus_h[i] = omh;
     }
 }
 
-void bocpd_hazard_free(bocpd_hazard_t *h) {
-    if (!h) return;
+void bocpd_hazard_free(bocpd_hazard_t *h)
+{
+    if (!h)
+        return;
     free(h->h);
     free(h->one_minus_h);
     memset(h, 0, sizeof(*h));
@@ -342,8 +379,10 @@ void bocpd_hazard_free(bocpd_hazard_t *h) {
  * DELTA DETECTOR
  *═══════════════════════════════════════════════════════════════════════════*/
 
-void bocpd_delta_init(bocpd_delta_detector_t *d, size_t warmup) {
-    if (!d) return;
+void bocpd_delta_init(bocpd_delta_detector_t *d, size_t warmup)
+{
+    if (!d)
+        return;
     memset(d, 0, sizeof(*d));
     d->kappa = 1.0;
     d->mu = 0.0;
@@ -354,21 +393,24 @@ void bocpd_delta_init(bocpd_delta_detector_t *d, size_t warmup) {
     d->warmup_period = warmup;
 }
 
-double bocpd_delta_update(bocpd_delta_detector_t *d, const double *r, 
-                          size_t active_len, double decay) {
-    if (!d || !r) return 0.0;
-    
+double bocpd_delta_update(bocpd_delta_detector_t *d, const double *r,
+                          size_t active_len, double decay)
+{
+    if (!d || !r)
+        return 0.0;
+
     /* Compute short-run mass P(r < BOCPD_SHORT_RUN_WINDOW) */
     double short_mass = 0.0;
     size_t limit = (active_len < BOCPD_SHORT_RUN_WINDOW) ? active_len : BOCPD_SHORT_RUN_WINDOW;
-    for (size_t i = 0; i < limit; i++) {
+    for (size_t i = 0; i < limit; i++)
+    {
         short_mass += r[i];
     }
-    
+
     double delta = short_mass - d->prev_short_mass;
     d->prev_short_mass = short_mass;
     d->n_observations++;
-    
+
     /* Storvik update for delta distribution */
     double kappa_new = d->kappa * decay + 1.0;
     double mu_new = (d->kappa * decay * d->mu + delta) / kappa_new;
@@ -376,30 +418,35 @@ double bocpd_delta_update(bocpd_delta_detector_t *d, const double *r,
     double delta_diff = delta - d->mu;
     double mu_diff = delta - mu_new;
     double beta_new = d->beta * decay + 0.5 * delta_diff * mu_diff;
-    
+
     d->kappa = kappa_new;
     d->mu = mu_new;
     d->alpha = alpha_new;
     d->beta = beta_new;
-    
+
     return delta;
 }
 
-int bocpd_delta_check(const bocpd_delta_detector_t *d, double z_threshold) {
-    if (!d || d->n_observations < d->warmup_period) return 0;
-    
-    double delta = d->prev_short_mass;  /* Most recent delta is stored here indirectly */
+int bocpd_delta_check(const bocpd_delta_detector_t *d, double z_threshold)
+{
+    if (!d || d->n_observations < d->warmup_period)
+        return 0;
+
+    double delta = d->prev_short_mass; /* Most recent delta is stored here indirectly */
     double z = bocpd_delta_zscore(d, delta);
     return (z > z_threshold) ? 1 : 0;
 }
 
-double bocpd_delta_zscore(const bocpd_delta_detector_t *d, double delta) {
-    if (!d || d->alpha < 1.0) return 0.0;
-    
+double bocpd_delta_zscore(const bocpd_delta_detector_t *d, double delta)
+{
+    if (!d || d->alpha < 1.0)
+        return 0.0;
+
     double sigma_sq = d->beta / d->alpha;
-    if (sigma_sq < 1e-10) sigma_sq = 1e-10;
+    if (sigma_sq < 1e-10)
+        sigma_sq = 1e-10;
     double sigma = sqrt(sigma_sq);
-    
+
     return (delta - d->mu) / sigma;
 }
 
@@ -407,7 +454,8 @@ double bocpd_delta_zscore(const bocpd_delta_detector_t *d, double delta) {
  * POSTERIOR UPDATE
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static inline void init_slot_zero(bocpd_t *b) {
+static inline void init_slot_zero(bocpd_t *b)
+{
     double *next = BOCPD_NEXT_BUF(b);
     const double kappa0 = b->prior.kappa0;
     const double mu0 = b->prior.mu0;
@@ -431,9 +479,11 @@ static inline void init_slot_zero(bocpd_t *b) {
     IBLK_SET_INV_SSN(next, 0, 1.0 / (sigma_sq * nu));
 }
 
-static void update_posteriors(bocpd_t *b, double x, size_t n_old) {
+static void update_posteriors(bocpd_t *b, double x, size_t n_old)
+{
     init_slot_zero(b);
-    if (n_old == 0) {
+    if (n_old == 0)
+    {
         b->cur_buf = 1 - b->cur_buf;
         return;
     }
@@ -448,7 +498,8 @@ static void update_posteriors(bocpd_t *b, double x, size_t n_old) {
     const __m256d pi = _mm256_set1_pd(M_PI);
 
     size_t i = 0;
-    for (; i + 4 <= n_old; i += 4) {
+    for (; i + 4 <= n_old; i += 4)
+    {
         size_t block = i / 4;
         const double *src = cur + block * BOCPD_IBLK_DOUBLES;
 
@@ -498,7 +549,8 @@ static void update_posteriors(bocpd_t *b, double x, size_t n_old) {
     }
 
     /* Scalar tail */
-    for (; i < n_old; i++) {
+    for (; i < n_old; i++)
+    {
         double ss_n_old = IBLK_GET_SS_N(cur, i);
         double kappa_old = IBLK_GET_KAPPA(cur, i);
         double mu_old = IBLK_GET_MU(cur, i);
@@ -538,15 +590,17 @@ static void update_posteriors(bocpd_t *b, double x, size_t n_old) {
  * PREDICTION STEP
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static void prediction_step(bocpd_t *b, double x) {
+static void prediction_step(bocpd_t *b, double x)
+{
     const size_t n = b->active_len;
-    if (n == 0) return;
+    if (n == 0)
+        return;
 
     const double thresh = b->trunc_thresh;
     double *params = BOCPD_CUR_BUF(b);
     double *r = b->r;
     double *r_new = b->r_scratch;
-    
+
     /* Get hazard values (constant or from table) */
     const int use_table = (b->hazard_table != NULL);
     const double h_const = b->hazard;
@@ -554,7 +608,8 @@ static void prediction_step(bocpd_t *b, double x) {
 
     const size_t n_padded = (n + 7) & ~7ULL;
 
-    for (size_t i = n; i < n_padded + 8; i++) r[i] = 0.0;
+    for (size_t i = n; i < n_padded + 8; i++)
+        r[i] = 0.0;
     memset(r_new, 0, (n_padded + 16) * sizeof(double));
 
     const __m256d x_vec = _mm256_set1_pd(x);
@@ -588,7 +643,8 @@ static void prediction_step(bocpd_t *b, double x) {
     const __m256i idx_inc = _mm256_set1_epi64x(4);
     size_t last_valid = 0;
 
-    for (size_t i = 0; i < n_padded; i += 4) {
+    for (size_t i = 0; i < n_padded; i += 4)
+    {
         size_t block = i / 4;
         const double *blk = params + block * BOCPD_IBLK_DOUBLES;
 
@@ -600,10 +656,13 @@ static void prediction_step(bocpd_t *b, double x) {
 
         /* Load hazard (constant or from table) */
         __m256d h_vec, omh_vec;
-        if (use_table) {
+        if (use_table)
+        {
             h_vec = _mm256_loadu_pd(&b->hazard_table->h[i]);
             omh_vec = _mm256_loadu_pd(&b->hazard_table->one_minus_h[i]);
-        } else {
+        }
+        else
+        {
             h_vec = _mm256_set1_pd(h_const);
             omh_vec = _mm256_set1_pd(omh_const);
         }
@@ -665,11 +724,16 @@ static void prediction_step(bocpd_t *b, double x) {
         /* Truncation tracking */
         __m256d thresh_cmp = _mm256_cmp_pd(growth, thresh_vec, _CMP_GT_OQ);
         int mask = _mm256_movemask_pd(thresh_cmp);
-        if (mask) {
-            if (mask & 8) last_valid = i + 4;
-            else if (mask & 4) last_valid = i + 3;
-            else if (mask & 2) last_valid = i + 2;
-            else if (mask & 1) last_valid = i + 1;
+        if (mask)
+        {
+            if (mask & 8)
+                last_valid = i + 4;
+            else if (mask & 4)
+                last_valid = i + 3;
+            else if (mask & 2)
+                last_valid = i + 2;
+            else if (mask & 1)
+                last_valid = i + 1;
         }
 
         idx_vec = _mm256_add_epi64(idx_vec, idx_inc);
@@ -683,7 +747,8 @@ static void prediction_step(bocpd_t *b, double x) {
     double r0 = _mm_cvtsd_f64(lo);
 
     r_new[0] = r0;
-    if (r0 > thresh && last_valid == 0) last_valid = 1;
+    if (r0 > thresh && last_valid == 0)
+        last_valid = 1;
 
     /* Find global max for MAP */
     double max_arr[4];
@@ -693,8 +758,10 @@ static void prediction_step(bocpd_t *b, double x) {
 
     double map_val = r0;
     size_t map_idx = 0;
-    for (int j = 0; j < 4; j++) {
-        if (max_arr[j] > map_val) {
+    for (int j = 0; j < 4; j++)
+    {
+        if (max_arr[j] > map_val)
+        {
             map_val = max_arr[j];
             map_idx = idx_arr[j];
         }
@@ -702,7 +769,8 @@ static void prediction_step(bocpd_t *b, double x) {
 
     /* Normalize */
     size_t new_len = (last_valid > 0) ? last_valid + 1 : n + 1;
-    if (new_len > b->capacity) new_len = b->capacity;
+    if (new_len > b->capacity)
+        new_len = b->capacity;
 
     size_t new_len_padded = (new_len + 3) & ~3ULL;
 
@@ -716,9 +784,11 @@ static void prediction_step(bocpd_t *b, double x) {
     lo = _mm_add_pd(lo, _mm_shuffle_pd(lo, lo, 1));
     double r_sum = _mm_cvtsd_f64(lo);
 
-    if (r_sum > 1e-300) {
+    if (r_sum > 1e-300)
+    {
         __m256d inv_sum = _mm256_set1_pd(1.0 / r_sum);
-        for (size_t j = 0; j < new_len_padded; j += 4) {
+        for (size_t j = 0; j < new_len_padded; j += 4)
+        {
             __m256d rv = _mm256_loadu_pd(&r_new[j]);
             _mm256_storeu_pd(&r[j], _mm256_mul_pd(rv, inv_sum));
         }
@@ -732,14 +802,17 @@ static void prediction_step(bocpd_t *b, double x) {
  * PUBLIC API
  *═══════════════════════════════════════════════════════════════════════════*/
 
-int bocpd_init(bocpd_t *b, double hazard_lambda, bocpd_prior_t prior, 
-               size_t max_run_length) {
-    if (!b || hazard_lambda <= 0.0 || max_run_length < 16) return -1;
+int bocpd_init(bocpd_t *b, double hazard_lambda, bocpd_prior_t prior,
+               size_t max_run_length)
+{
+    if (!b || hazard_lambda <= 0.0 || max_run_length < 16)
+        return -1;
 
     memset(b, 0, sizeof(*b));
 
     size_t cap = 32;
-    while (cap < max_run_length) cap <<= 1;
+    while (cap < max_run_length)
+        cap <<= 1;
 
     b->capacity = cap;
     b->hazard = 1.0 / hazard_lambda;
@@ -761,16 +834,21 @@ int bocpd_init(bocpd_t *b, double hazard_lambda, bocpd_prior_t prior,
     void *mega = _aligned_malloc(total, 64);
 #else
     void *mega = NULL;
-    if (posix_memalign(&mega, 64, total) != 0) mega = NULL;
+    if (posix_memalign(&mega, 64, total) != 0)
+        mega = NULL;
 #endif
 
-    if (!mega) return -1;
+    if (!mega)
+        return -1;
     memset(mega, 0, total);
 
     uint8_t *ptr = (uint8_t *)mega;
-    b->interleaved[0] = (double *)ptr; ptr += bytes_interleaved;
-    b->interleaved[1] = (double *)ptr; ptr += bytes_interleaved;
-    b->r = (double *)ptr; ptr += bytes_r;
+    b->interleaved[0] = (double *)ptr;
+    ptr += bytes_interleaved;
+    b->interleaved[1] = (double *)ptr;
+    ptr += bytes_interleaved;
+    b->r = (double *)ptr;
+    ptr += bytes_r;
     b->r_scratch = (double *)ptr;
 
     b->mega = mega;
@@ -781,28 +859,36 @@ int bocpd_init(bocpd_t *b, double hazard_lambda, bocpd_prior_t prior,
     return 0;
 }
 
-int bocpd_init_with_hazard(bocpd_t *b, bocpd_hazard_t *hazard, bocpd_prior_t prior) {
-    if (!b || !hazard) return -1;
-    
+int bocpd_init_with_hazard(bocpd_t *b, bocpd_hazard_t *hazard, bocpd_prior_t prior)
+{
+    if (!b || !hazard)
+        return -1;
+
     int ret = bocpd_init(b, 100.0, prior, hazard->max_run_length);
-    if (ret != 0) return ret;
-    
+    if (ret != 0)
+        return ret;
+
     b->hazard_table = hazard;
     return 0;
 }
 
-void bocpd_free(bocpd_t *b) {
-    if (!b) return;
+void bocpd_free(bocpd_t *b)
+{
+    if (!b)
+        return;
 #ifdef _WIN32
-    if (b->mega) _aligned_free(b->mega);
+    if (b->mega)
+        _aligned_free(b->mega);
 #else
     free(b->mega);
 #endif
     memset(b, 0, sizeof(*b));
 }
 
-void bocpd_reset(bocpd_t *b) {
-    if (!b) return;
+void bocpd_reset(bocpd_t *b)
+{
+    if (!b)
+        return;
     memset(b->r, 0, (b->capacity + 32) * sizeof(double));
     memset(b->r_scratch, 0, (b->capacity + 32) * sizeof(double));
     size_t n_blocks = b->capacity / 4 + 2;
@@ -816,10 +902,13 @@ void bocpd_reset(bocpd_t *b) {
     b->p_changepoint = 0.0;
 }
 
-void bocpd_step(bocpd_t *b, double x) {
-    if (!b) return;
+void bocpd_step(bocpd_t *b, double x)
+{
+    if (!b)
+        return;
 
-    if (b->t == 0) {
+    if (b->t == 0)
+    {
         b->r[0] = 1.0;
         double *cur = BOCPD_CUR_BUF(b);
 
@@ -865,14 +954,18 @@ void bocpd_step(bocpd_t *b, double x) {
 
     double p = 0.0;
     size_t lim = (b->active_len < 5) ? b->active_len : 5;
-    for (size_t j = 0; j < lim; j++) p += b->r[j];
+    for (size_t j = 0; j < lim; j++)
+        p += b->r[j];
     b->p_changepoint = p;
 }
 
-double bocpd_short_mass(const bocpd_t *b, size_t window) {
-    if (!b) return 0.0;
+double bocpd_short_mass(const bocpd_t *b, size_t window)
+{
+    if (!b)
+        return 0.0;
     double mass = 0.0;
     size_t lim = (b->active_len < window) ? b->active_len : window;
-    for (size_t i = 0; i < lim; i++) mass += b->r[i];
+    for (size_t i = 0; i < lim; i++)
+        mass += b->r[i];
     return mass;
 }
