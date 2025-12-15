@@ -397,6 +397,84 @@ static void run_bocpd_test(SyntheticData *data, BOCPDConfig *cfg,
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * BETTER APPROACH: r[0] THRESHOLD + REFRACTORY PERIOD
+ *
+ * The delta detector has issues with asymmetric detection. A simpler and
+ * more robust approach is to directly threshold bocpd.r[0] (probability
+ * that a changepoint just occurred) with a refractory period to prevent
+ * multiple detections.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+static void run_bocpd_r0_test(SyntheticData *data, BOCPDConfig *cfg,
+                              double r0_threshold, int refractory_ticks,
+                              int *detections, double *latencies,
+                              DetectionMetrics *metrics)
+{
+    bocpd_t bocpd;
+    bocpd_hazard_t hazard;
+
+    bocpd_prior_t prior = {
+        .mu0 = 0.0,
+        .kappa0 = cfg->prior_kappa0,
+        .alpha0 = cfg->prior_alpha0,
+        .beta0 = cfg->prior_beta0};
+
+    int use_power_law = (cfg->power_law_alpha > 0.0);
+
+    if (use_power_law)
+    {
+        bocpd_hazard_init_power_law(&hazard, cfg->power_law_alpha, MAX_RUN_LENGTH);
+        bocpd_init_with_hazard(&bocpd, &hazard, prior);
+    }
+    else
+    {
+        bocpd_init(&bocpd, cfg->hazard_lambda, prior, MAX_RUN_LENGTH);
+    }
+
+    memset(detections, 0, data->n_ticks * sizeof(int));
+
+    int refractory_counter = 0; /* Counts down after detection */
+    int warmup = 50;            /* Skip first N ticks */
+
+    for (int t = 0; t < data->n_ticks; t++)
+    {
+        double x = data->observations[t];
+
+        double t0 = get_time_us();
+        bocpd_step(&bocpd, x);
+        double t1 = get_time_us();
+
+        latencies[t] = t1 - t0;
+
+        /* Skip warmup period */
+        if (t < warmup)
+            continue;
+
+        /* Decrement refractory counter */
+        if (refractory_counter > 0)
+        {
+            refractory_counter--;
+            continue;
+        }
+
+        /* Check r[0] threshold */
+        if (bocpd.r[0] > r0_threshold)
+        {
+            detections[t] = 1;
+            refractory_counter = refractory_ticks; /* Start refractory period */
+        }
+    }
+
+    bocpd_free(&bocpd);
+    if (use_power_law)
+    {
+        bocpd_hazard_free(&hazard);
+    }
+
+    compute_metrics(metrics, detections, data, latencies);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * ALTERNATIVE: Simple p_changepoint threshold
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -635,6 +713,70 @@ int main(int argc, char **argv)
     print_metrics(cfg6.name, &metrics);
 
     /*═══════════════════════════════════════════════════════════════════════
+     * TEST 7: r[0] threshold with refractory period (RECOMMENDED)
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    BOCPDConfig cfg7 = {
+        .name = "★ r[0] > 0.05 + Refractory=20 (RECOMMENDED)",
+        .hazard_lambda = 100.0,
+        .power_law_alpha = 0.0,
+        .z_threshold = 0.0,
+        .prior_kappa0 = 1.0,
+        .prior_alpha0 = 1.0,
+        .prior_beta0 = 1.0};
+
+    run_bocpd_r0_test(data, &cfg7, 0.05, 20, detections, latencies, &metrics);
+    print_metrics(cfg7.name, &metrics);
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * TEST 8: r[0] with higher threshold
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    BOCPDConfig cfg8 = {
+        .name = "r[0] > 0.10 + Refractory=20 (Conservative)",
+        .hazard_lambda = 100.0,
+        .power_law_alpha = 0.0,
+        .z_threshold = 0.0,
+        .prior_kappa0 = 1.0,
+        .prior_alpha0 = 1.0,
+        .prior_beta0 = 1.0};
+
+    run_bocpd_r0_test(data, &cfg8, 0.10, 20, detections, latencies, &metrics);
+    print_metrics(cfg8.name, &metrics);
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * TEST 9: r[0] with lower threshold + longer refractory
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    BOCPDConfig cfg9 = {
+        .name = "r[0] > 0.03 + Refractory=50 (Sensitive)",
+        .hazard_lambda = 100.0,
+        .power_law_alpha = 0.0,
+        .z_threshold = 0.0,
+        .prior_kappa0 = 1.0,
+        .prior_alpha0 = 1.0,
+        .prior_beta0 = 1.0};
+
+    run_bocpd_r0_test(data, &cfg9, 0.03, 50, detections, latencies, &metrics);
+    print_metrics(cfg9.name, &metrics);
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * TEST 10: r[0] with power-law hazard
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    BOCPDConfig cfg10 = {
+        .name = "★ Power-Law + r[0] > 0.05 + Refractory=20",
+        .hazard_lambda = 0.0,
+        .power_law_alpha = 0.8,
+        .z_threshold = 0.0,
+        .prior_kappa0 = 1.0,
+        .prior_alpha0 = 1.0,
+        .prior_beta0 = 1.0};
+
+    run_bocpd_r0_test(data, &cfg10, 0.05, 20, detections, latencies, &metrics);
+    print_metrics(cfg10.name, &metrics);
+
+    /*═══════════════════════════════════════════════════════════════════════
      * SUMMARY
      *═══════════════════════════════════════════════════════════════════════*/
 
@@ -642,12 +784,13 @@ int main(int argc, char **argv)
     printf("  SUMMARY\n");
     printf("══════════════════════════════════════════════════════════════════\n");
     printf("\nRecommended configuration for MMPF integration:\n");
-    printf("  - Power-law hazard with α=0.8 (heavy-tailed regime durations)\n");
-    printf("  - Delta detector with z_threshold=3.0 (balance precision/recall)\n");
-    printf("  - Weak prior (κ=1, α=1, β=1) for fast adaptation\n");
+    printf("  - Use r[0] threshold (NOT delta detector)\n");
+    printf("  - Threshold: r[0] > 0.05\n");
+    printf("  - Refractory period: 20 ticks (prevent multiple triggers)\n");
+    printf("  - Power-law hazard with α=0.8\n");
     printf("\nExpected behavior with MMPF:\n");
-    printf("  - Normal operation: BOCPD runs, delta stays low, MMPF uses high inertia\n");
-    printf("  - Changepoint detected: delta spikes, mmpf_inject_shock() called\n");
+    printf("  - Normal operation: BOCPD runs, r[0] stays low, MMPF uses high inertia\n");
+    printf("  - Changepoint detected: r[0] spikes, mmpf_inject_shock() called\n");
     printf("  - MMPF re-evaluates hypotheses with uniform transitions\n");
     printf("  - mmpf_restore_from_shock() returns to normal operation\n");
 
@@ -657,8 +800,8 @@ int main(int argc, char **argv)
     {
         fprintf(csv, "tick,observation,true_mean,is_cp,detection\n");
 
-        /* Re-run best config for CSV */
-        run_bocpd_test(data, &cfg2, detections, latencies, &metrics);
+        /* Re-run best config (r[0] threshold) for CSV */
+        run_bocpd_r0_test(data, &cfg10, 0.05, 20, detections, latencies, &metrics);
 
         for (int t = 0; t < data->n_ticks; t++)
         {

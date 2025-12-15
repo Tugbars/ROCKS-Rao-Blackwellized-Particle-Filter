@@ -214,7 +214,10 @@ if(RBPF_BUILD_TESTS)
         add_executable(test_bocpd
             ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c
         )
-        target_link_libraries(test_bocpd PRIVATE bocpd m)
+        target_link_libraries(test_bocpd PRIVATE bocpd)
+        if(NOT WIN32)
+            target_link_libraries(test_bocpd PRIVATE m)
+        endif()
         target_include_directories(test_bocpd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD)
         target_compile_options(test_bocpd PRIVATE ${COMMON_FLAGS})
         target_compile_definitions(test_bocpd PRIVATE ${COMMON_DEFS})
