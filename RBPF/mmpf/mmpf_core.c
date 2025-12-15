@@ -1336,6 +1336,17 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
         mmpf->gated_dynamics[k].sum_w_sigma = 0.0;
         mmpf->gated_dynamics[k].prev_state = (double)log_vol;
     }
+
+    /* Reset shock state */
+    mmpf->shock_active = 0;
+    mmpf->process_noise_multiplier = RBPF_REAL(1.0);
+    for (k = 0; k < MMPF_N_MODELS; k++)
+    {
+        for (i = 0; i < MMPF_N_MODELS; i++)
+        {
+            mmpf->saved_transition[k][i] = RBPF_REAL(0.0);
+        }
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -1444,6 +1455,10 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 
         rbpf_ksc_transition(rbpf);
         rbpf_ksc_predict(rbpf);
+
+        /* NOTE: Process noise boost during shock is handled by mmpf_inject_shock()
+         * in mmpf_api.c, which modifies params[r].q directly before this step
+         * and restores it in mmpf_restore_from_shock() after. */
 
         if (skip_update)
         {
