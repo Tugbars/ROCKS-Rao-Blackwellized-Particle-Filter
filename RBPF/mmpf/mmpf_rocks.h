@@ -171,8 +171,8 @@ extern "C"
         rbpf_real_t crisis_exit_boost; /* Crisis exits faster: 0.92 multiplier */
         rbpf_real_t min_mixing_prob;   /* Minimum transition probability (prevents lock-in): 0.01 */
 
-        rbpf_real_t transition_prior_alpha;  /* Dirichlet pseudo-counts (default: 1.0) */
-        rbpf_real_t transition_prior_mass;   /* Observation mass (default: 20.0) */
+        rbpf_real_t transition_prior_alpha; /* Dirichlet pseudo-counts (default: 1.0) */
+        rbpf_real_t transition_prior_mass;  /* Observation mass (default: 20.0) */
 
         /* OCSN-driven adaptive stickiness */
         int enable_adaptive_stickiness; /* 1 = adjust stickiness based on outliers */
@@ -260,15 +260,15 @@ extern "C"
          * This replaces the old Panic Drift mechanism with a principled approach.
          *═══════════════════════════════════════════════════════════════════════*/
 
-        int enable_student_t;                   /* 1 = use Student-t observations (recommended) */
+        int enable_student_t;                     /* 1 = use Student-t observations (recommended) */
         rbpf_real_t hypothesis_nu[MMPF_N_MODELS]; /* Per-hypothesis ν (degrees of freedom) */
 
         /* Optional: WTA-gated ν learning
          * Only dominant hypothesis learns its ν from data.
          * This gives "structural memory" — Crisis remembers how fat-tailed it is. */
-        int enable_nu_learning;      /* 1 = learn ν via Storvik auxiliary stats */
-        rbpf_real_t nu_floor;        /* Minimum ν (default: 2.5) */
-        rbpf_real_t nu_ceil;         /* Maximum ν (default: 30.0) */
+        int enable_nu_learning;       /* 1 = learn ν via Storvik auxiliary stats */
+        rbpf_real_t nu_floor;         /* Minimum ν (default: 2.5) */
+        rbpf_real_t nu_ceil;          /* Maximum ν (default: 30.0) */
         rbpf_real_t nu_learning_rate; /* EWMA rate for ν learning (default: 0.99) */
 
         /*═══════════════════════════════════════════════════════════════════════
@@ -336,12 +336,12 @@ extern "C"
         int update_skipped; /* 1 if observation was treated as censored */
 
         /* Student-t diagnostics */
-        int student_t_active;                      /* 1 if Student-t was used this tick */
-        rbpf_real_t model_lambda_mean[MMPF_N_MODELS]; /* E[λ] per model (1.0 = Gaussian) */
+        int student_t_active;                          /* 1 if Student-t was used this tick */
+        rbpf_real_t model_lambda_mean[MMPF_N_MODELS];  /* E[λ] per model (1.0 = Gaussian) */
         rbpf_real_t model_nu_effective[MMPF_N_MODELS]; /* Implied ν from λ variance */
-        rbpf_real_t model_nu[MMPF_N_MODELS];          /* Current ν per model (fixed or learned) */
+        rbpf_real_t model_nu[MMPF_N_MODELS];           /* Current ν per model (fixed or learned) */
 
-         /* Storvik-learned parameters (swim lane bounded) */
+        /* Storvik-learned parameters (swim lane bounded) */
         rbpf_real_t learned_mu_vol[MMPF_N_MODELS];    /* Learned μ_vol per hypothesis */
         rbpf_real_t learned_sigma_eta[MMPF_N_MODELS]; /* Learned σ_η per hypothesis */
 
@@ -472,6 +472,7 @@ extern "C"
         /* Shock state */
         int shock_active;                     /* 1 if currently in shock mode */
         rbpf_real_t process_noise_multiplier; /* Applied to sigma_vol during shock */
+         int shock_cooldown;                   /* Refractory ticks remaining (0 = ready) */
 
         /*═══════════════════════════════════════════════════════════════════════
          * GLOBAL BASELINE TRACKING STATE
@@ -888,6 +889,25 @@ extern "C"
      */
     void mmpf_buffer_copy_particle(MMPF_ParticleBuffer *dst, int dst_idx,
                                    const MMPF_ParticleBuffer *src, int src_idx);
+
+                                   int mmpf_is_shock_active(const MMPF_ROCKS *mmpf);
+
+    /**
+     * Get remaining shock cooldown ticks.
+     */
+    int mmpf_get_shock_cooldown(const MMPF_ROCKS *mmpf);
+
+    /**
+     * Set shock cooldown (refractory period).
+     */
+    void mmpf_set_shock_cooldown(MMPF_ROCKS *mmpf, int ticks);
+
+    /**
+     * Convenience: Inject shock with automatic cooldown.
+     * Only injects if cooldown is 0, then sets cooldown.
+     * @return 1 if shock was injected, 0 if blocked by cooldown
+     */
+    int mmpf_try_inject_shock(MMPF_ROCKS *mmpf, int cooldown_ticks);
 
 #ifdef __cplusplus
 }

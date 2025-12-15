@@ -324,6 +324,52 @@ int mmpf_is_shock_active(const MMPF_ROCKS *mmpf)
     return mmpf ? mmpf->shock_active : 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SHOCK COOLDOWN FUNCTIONS
+ * Add these after mmpf_is_shock_active() in mmpf_api.c
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
+int mmpf_get_shock_cooldown(const MMPF_ROCKS *mmpf)
+{
+    return mmpf ? mmpf->shock_cooldown : 0;
+}
+
+void mmpf_set_shock_cooldown(MMPF_ROCKS *mmpf, int ticks)
+{
+    if (mmpf) {
+        mmpf->shock_cooldown = ticks > 0 ? ticks : 0;
+    }
+}
+
+int mmpf_tick_shock_cooldown(MMPF_ROCKS *mmpf)
+{
+    if (!mmpf) return 0;
+    
+    if (mmpf->shock_cooldown > 0) {
+        mmpf->shock_cooldown--;
+        return (mmpf->shock_cooldown == 0) ? 1 : 0;
+    }
+    return 0;
+}
+
+int mmpf_try_inject_shock(MMPF_ROCKS *mmpf, int cooldown_ticks)
+{
+    if (!mmpf) return 0;
+    
+    /* Check cooldown */
+    if (mmpf->shock_cooldown > 0) {
+        return 0;  /* Blocked by cooldown */
+    }
+    
+    /* Inject shock */
+    mmpf_inject_shock(mmpf);
+    
+    /* Set cooldown */
+    mmpf->shock_cooldown = cooldown_ticks > 0 ? cooldown_ticks : 20;
+    
+    return 1;  /* Shock injected */
+}
+
 /*═══════════════════════════════════════════════════════════════════════════
  * DIAGNOSTICS
  *═══════════════════════════════════════════════════════════════════════════*/

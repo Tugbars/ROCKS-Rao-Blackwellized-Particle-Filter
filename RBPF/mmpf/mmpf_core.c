@@ -1170,6 +1170,7 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
     /* Initialize shock state */
     mmpf->shock_active = 0;
     mmpf->process_noise_multiplier = RBPF_REAL(1.0);
+    mmpf->shock_cooldown = 0;
     for (i = 0; i < MMPF_N_MODELS; i++)
     {
         for (j = 0; j < MMPF_N_MODELS; j++)
@@ -1340,6 +1341,7 @@ void mmpf_reset(MMPF_ROCKS *mmpf, rbpf_real_t initial_vol)
     /* Reset shock state */
     mmpf->shock_active = 0;
     mmpf->process_noise_multiplier = RBPF_REAL(1.0);
+    mmpf->shock_cooldown = 0;
     for (k = 0; k < MMPF_N_MODELS; k++)
     {
         for (i = 0; i < MMPF_N_MODELS; i++)
@@ -1358,6 +1360,12 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
     int k, r, i;
     int skip_update = 0;
     rbpf_real_t y_log;
+
+    /* Decrement shock cooldown (refractory period) */
+    if (mmpf->shock_cooldown > 0)
+    {
+        mmpf->shock_cooldown--;
+    }
 
     /* Global baseline update */
     if (mmpf->config.enable_global_baseline)
@@ -1406,8 +1414,15 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
     }
 
-    /* IMM mixing */
-    update_transition_matrix(mmpf);
+    /* IMM mixing
+     * NOTE: Skip transition matrix update if shock is active.
+     * mmpf_inject_shock() sets uniform transitions (33/33/33) to allow
+     * likelihood to dominate. update_transition_matrix() would overwrite
+     * this with the sticky matrix (98% stay), defeating the shock. */
+    if (!mmpf->shock_active)
+    {
+        update_transition_matrix(mmpf);
+    }
     compute_mixing_weights(mmpf);
     compute_mixing_counts(mmpf);
     imm_mixing_step(mmpf);
