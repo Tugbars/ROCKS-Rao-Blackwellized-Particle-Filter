@@ -223,6 +223,23 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_bocpd PRIVATE ${COMMON_DEFS})
     endif()
 
+    # BOCPD + MMPF integration test
+    if(TARGET bocpd AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_mmpf.c)
+        add_executable(test_bocpd_mmpf
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_mmpf.c
+        )
+        target_link_libraries(test_bocpd_mmpf PRIVATE rocks bocpd)
+        if(NOT WIN32)
+            target_link_libraries(test_bocpd_mmpf PRIVATE m)
+        endif()
+        target_include_directories(test_bocpd_mmpf PRIVATE 
+            ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
+            ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
+        )
+        target_compile_options(test_bocpd_mmpf PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_bocpd_mmpf PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
         add_executable(example_usage

@@ -448,11 +448,15 @@ static void run_mmpf_with_bocpd(
     /* Initialize BOCPD with power-law hazard */
     bocpd_t bocpd;
     bocpd_hazard_t hazard;
+    /* Initialize BOCPD with power-law hazard
+     * Prior centered on typical log(r²) ≈ -9 (1% daily vol)
+     * Weak prior (kappa=1) for fast adaptation */
     bocpd_prior_t prior = {
-        .mu0 = 0.0,
-        .kappa0 = 1.0,
-        .alpha0 = 1.0,
-        .beta0 = 1.0};
+        .mu0 = -9.0,   /* E[log(r²)] ≈ 2×log(0.01) - 1.27 ≈ -10.5, start middle */
+        .kappa0 = 1.0, /* Weak prior on mean */
+        .alpha0 = 1.0, /* Weak prior on variance */
+        .beta0 = 2.0   /* Var ≈ 2 for log-chi² noise */
+    };
 
     bocpd_hazard_init_power_law(&hazard, 0.8, 512);
     bocpd_init_with_hazard(&bocpd, &hazard, prior);
@@ -465,8 +469,24 @@ static void run_mmpf_with_bocpd(
     {
         double t0 = get_time_us();
 
-        /* Step BOCPD first */
-        bocpd_step(&bocpd, data->log_returns[t]);
+        /* Transform observation: y = log(r²)
+         * This is what MMPF sees internally.
+         * BOCPD needs this to detect VARIANCE changes (not mean changes).
+         * Raw log-returns have constant mean=0, so BOCPD sees nothing.
+         * log(r²) has mean ≈ 2×log(σ) - 1.27, which shifts with regime. */
+        double r = data->log_returns[t];
+        double y_log;
+        if (fabs(r) < 1e-10)
+        {
+            y_log = -20.0; /* Floor for zero returns */
+        }
+        else
+        {
+            y_log = log(r * r);
+        }
+
+        /* Step BOCPD on transformed observation */
+        bocpd_step(&bocpd, y_log);
 
         /* Check for shock (after warmup, respecting refractory) */
         shock_fired[t] = 0;
