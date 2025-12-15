@@ -116,11 +116,11 @@ static const MMPF_SwimLane SWIM_LANES[MMPF_N_MODELS] = {
      *             Rejects volatility → likelihood tanks → regime switch
      *═══════════════════════════════════════════════════════════════════════*/
     {
-        .mu_vol_min = RBPF_REAL(-6.0),        /* exp(-6) ≈ 0.25% vol */
-        .mu_vol_max = RBPF_REAL(-4.5),        /* exp(-4.5) ≈ 1.1% vol */
-        .sigma_vol_min = RBPF_REAL(0.03),     /* Very smooth */
-        .sigma_vol_max = RBPF_REAL(0.15),     /* Low vol-of-vol */
-        .learning_rate_scale = RBPF_REAL(0.0) /* PINNED — the rock doesn't move */
+        .mu_vol_min = RBPF_REAL(-6.0),         /* exp(-6) ≈ 0.25% vol */
+        .mu_vol_max = RBPF_REAL(-4.5),         /* exp(-4.5) ≈ 1.1% vol */
+        .sigma_vol_min = RBPF_REAL(0.03),      /* Very smooth */
+        .sigma_vol_max = RBPF_REAL(0.15),      /* Low vol-of-vol */
+        .learning_rate_scale = RBPF_REAL(0.05) /* SLOW — the rock moves slightly, prevents Trend Vampire */
     },
 
     /*═══════════════════════════════════════════════════════════════════════
@@ -579,13 +579,14 @@ MMPF_Config mmpf_config_defaults(void)
      *═══════════════════════════════════════════════════════════════════════*/
     cfg.base_stickiness = RBPF_REAL(0.98);
     cfg.min_stickiness = RBPF_REAL(0.85);
-    cfg.crisis_exit_boost = RBPF_REAL(0.92);
+    cfg.crisis_exit_boost = RBPF_REAL(0.92); /* Makes leaving Crisis easier */
+    cfg.crisis_entry_boost = RBPF_REAL(1.5); /* Mild boost — let Student-t likelihood do the work */
     cfg.enable_adaptive_stickiness = 1;
 
     /* Dirichlet prior for transition matrix smoothing
-     * Default: α=1.0, N=20 → floor ≈ 4.3% (all regimes stay warm) */
+     * Default: α=1.0, N=100 → floor ≈ 1.0% (more decisive, less "soupy") */
     cfg.transition_prior_alpha = RBPF_REAL(1.0);
-    cfg.transition_prior_mass = RBPF_REAL(20.0);
+    cfg.transition_prior_mass = RBPF_REAL(100.0); /* High inertia: floor ~1%, dominant sticks harder */
 
     cfg.enable_storvik_sync = 1;
 
@@ -678,41 +679,18 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
      *   K     = number of regimes (3)
      *
      * ─────────────────────────────────────────────────────────────────────
-     * INTERPRETATION
+     * ASYMMETRIC CRISIS TRANSITIONS
      * ─────────────────────────────────────────────────────────────────────
      *
-     * α = 1.0 means: "Before seeing any data, I believe I've observed
-     *                 1 transition to each regime."
+     * Crisis needs asymmetric behavior:
+     *   - ENTER quickly: When vol explodes, respond immediately
+     *   - EXIT quickly: Don't get stuck when vol drops
      *
-     * N = 20 means:  "My current stickiness estimate is worth 20 observations."
+     * We achieve this by:
+     *   1. crisis_entry_boost: Increases P(X → CRISIS) for X ≠ CRISIS
+     *   2. crisis_exit_boost: Decreases P(CRISIS → CRISIS)
      *
-     * The FLOOR (minimum transition probability) emerges naturally:
-     *
-     *                     α                    1.0
-     *   Floor = ───────────────── = ─────────────────── ≈ 4.3%
-     *            N + K × α           20 + 3 × 1.0
-     *
-     * ─────────────────────────────────────────────────────────────────────
-     * TUNING GUIDE
-     * ─────────────────────────────────────────────────────────────────────
-     *
-     *   α     N      Floor    Effect
-     *   ───   ───    ─────    ──────────────────────────────────
-     *   1.0   20     4.3%     Default — balanced warming
-     *   1.0   50     1.9%     Trust stickiness more, less warming
-     *   2.0   20     7.7%     Paranoid — strong warming
-     *   0.5   20     2.2%     Confident — minimal warming
-     *   1.0   10     7.7%     Uncertain about stickiness
-     *
-     * ─────────────────────────────────────────────────────────────────────
-     * WHY THIS IS BETTER THAN A HARD FLOOR
-     * ─────────────────────────────────────────────────────────────────────
-     *
-     * 1. Smooth: No discontinuous kink in the probability surface
-     * 2. Principled: It's a Bayesian prior, not a magic number
-     * 3. Interpretable: Parameters have clear meaning (pseudo-counts)
-     * 4. Symmetric: Also slightly regularizes the diagonal (stay probability)
-     * 5. Scales: Works correctly regardless of K (number of models)
+     * The entry boost is OCSN-adaptive: Higher outlier fraction → easier entry
      *
      *═══════════════════════════════════════════════════════════════════════*/
 
@@ -726,9 +704,51 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
     rbpf_real_t K = (rbpf_real_t)MMPF_N_MODELS;
     rbpf_real_t denom = N_mass + K * alpha;
 
-    /* Adaptive stickiness: drops when outliers are high (uncertain regime) */
-    rbpf_real_t stickiness = base - (base - min_s) * outlier;
+    /*═══════════════════════════════════════════════════════════════════════
+     * VOLATILITY-LEVEL SIGNAL
+     *
+     * Problem: OCSN under Crisis hypothesis (ν=3) expects fat tails, so it
+     * doesn't flag extreme moves as outliers. This means outlier_fraction
+     * stays low even during real crisis, and stickiness stays high.
+     *
+     * Solution: Also use current log_vol level as a signal.
+     * Crisis swim lane starts at -3.0, so when log_vol > -3.5, we should
+     * be more willing to transition.
+     *
+     * vol_signal: 0 at log_vol = -4.0, 1 at log_vol = -2.0
+     *═══════════════════════════════════════════════════════════════════════*/
+    rbpf_real_t current_log_vol = mmpf->weighted_log_vol;
+    rbpf_real_t vol_signal = (current_log_vol - RBPF_REAL(-4.0)) / RBPF_REAL(2.0);
+    if (vol_signal < RBPF_REAL(0.0))
+        vol_signal = RBPF_REAL(0.0);
+    if (vol_signal > RBPF_REAL(1.0))
+        vol_signal = RBPF_REAL(1.0);
+
+    /* Use maximum of outlier signal and vol signal for regime uncertainty */
+    rbpf_real_t combined_signal = (outlier > vol_signal) ? outlier : vol_signal;
+
+    /* Adaptive stickiness: drops when regime is uncertain (outliers OR high vol) */
+    rbpf_real_t stickiness = base - (base - min_s) * combined_signal;
     mmpf->current_stickiness = stickiness;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * CRISIS ENTRY BOOST
+     *
+     * When OCSN detects outliers OR vol is high, be MORE willing to enter Crisis.
+     * This is the "early warning" mechanism.
+     *
+     * crisis_entry_boost: 1.0 = no boost, 2.0 = double entry probability
+     * The boost scales with combined_signal: more stress → higher boost
+     *
+     * Example with base=0.98, entry_boost=3.0, combined_signal=0.5:
+     *   Base P(CALM → CRISIS) = (1 - 0.98) / 2 = 0.01
+     *   Boosted = 0.01 × (1 + 2.0 × 0.5) = 0.01 × 2.0 = 0.02
+     *   After Dirichlet smoothing: higher still
+     *
+     * This makes Crisis more responsive when the market shows stress signals.
+     *═══════════════════════════════════════════════════════════════════════*/
+    rbpf_real_t crisis_entry_multiplier = RBPF_REAL(1.0) +
+                                          (mmpf->config.crisis_entry_boost - RBPF_REAL(1.0)) * combined_signal;
 
     for (i = 0; i < MMPF_N_MODELS; i++)
     {
@@ -743,13 +763,39 @@ static void update_transition_matrix(MMPF_ROCKS *mmpf)
         /* Raw leave probability (before smoothing) */
         rbpf_real_t leave = (RBPF_REAL(1.0) - stay) / (MMPF_N_MODELS - 1);
 
+        /* Build raw transition row */
+        rbpf_real_t raw_probs[MMPF_N_MODELS];
+        rbpf_real_t row_sum = RBPF_REAL(0.0);
+
+        for (j = 0; j < MMPF_N_MODELS; j++)
+        {
+            if (i == j)
+            {
+                raw_probs[j] = stay;
+            }
+            else if (j == MMPF_CRISIS && i != MMPF_CRISIS)
+            {
+                /* Boost transitions INTO Crisis (from non-Crisis) */
+                raw_probs[j] = leave * crisis_entry_multiplier;
+            }
+            else
+            {
+                raw_probs[j] = leave;
+            }
+            row_sum += raw_probs[j];
+        }
+
+        /* Renormalize row to sum to 1 (the boost stole probability from others) */
+        for (j = 0; j < MMPF_N_MODELS; j++)
+        {
+            raw_probs[j] /= row_sum;
+        }
+
         /* Apply Dirichlet smoothing to each transition probability */
         for (j = 0; j < MMPF_N_MODELS; j++)
         {
-            rbpf_real_t raw_prob = (i == j) ? stay : leave;
-
             /* P_smoothed = (P_raw × N + α) / (N + K × α) */
-            mmpf->transition[i][j] = (raw_prob * N_mass + alpha) / denom;
+            mmpf->transition[i][j] = (raw_probs[j] * N_mass + alpha) / denom;
         }
     }
 }
