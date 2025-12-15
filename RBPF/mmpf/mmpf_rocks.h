@@ -166,13 +166,34 @@ extern "C"
         MMPF_HypothesisParams hypotheses[MMPF_N_MODELS];
 
         /* IMM transition matrix base settings */
-        rbpf_real_t base_stickiness;   /* Default: 0.98 (98% stay in same regime) */
-        rbpf_real_t min_stickiness;    /* Under stress: 0.85 */
-        rbpf_real_t crisis_exit_boost; /* Crisis exits faster: 0.92 multiplier */
-        rbpf_real_t min_mixing_prob;   /* Minimum transition probability (prevents lock-in): 0.01 */
+        rbpf_real_t base_stickiness;    /* Default: 0.98 (98% stay in same regime) */
+        rbpf_real_t min_stickiness;     /* Under stress: 0.85 */
+        rbpf_real_t crisis_exit_boost;  /* Crisis exits faster: 0.92 multiplier */
+        rbpf_real_t crisis_entry_boost; /* Crisis enters faster: 1.5 multiplier */
+        rbpf_real_t min_mixing_prob;    /* Minimum transition probability (prevents lock-in): 0.01 */
 
-        rbpf_real_t transition_prior_alpha; /* Dirichlet pseudo-counts (default: 1.0) */
-        rbpf_real_t transition_prior_mass;  /* Observation mass (default: 20.0) */
+        /* Dirichlet prior for transition matrix smoothing */
+        rbpf_real_t transition_prior_alpha; /* Pseudo-counts per regime (default: 1.0) */
+        rbpf_real_t transition_prior_mass;  /* Observation mass (default: 100.0) */
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * SWIM LANES (Hard bounds for each hypothesis)
+         *
+         * Prevents mode collapse — models can't converge because they're
+         * structurally constrained to different volatility regions.
+         *
+         * μ_vol bounds: What log-volatility level each model covers
+         * σ_vol bounds: How responsive each model is (vol-of-vol)
+         * learning_rate_scale: 0.0 = pinned (Calm), 1.0 = full adaptation (Trend)
+         *═══════════════════════════════════════════════════════════════════════*/
+        struct
+        {
+            rbpf_real_t mu_vol_min;
+            rbpf_real_t mu_vol_max;
+            rbpf_real_t sigma_vol_min;
+            rbpf_real_t sigma_vol_max;
+            rbpf_real_t learning_rate_scale;
+        } swim_lanes[MMPF_N_MODELS];
 
         /* OCSN-driven adaptive stickiness */
         int enable_adaptive_stickiness; /* 1 = adjust stickiness based on outliers */
@@ -282,8 +303,6 @@ extern "C"
         int enable_gated_learning;            /* 1 = weight dynamics updates by regime prob */
         rbpf_real_t gated_learning_threshold; /* Min weight to update (0.0 = soft gate) */
 
-        rbpf_real_t crisis_entry_boost; /* Crisis enters faster when outliers high (default: 3.0) */
-
     } MMPF_Config;
 
     /*═══════════════════════════════════════════════════════════════════════════
@@ -341,9 +360,9 @@ extern "C"
         rbpf_real_t model_nu_effective[MMPF_N_MODELS]; /* Implied ν from λ variance */
         rbpf_real_t model_nu[MMPF_N_MODELS];           /* Current ν per model (fixed or learned) */
 
-        /* Storvik-learned parameters (swim lane bounded) */
-        rbpf_real_t learned_mu_vol[MMPF_N_MODELS];    /* Learned μ_vol per hypothesis */
-        rbpf_real_t learned_sigma_eta[MMPF_N_MODELS]; /* Learned σ_η per hypothesis */
+        /* Storvik learned parameters (via swim lanes) */
+        rbpf_real_t learned_mu_vol[MMPF_N_MODELS];    /* Learned μ_vol per model */
+        rbpf_real_t learned_sigma_eta[MMPF_N_MODELS]; /* Learned σ_η per model */
 
     } MMPF_Output;
 
@@ -472,7 +491,7 @@ extern "C"
         /* Shock state */
         int shock_active;                     /* 1 if currently in shock mode */
         rbpf_real_t process_noise_multiplier; /* Applied to sigma_vol during shock */
-         int shock_cooldown;                   /* Refractory ticks remaining (0 = ready) */
+        int shock_cooldown;                   /* Refractory ticks remaining (0 = ready) */
 
         /*═══════════════════════════════════════════════════════════════════════
          * GLOBAL BASELINE TRACKING STATE
@@ -833,6 +852,42 @@ extern "C"
      */
     int mmpf_is_shock_active(const MMPF_ROCKS *mmpf);
 
+    /**
+     * Get remaining shock cooldown ticks.
+     *
+     * @param mmpf  MMPF instance
+     * @return      Ticks remaining before next shock allowed (0 = ready)
+     */
+    int mmpf_get_shock_cooldown(const MMPF_ROCKS *mmpf);
+
+    /**
+     * Set shock cooldown (refractory period).
+     * Call after mmpf_inject_shock() to prevent re-triggering.
+     *
+     * @param mmpf   MMPF instance
+     * @param ticks  Cooldown ticks (typically 20-50)
+     */
+    void mmpf_set_shock_cooldown(MMPF_ROCKS *mmpf, int ticks);
+
+    /**
+     * Decrement shock cooldown by 1 (call once per tick).
+     * Returns 1 if cooldown just reached 0 (ready for new shock).
+     *
+     * @param mmpf  MMPF instance
+     * @return      1 if now ready, 0 if still cooling down
+     */
+    int mmpf_tick_shock_cooldown(MMPF_ROCKS *mmpf);
+
+    /**
+     * Convenience: Inject shock with automatic cooldown.
+     * Only injects if cooldown is 0, then sets cooldown.
+     *
+     * @param mmpf            MMPF instance
+     * @param cooldown_ticks  Refractory period after shock
+     * @return                1 if shock was injected, 0 if blocked by cooldown
+     */
+    int mmpf_try_inject_shock(MMPF_ROCKS *mmpf, int cooldown_ticks);
+
     /*═══════════════════════════════════════════════════════════════════════════
      * API: Diagnostics
      *═══════════════════════════════════════════════════════════════════════════*/
@@ -889,25 +944,6 @@ extern "C"
      */
     void mmpf_buffer_copy_particle(MMPF_ParticleBuffer *dst, int dst_idx,
                                    const MMPF_ParticleBuffer *src, int src_idx);
-
-                                   int mmpf_is_shock_active(const MMPF_ROCKS *mmpf);
-
-    /**
-     * Get remaining shock cooldown ticks.
-     */
-    int mmpf_get_shock_cooldown(const MMPF_ROCKS *mmpf);
-
-    /**
-     * Set shock cooldown (refractory period).
-     */
-    void mmpf_set_shock_cooldown(MMPF_ROCKS *mmpf, int ticks);
-
-    /**
-     * Convenience: Inject shock with automatic cooldown.
-     * Only injects if cooldown is 0, then sets cooldown.
-     * @return 1 if shock was injected, 0 if blocked by cooldown
-     */
-    int mmpf_try_inject_shock(MMPF_ROCKS *mmpf, int cooldown_ticks);
 
 #ifdef __cplusplus
 }
