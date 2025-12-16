@@ -1944,6 +1944,35 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                     {
                         ext->rbpf->params[r].mu_vol = (rbpf_real_t)learned_mu;
                     }
+
+                    /* ═══════════════════════════════════════════════════════════════
+                     * CRITICAL FIX: Sync Storvik Priors with Online EM ("Moving Leash")
+                     *
+                     * Without this, Storvik particles use stale priors from initialization.
+                     * When Online EM discovers a new regime center:
+                     *   - RBPF params update ✓ (particles see new target)
+                     *   - Storvik priors stay old ✗ (drift clamp fights new target)
+                     *   - Result: Mode collapse as particles hit mu_drift_max
+                     *
+                     * The fix: Update Storvik's prior mean (m) to match Online EM.
+                     * Keep phi/sigma fixed to structural defaults for stability.
+                     * This allows particles to explore the new regime freely.
+                     *═══════════════════════════════════════════════════════════════*/
+                    if (ext->storvik_initialized)
+                    {
+                        const MMPF_HypothesisParams *hp = &mmpf->config.hypotheses[k];
+
+                        for (int r = 0; r < ext->rbpf->n_regimes; r++)
+                        {
+                            param_learn_set_prior(
+                                &ext->storvik,
+                                r,
+                                (param_real)learned_mu,      /* New center from EM */
+                                (param_real)(1.0 - hp->phi), /* Keep structural phi */
+                                (param_real)hp->sigma_eta    /* Keep structural sigma */
+                            );
+                        }
+                    }
                 }
             }
         }
