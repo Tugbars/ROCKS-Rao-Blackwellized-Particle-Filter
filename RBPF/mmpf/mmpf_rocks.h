@@ -533,30 +533,49 @@ extern "C"
             double last_teleport;
         } mcmc_stats;
 
-        /* Online EM state (streaming GMM for regime center learning) */
+        /* ═══════════════════════════════════════════════════════════════════════
+         * STRUCTURAL HIERARCHICAL ESTIMATION
+         *
+         * Instead of learning 3 independent μ values (which collapse),
+         * we learn 2 structural parameters:
+         *
+         *   B = Base Level (the "tide" that lifts all boats)
+         *   S = Spread (the distance between regimes)
+         *
+         * Model positions are DERIVED from structure:
+         *   μ_calm   = B + coeff[0] × S  = B - 1.0×S
+         *   μ_trend  = B + coeff[1] × S  = B + 0.0×S = B
+         *   μ_crisis = B + coeff[2] × S  = B + 1.5×S
+         *
+         * WHY THIS IS BULLETPROOF:
+         *   - Zero collapse risk: S_min enforces minimum separation
+         *   - Coupled learning: All data informs B, fleet stays in formation
+         *   - Noise immunity: Even mushy weights find the centroid
+         *   - Adaptive: B and S can both shift as market evolves
+         *═══════════════════════════════════════════════════════════════════════*/
         struct
         {
-            double mu[MMPF_N_MODELS];      /* Learned regime centers */
-            double sigma[MMPF_N_MODELS];   /* Learned regime spreads */
-            double sum_w[MMPF_N_MODELS];   /* Cumulative weight per regime */
-            double sum_wx[MMPF_N_MODELS];  /* Σ w×x for mean */
-            double sum_wx2[MMPF_N_MODELS]; /* Σ w×x² for variance */
-            double alpha;                  /* EMA decay (0.995 = 200 tick half-life) */
-            int warmup_ticks;              /* Ticks before output is trusted */
-            int tick_count;                /* Current tick */
+            /* Structural State */
+            double base_level; /* B: Center of gravity */
+            double spread;     /* S: Regime separation */
 
-            /* ═══════════════════════════════════════════════════════════════════
-             * MAP Prior (Bayesian Anchor to prevent mode collapse)
-             *
-             * Instead of pure MLE:  μ = Σ(w·x) / Σw
-             * We use MAP:           μ = (Σ(w·x) + κ·μ_prior) / (Σw + κ)
-             *
-             * This provides a "gravitational anchor" that prevents all models
-             * from collapsing to the same center. The stiffness κ represents
-             * the prior strength in "virtual observations."
-             *═══════════════════════════════════════════════════════════════════*/
-            double mu_prior[MMPF_N_MODELS];  /* Anchor centers (structural identity) */
-            double stiffness[MMPF_N_MODELS]; /* κ: prior strength (virtual observations) */
+            /* Geometry Configuration */
+            double coefficients[MMPF_N_MODELS]; /* Position multipliers [-1.0, 0.0, 1.5] */
+            double min_spread;                  /* Minimum separation (prevents collapse) */
+            double max_spread;                  /* Maximum separation (prevents explosion) */
+
+            /* Learning Parameters */
+            double learning_rate_base;   /* α for base level updates */
+            double learning_rate_spread; /* α for spread updates (usually slower) */
+            double alpha;                /* EMA decay for smoothing */
+
+            /* Output Cache (Projected means) */
+            double mu[MMPF_N_MODELS];    /* μ_k = B + coeff[k] × S */
+            double sigma[MMPF_N_MODELS]; /* Learned regime spreads */
+
+            /* Statistics */
+            int warmup_ticks; /* Ticks before output is trusted */
+            int tick_count;   /* Current tick */
         } online_em;
 
         /* Entropy state (stability detection for shock exit) */

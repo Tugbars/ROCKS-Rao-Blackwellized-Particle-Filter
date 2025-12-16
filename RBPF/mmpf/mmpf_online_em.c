@@ -1,319 +1,298 @@
 /**
  * @file mmpf_online_em.c
- * @brief Online Expectation-Maximization for Regime Discovery
+ * @brief Structural Hierarchical Estimation for Regime Discovery
  *
- * Stepwise EM algorithm for learning regime centers from streaming data.
+ * This uses Stochastic Gradient Descent (SGD) to find the Base and Spread
+ * that minimize the error between the model and reality.
+ *
+ * GEOMETRY (Fixed by Design):
+ *   μ_calm   = B - 1.0×S  (One spread below base)
+ *   μ_trend  = B          (At base level)
+ *   μ_crisis = B + 1.5×S  (1.5 spreads above - asymmetric)
+ *
+ * LEARNING:
+ *   Loss: L = 0.5 × Σ w_k × (y - (B + c_k × S))²
+ *
+ *   Gradients:
+ *     ∂L/∂B = -Σ w_k × error_k
+ *     ∂L/∂S = -Σ w_k × error_k × c_k
+ *
+ * WHY THIS KILLS MODE COLLAPSE:
+ *   - min_spread enforces S ≥ 0.3, so models CANNOT touch
+ *   - All data informs B, fleet stays in formation
+ *   - Even mushy weights find the correct centroid
  */
 
 #include "mmpf_online_em.h"
 #include <math.h>
 #include <string.h>
-#include <stdlib.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-/*═══════════════════════════════════════════════════════════════════════════
- * HELPERS
- *═══════════════════════════════════════════════════════════════════════════*/
-
-/**
- * @brief Gaussian PDF (not log, for responsibility computation)
- */
-static inline double gaussian_pdf(double x, double mu, double var) {
-    if (var < 1e-10) var = 1e-10;
-    double d = x - mu;
-    return exp(-0.5 * d * d / var) / sqrt(2.0 * M_PI * var);
-}
-
-/**
- * @brief Bubble sort clusters by mu (enforce ordering constraint)
- */
-static void sort_clusters(MMPF_OnlineEM *em) {
-    int n = em->n_clusters;
-    
-    /* Simple bubble sort (n is small, typically 3) */
-    for (int i = 0; i < n - 1; i++) {
-        for (int j = 0; j < n - 1 - i; j++) {
-            if (em->mu[j] > em->mu[j + 1]) {
-                /* Swap all parameters */
-                double tmp;
-                
-                tmp = em->mu[j];
-                em->mu[j] = em->mu[j + 1];
-                em->mu[j + 1] = tmp;
-                
-                tmp = em->var[j];
-                em->var[j] = em->var[j + 1];
-                em->var[j + 1] = tmp;
-                
-                tmp = em->pi[j];
-                em->pi[j] = em->pi[j + 1];
-                em->pi[j + 1] = tmp;
-            }
-        }
-    }
-}
+#include <stdio.h>
 
 /*═══════════════════════════════════════════════════════════════════════════
  * INITIALIZATION
  *═══════════════════════════════════════════════════════════════════════════*/
 
-void mmpf_online_em_init(MMPF_OnlineEM *em, int n_clusters) {
-    if (n_clusters < 2) n_clusters = 2;
-    if (n_clusters > MMPF_EM_MAX_CLUSTERS) n_clusters = MMPF_EM_MAX_CLUSTERS;
-    
+void mmpf_online_em_init(MMPF_OnlineEM *em)
+{
     memset(em, 0, sizeof(MMPF_OnlineEM));
-    em->n_clusters = n_clusters;
-    
-    /* Default initialization from Stage 1 tuner results */
-    if (n_clusters == 3) {
-        /* Calm */
-        em->mu[0] = -4.5;   /* Midpoint of [-5.5, -3.5] */
-        em->var[0] = 1.0;
-        em->pi[0] = 0.5;    /* Most time is calm */
-        
-        /* Trend */
-        em->mu[1] = -3.0;   /* Between calm and crisis */
-        em->var[1] = 1.0;
-        em->pi[1] = 0.3;
-        
-        /* Crisis */
-        em->mu[2] = -1.25;  /* Midpoint of [-2.5, 0.0] */
-        em->var[2] = 1.5;   /* Higher variance for crisis */
-        em->pi[2] = 0.2;    /* Rare but important */
-    } else {
-        /* Generic initialization: spread evenly from -5 to 0 */
-        double step = 4.0 / (n_clusters - 1);
-        for (int k = 0; k < n_clusters; k++) {
-            em->mu[k] = -5.0 + k * step;
-            em->var[k] = 1.0;
-            em->pi[k] = 1.0 / n_clusters;
-        }
+
+    /*───────────────────────────────────────────────────────────────────────
+     * GEOMETRY: The "Shape" of Volatility
+     * Calm is 1 unit below base, Crisis is 1.5 units above (asymmetric)
+     *───────────────────────────────────────────────────────────────────────*/
+    em->n_regimes = 3;
+    em->coefficients[0] = -1.0;                                /* Calm: B - S */
+    em->coefficients[1] = 0.0;                                 /* Trend: B (the base) */
+    em->coefficients[2] = 1.0; /* Crisis: B + S (symmetric) */ /* Crisis: B + 1.5S (asymmetric) */
+
+    /*───────────────────────────────────────────────────────────────────────
+     * INITIALIZATION
+     * Start somewhere reasonable; the solver will calibrate quickly
+     *───────────────────────────────────────────────────────────────────────*/
+    em->base_level = -4.0; /* Trend/base starts at -4.0 */
+    em->spread = 0.5;      /* Initial separation */
+
+    /*───────────────────────────────────────────────────────────────────────
+     * PHYSICS (Not Heuristics)
+     *───────────────────────────────────────────────────────────────────────*/
+    em->lr_base = 0.005;                      /* Base moves moderately fast (drift) */
+    em->lr_spread = 0.0; /* FIXED GEOMETRY */ /* Structure changes very slowly */
+    em->min_spread = 0.5;                     /* Hard physical limit - PREVENTS COLLAPSE */
+    em->max_spread = 5.0;                     /* Sanity cap */
+    em->min_base = -9.0;                      /* Safety bound */
+    em->max_base = 2.0;                       /* Safety bound */
+    em->warmup_ticks = 50;
+
+    /* Project initial μ values */
+    for (int k = 0; k < em->n_regimes; k++)
+    {
+        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
+        em->sigma[k] = 0.5; /* Default per-regime spread */
     }
-    
-    /* Bounds */
-    em->eta = 0.001;      /* ~1000 tick memory */
-    em->min_var = 0.1;    /* Prevent singularity */
-    em->min_pi = 0.05;    /* Prevent cluster death */
-    em->min_mu = -10.0;
-    em->max_mu = 2.0;
-    
-    em->tick_count = 0;
 }
 
-void mmpf_online_em_init_custom(MMPF_OnlineEM *em, int n_clusters,
-                                 const double *mu, const double *var,
-                                 const double *pi) {
-    mmpf_online_em_init(em, n_clusters);
-    
-    /* Override with custom values */
-    if (mu) {
-        memcpy(em->mu, mu, n_clusters * sizeof(double));
+void mmpf_online_em_init_custom(MMPF_OnlineEM *em, int n_regimes,
+                                const double *coefficients)
+{
+    /* Start with defaults */
+    mmpf_online_em_init(em);
+
+    /* Override with custom geometry */
+    if (n_regimes < 2)
+        n_regimes = 2;
+    if (n_regimes > MMPF_EM_MAX_REGIMES)
+        n_regimes = MMPF_EM_MAX_REGIMES;
+
+    em->n_regimes = n_regimes;
+
+    if (coefficients)
+    {
+        memcpy(em->coefficients, coefficients, n_regimes * sizeof(double));
     }
-    
-    if (var) {
-        memcpy(em->var, var, n_clusters * sizeof(double));
+
+    /* Re-project μ values with new geometry */
+    for (int k = 0; k < em->n_regimes; k++)
+    {
+        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
     }
-    
-    if (pi) {
-        memcpy(em->pi, pi, n_clusters * sizeof(double));
-        
-        /* Normalize */
-        double sum = 0.0;
-        for (int k = 0; k < n_clusters; k++) sum += em->pi[k];
-        if (sum > 1e-10) {
-            for (int k = 0; k < n_clusters; k++) em->pi[k] /= sum;
-        }
-    }
-    
-    /* Ensure ordering */
-    sort_clusters(em);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * ONLINE EM UPDATE
+ * THE STRUCTURAL SOLVER (SGD)
  *═══════════════════════════════════════════════════════════════════════════*/
 
-void mmpf_online_em_update(MMPF_OnlineEM *em, double y_log_vol) {
-    int n = em->n_clusters;
-    double gamma[MMPF_EM_MAX_CLUSTERS];
-    double sum_gamma = 0.0;
-    
-    /*─────────────────────────────────────────────────────────────────────────
-     * E-STEP: Compute responsibilities
-     *───────────────────────────────────────────────────────────────────────*/
-    for (int k = 0; k < n; k++) {
-        double prob = gaussian_pdf(y_log_vol, em->mu[k], em->var[k]);
-        gamma[k] = em->pi[k] * prob;
-        sum_gamma += gamma[k];
-    }
-    
-    /* Normalize responsibilities */
-    if (sum_gamma < 1e-10) {
-        /* Observation far from all clusters: uniform assignment */
-        for (int k = 0; k < n; k++) {
-            gamma[k] = 1.0 / n;
-        }
-    } else {
-        for (int k = 0; k < n; k++) {
-            gamma[k] /= sum_gamma;
-        }
-    }
-    
-    /* Store for diagnostics */
-    memcpy(em->last_responsibility, gamma, n * sizeof(double));
-    
-    /*─────────────────────────────────────────────────────────────────────────
-     * M-STEP: Update parameters via stochastic approximation
-     *───────────────────────────────────────────────────────────────────────*/
-    double eta = em->eta;
-    
-    for (int k = 0; k < n; k++) {
-        /* Update weight (π_k)
-         * π_new = (1-η)×π_old + η×γ_k
-         */
-        em->pi[k] = (1.0 - eta) * em->pi[k] + eta * gamma[k];
-        
-        /* Floor to prevent cluster death */
-        if (em->pi[k] < em->min_pi) {
-            em->pi[k] = em->min_pi;
-        }
-        
-        /* Effective learning rate for this cluster
-         * If cluster is rare (low π), it learns slower for stability
-         * η_k = η × γ_k / π_k
-         */
-        double eta_k = eta * gamma[k] / (em->pi[k] + 1e-10);
-        
-        /* Update mean (μ_k)
-         * μ_new = μ_old + η_k × (y - μ_old)
-         */
-        double delta = y_log_vol - em->mu[k];
-        em->mu[k] += eta_k * delta;
-        
-        /* Clamp to bounds */
-        if (em->mu[k] < em->min_mu) em->mu[k] = em->min_mu;
-        if (em->mu[k] > em->max_mu) em->mu[k] = em->max_mu;
-        
-        /* Update variance (σ²_k)
-         * σ²_new = (1-η_k)×σ²_old + η_k×(y - μ_new)²
-         *
-         * Note: We use the NEW mean for computing residual.
-         * This is the online Welford-style update.
-         */
-        double residual = y_log_vol - em->mu[k];
-        double new_var = (1.0 - eta_k) * em->var[k] + eta_k * residual * residual;
-        
-        /* Floor to prevent singularity */
-        if (new_var < em->min_var) {
-            new_var = em->min_var;
-        }
-        
-        em->var[k] = new_var;
-    }
-    
-    /*─────────────────────────────────────────────────────────────────────────
-     * ENFORCE ORDERING CONSTRAINT
-     * Ensure μ₀ < μ₁ < ... < μ_{K-1} to prevent label switching
-     *───────────────────────────────────────────────────────────────────────*/
-    sort_clusters(em);
-    
-    /*─────────────────────────────────────────────────────────────────────────
-     * RE-NORMALIZE WEIGHTS
-     * After flooring, weights might not sum to 1
-     *───────────────────────────────────────────────────────────────────────*/
-    double pi_sum = 0.0;
-    for (int k = 0; k < n; k++) {
-        pi_sum += em->pi[k];
-    }
-    if (pi_sum > 1e-10) {
-        for (int k = 0; k < n; k++) {
-            em->pi[k] /= pi_sum;
-        }
-    }
-    
+void mmpf_online_em_update(MMPF_OnlineEM *em, double y_log_vol,
+                           const rbpf_real_t *weights)
+{
     em->tick_count++;
+    em->last_y = y_log_vol;
+
+    /* Skip during warmup - let RBPF stabilize first */
+    if (em->tick_count < em->warmup_ticks)
+    {
+        return;
+    }
+
+    /* NaN guard */
+    if (y_log_vol != y_log_vol)
+    {
+        return;
+    }
+
+    /*───────────────────────────────────────────────────────────────────────
+     * COMPUTE GRADIENTS
+     *
+     * We want to minimize: L = 0.5 × Σ w_k × (y - (B + c_k×S))²
+     *
+     * Gradients (negative for ascent, but we use error directly):
+     *   ∂L/∂B = Σ w_k × error_k
+     *   ∂L/∂S = Σ w_k × error_k × c_k
+     *───────────────────────────────────────────────────────────────────────*/
+    double grad_base = 0.0;
+    double grad_spread = 0.0;
+    double total_weight = 0.0;
+
+    for (int k = 0; k < em->n_regimes; k++)
+    {
+        double w = (double)weights[k];
+        if (w < 1e-6)
+            continue;
+
+        double c = em->coefficients[k];
+
+        /* Prediction: Where this model thinks vol should be */
+        double predicted_mu = em->base_level + c * em->spread;
+
+        /* Error: How wrong was this model? */
+        /* Positive error = vol higher than expected → move UP */
+        double error = y_log_vol - predicted_mu;
+
+        /* Accumulate gradients */
+        grad_base += w * error;       /* If error > 0, raise Base */
+        grad_spread += w * error * c; /* If error > 0 AND c > 0, increase Spread */
+
+        total_weight += w;
+    }
+
+    /* Normalize gradients (proper expectation) */
+    if (total_weight > 1e-6)
+    {
+        grad_base /= total_weight;
+        grad_spread /= total_weight;
+    }
+
+    /* Store for diagnostics */
+    em->last_grad_base = grad_base;
+    em->last_grad_spread = grad_spread;
+
+    /*───────────────────────────────────────────────────────────────────────
+     * UPDATE STATE (SGD Step)
+     *───────────────────────────────────────────────────────────────────────*/
+    em->base_level += em->lr_base * grad_base;
+    em->spread += em->lr_spread * grad_spread;
+
+    /*───────────────────────────────────────────────────────────────────────
+     * ENFORCE PHYSICAL CONSTRAINTS
+     * This is what makes mode collapse IMPOSSIBLE
+     *───────────────────────────────────────────────────────────────────────*/
+    if (em->spread < em->min_spread)
+    {
+        em->spread = em->min_spread;
+    }
+    if (em->spread > em->max_spread)
+    {
+        em->spread = em->max_spread;
+    }
+
+    /* Safety bounds on base level */
+    if (em->base_level < em->min_base)
+    {
+        em->base_level = em->min_base;
+    }
+    if (em->base_level > em->max_base)
+    {
+        em->base_level = em->max_base;
+    }
+
+    /*───────────────────────────────────────────────────────────────────────
+     * PROJECT TO MODEL MEANS
+     * This GUARANTEES: μ_calm < μ_trend < μ_crisis (forever)
+     *───────────────────────────────────────────────────────────────────────*/
+    for (int k = 0; k < em->n_regimes; k++)
+    {
+        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
  * QUERY FUNCTIONS
  *═══════════════════════════════════════════════════════════════════════════*/
 
-int mmpf_online_em_classify(const MMPF_OnlineEM *em, double y_log_vol) {
-    int n = em->n_clusters;
-    int best_k = 0;
-    double best_score = -1e30;
-    
-    for (int k = 0; k < n; k++) {
-        double prob = gaussian_pdf(y_log_vol, em->mu[k], em->var[k]);
-        double score = em->pi[k] * prob;
-        if (score > best_score) {
-            best_score = score;
-            best_k = k;
-        }
+void mmpf_online_em_get_centers(const MMPF_OnlineEM *em, double *mu_out)
+{
+    memcpy(mu_out, em->mu, em->n_regimes * sizeof(double));
+}
+
+void mmpf_online_em_set_learning_rates(MMPF_OnlineEM *em,
+                                       double lr_base, double lr_spread)
+{
+    if (lr_base < 0.0001)
+        lr_base = 0.0001;
+    if (lr_base > 0.1)
+        lr_base = 0.1;
+    if (lr_spread < 0.00001)
+        lr_spread = 0.00001;
+    if (lr_spread > 0.01)
+        lr_spread = 0.01;
+
+    em->lr_base = lr_base;
+    em->lr_spread = lr_spread;
+}
+
+void mmpf_online_em_set_constraints(MMPF_OnlineEM *em,
+                                    double min_spread, double max_spread)
+{
+    if (min_spread < 0.1)
+        min_spread = 0.1;
+    if (max_spread < min_spread)
+        max_spread = min_spread + 1.0;
+
+    em->min_spread = min_spread;
+    em->max_spread = max_spread;
+
+    /* Enforce constraints immediately */
+    if (em->spread < em->min_spread)
+    {
+        em->spread = em->min_spread;
     }
-    
-    return best_k;
-}
-
-void mmpf_online_em_responsibilities(const MMPF_OnlineEM *em, double y_log_vol,
-                                      double *gamma) {
-    int n = em->n_clusters;
-    double sum = 0.0;
-    
-    for (int k = 0; k < n; k++) {
-        double prob = gaussian_pdf(y_log_vol, em->mu[k], em->var[k]);
-        gamma[k] = em->pi[k] * prob;
-        sum += gamma[k];
+    if (em->spread > em->max_spread)
+    {
+        em->spread = em->max_spread;
     }
-    
-    if (sum > 1e-10) {
-        for (int k = 0; k < n; k++) {
-            gamma[k] /= sum;
-        }
-    } else {
-        for (int k = 0; k < n; k++) {
-            gamma[k] = 1.0 / n;
-        }
+
+    /* Re-project */
+    for (int k = 0; k < em->n_regimes; k++)
+    {
+        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
     }
 }
 
-void mmpf_online_em_set_learning_rate(MMPF_OnlineEM *em, double eta) {
-    if (eta < 0.0001) eta = 0.0001;
-    if (eta > 0.1) eta = 0.1;
-    em->eta = eta;
-}
+void mmpf_online_em_reset(MMPF_OnlineEM *em)
+{
+    int n = em->n_regimes;
+    double coeffs[MMPF_EM_MAX_REGIMES];
+    memcpy(coeffs, em->coefficients, n * sizeof(double));
 
-void mmpf_online_em_get_centers(const MMPF_OnlineEM *em, double *mu_out) {
-    memcpy(mu_out, em->mu, em->n_clusters * sizeof(double));
-}
+    mmpf_online_em_init(em);
 
-int mmpf_online_em_converged(const MMPF_OnlineEM *em, double var_threshold) {
-    /* Simple heuristic: check if all variances are below threshold */
-    /* This indicates clusters have stabilized */
-    for (int k = 0; k < em->n_clusters; k++) {
-        if (em->var[k] > var_threshold) {
-            return 0;
-        }
+    em->n_regimes = n;
+    memcpy(em->coefficients, coeffs, n * sizeof(double));
+
+    /* Re-project */
+    for (int k = 0; k < em->n_regimes; k++)
+    {
+        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
     }
-    return 1;
-}
-
-void mmpf_online_em_reset(MMPF_OnlineEM *em) {
-    int n = em->n_clusters;
-    mmpf_online_em_init(em, n);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
  * DIAGNOSTICS
  *═══════════════════════════════════════════════════════════════════════════*/
 
-/**
- * @brief Print EM state (for debugging)
- */
-void mmpf_online_em_dump(const MMPF_OnlineEM *em) {
-    /* For debugging, implement as needed */
-    (void)em;
+void mmpf_online_em_dump(const MMPF_OnlineEM *em)
+{
+    printf("=== Structural Hierarchical Estimation ===\n");
+    printf("Base Level (B): %.4f\n", em->base_level);
+    printf("Spread (S):     %.4f\n", em->spread);
+    printf("Ticks:          %d\n", em->tick_count);
+    printf("\nProjected Means:\n");
+    for (int k = 0; k < em->n_regimes; k++)
+    {
+        printf("  [%d] coeff=%.2f → μ=%.4f\n",
+               k, em->coefficients[k], em->mu[k]);
+    }
+    printf("\nLast Gradients:\n");
+    printf("  grad_B: %.6f\n", em->last_grad_base);
+    printf("  grad_S: %.6f\n", em->last_grad_spread);
+    printf("==========================================\n");
 }

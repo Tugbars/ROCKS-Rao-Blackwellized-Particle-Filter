@@ -580,7 +580,7 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.base_stickiness = RBPF_REAL(0.98);
     cfg.min_stickiness = RBPF_REAL(0.85);
     cfg.crisis_exit_boost = RBPF_REAL(0.92);
-    cfg.min_mixing_prob = RBPF_REAL(0.05); /* 5% minimum - ensures Crisis is always "listening" */
+    cfg.min_mixing_prob = RBPF_REAL(0.005); /* 0.5% - allows decisive selection, keeps models alive */
     cfg.enable_adaptive_stickiness = 1;
 
     /* Storvik Sync: ENABLED - proper Bayesian parameter learning
@@ -1122,37 +1122,70 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         memset(&mmpf->mcmc_stats, 0, sizeof(mmpf->mcmc_stats));
     }
 
-    /* Online EM for regime center learning */
+    /* ═══════════════════════════════════════════════════════════════════════════
+     * STRUCTURAL HIERARCHICAL ESTIMATION INITIALIZATION
+     *
+     * We learn (B, S) instead of independent μ values:
+     *   μ_k = B + coeff[k] × S
+     *
+     * Geometry: Calm ← ─S─ → Trend ← ─S─ → Crisis
+     *           (B-S)        (B)           (B+S)
+     *═══════════════════════════════════════════════════════════════════════════*/
     {
-        mmpf->online_em.alpha = 0.995; /* ~200 tick half-life */
+        /* Learning parameters */
+        mmpf->online_em.alpha = 0.995;              /* EMA decay for smoothing */
+        mmpf->online_em.learning_rate_base = 0.005; /* Base moves moderately fast (drift) */
+        mmpf->online_em.learning_rate_spread = 0.0; /* FIXED GEOMETRY - spread doesn't learn */
         mmpf->online_em.warmup_ticks = 50;
         mmpf->online_em.tick_count = 0;
 
-        /* Default stiffness values (κ = prior strength in virtual observations)
+        /* Geometry: Define the "shape" of volatility regimes
+         * These coefficients define how each model relates to the base level:
+         *   CALM:   Below base (quiet markets)
+         *   TREND:  At base (normal/trending)
+         *   CRISIS: Above base (high volatility)
          *
-         * These are "Bungee Cords" not "Anchors" - light enough to let
-         * models adapt quickly to data while preventing total mode collapse.
-         *
-         * κ = 0   → Pure MLE (no anchor, allows mode collapse)
-         * κ = 1-5 → Light anchor (adapts in ~10-50 ticks)
-         * κ = 50+ → Too stiff (locks to prior, can't adapt)
+         * SYMMETRIC design: Calm and Crisis are equidistant from Trend
+         * This matches the original mu_vol_offsets: [-0.5, 0.0, +0.5]
          */
-        const double default_stiffness[MMPF_N_MODELS] = {5.0, 2.0, 1.0};
+        mmpf->online_em.coefficients[MMPF_CALM] = -1.0;  /* One spread below */
+        mmpf->online_em.coefficients[MMPF_TREND] = 0.0;  /* At base level */
+        mmpf->online_em.coefficients[MMPF_CRISIS] = 1.0; /* One spread above (symmetric) */
 
+        /* Structural constraints (prevent collapse and explosion) */
+        mmpf->online_em.min_spread = 0.5; /* Minimum separation - matches original design */
+        mmpf->online_em.max_spread = 3.0; /* Maximum separation (prevents explosion) */
+
+        /* Initialize structural state from configured hypotheses
+         *
+         * We derive initial (B, S) from the configured μ values:
+         *   B = μ_trend (since coeff[TREND] = 0)
+         *   S = μ_trend - μ_calm (since coeff[CALM] = -1)
+         */
+        double mu_calm = (double)cfg.hypotheses[MMPF_CALM].mu_vol;
+        double mu_trend = (double)cfg.hypotheses[MMPF_TREND].mu_vol;
+        double mu_crisis = (double)cfg.hypotheses[MMPF_CRISIS].mu_vol;
+
+        mmpf->online_em.base_level = mu_trend;
+        mmpf->online_em.spread = mu_trend - mu_calm; /* Initial spread from config */
+
+        /* Enforce minimum spread */
+        if (mmpf->online_em.spread < mmpf->online_em.min_spread)
+        {
+            mmpf->online_em.spread = mmpf->online_em.min_spread;
+        }
+
+        /* Project initial μ values from structure */
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
-            /* Initialize to CONFIGURED hypothesis centers (not baseline + offsets)
-             * This ensures tests that override cfg.hypotheses[k].mu_vol work correctly */
-            mmpf->online_em.mu[k] = (double)cfg.hypotheses[k].mu_vol;
-            mmpf->online_em.sigma[k] = 0.5; /* Initial spread */
-            mmpf->online_em.sum_w[k] = 1.0; /* Prevent div-by-zero */
-            mmpf->online_em.sum_wx[k] = mmpf->online_em.mu[k];
-            mmpf->online_em.sum_wx2[k] = mmpf->online_em.mu[k] * mmpf->online_em.mu[k] + 0.25;
-
-            /* MAP Prior: Anchor to configured centers with per-model stiffness */
-            mmpf->online_em.mu_prior[k] = (double)cfg.hypotheses[k].mu_vol;
-            mmpf->online_em.stiffness[k] = default_stiffness[k];
+            double coeff = mmpf->online_em.coefficients[k];
+            mmpf->online_em.mu[k] = mmpf->online_em.base_level + coeff * mmpf->online_em.spread;
+            mmpf->online_em.sigma[k] = 0.5; /* Initial per-regime spread */
         }
+
+        /* Note: The projected μ values may differ slightly from cfg.hypotheses[k].mu_vol
+         * because we enforce the structural geometry. This is intentional - the
+         * structure IS the constraint that prevents collapse. */
     }
 
     /* Entropy state for stability detection */
@@ -1544,38 +1577,10 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
     /* 2. Compute mixing weights */
     compute_mixing_weights(mmpf);
 
-    /* 2.5 Temperature-Based Weight Sharpening (Entropy Annealing)
-     *
-     * The IMM weights are often "mushy" because overlapping distributions
-     * give partial credit to multiple models. We force a decision by
-     * raising weights to a power (T < 1 sharpens, T > 1 softens).
-     *
-     * Effect: w_k^(1/T) / Σ w_j^(1/T)
-     *   T = 1.0 → No change (standard IMM)
-     *   T = 0.5 → Squaring effect: 0.4 vs 0.35 becomes 0.53 vs 0.38
-     *   T = 0.1 → Aggressive: Winner takes almost all
-     */
-    {
-        const double T = 0.5; /* Temperature < 1.0 sharpens */
-        double sum_w = 0.0;
-
-        for (int k = 0; k < MMPF_N_MODELS; k++)
-        {
-            mmpf->weights[k] = (rbpf_real_t)pow((double)mmpf->weights[k], 1.0 / T);
-            sum_w += (double)mmpf->weights[k];
-        }
-
-        /* Renormalize */
-        if (sum_w > 1e-30)
-        {
-            rbpf_real_t inv_sum = (rbpf_real_t)(1.0 / sum_w);
-            for (int k = 0; k < MMPF_N_MODELS; k++)
-            {
-                mmpf->weights[k] *= inv_sum;
-                mmpf->log_weights[k] = rbpf_log(mmpf->weights[k]);
-            }
-        }
-    }
+    /* Note: Temperature sharpening (entropy annealing) has been removed.
+     * With Structural Hierarchical Estimation, the models maintain proper
+     * separation by construction, so artificial weight sharpening is unnecessary.
+     * If needed, T = 0.75 to 0.85 provides gentle sharpening. */
 
     compute_mixing_counts(mmpf);
 
@@ -1940,63 +1945,105 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
 
         /*═══════════════════════════════════════════════════════════════════════
-         * ONLINE EM: Learn regime centers from streaming data
+         * STRUCTURAL HIERARCHICAL ESTIMATION
          *
-         * Each hypothesis learns its own μ_vol from data where IT is dominant.
-         * This is a proper streaming GMM - no manual EWMA heuristics.
+         * Instead of learning 3 independent μ values (which collapse),
+         * we learn 2 structural parameters using gradient descent:
+         *
+         *   B = Base Level (where is the market overall?)
+         *   S = Spread (how far apart are the regimes?)
+         *
+         * Loss: L = 0.5 × Σ w_k × (y - (B + c_k × S))²
+         *
+         * Key insight: We use weighted_log_vol (already computed) as the
+         * "truth" signal. This closes the loop:
+         *   RBPF tells EM where vol is → EM tells RBPF where regimes are
          *═══════════════════════════════════════════════════════════════════════*/
         {
-            double alpha = mmpf->online_em.alpha;
             mmpf->online_em.tick_count++;
+
+            /* Skip during warmup - let RBPF stabilize first */
+            if (mmpf->online_em.tick_count < mmpf->online_em.warmup_ticks)
+            {
+                goto skip_structural_update;
+            }
+
+            /* Use weighted posterior log-vol as the "truth" signal */
+            double y = (double)mmpf->weighted_log_vol;
+
+            if (y != y)
+                goto skip_structural_update; /* NaN guard */
+
+            /* Compute gradients for structural parameters */
+            double grad_B = 0.0;
+            double grad_S = 0.0;
+            double total_weight = 0.0;
 
             for (int k = 0; k < MMPF_N_MODELS; k++)
             {
                 double w_k = (double)mmpf->weights[k];
-                double x_k = (double)mmpf->model_output[k].log_vol_mean;
+                if (w_k < 1e-6)
+                    continue;
 
-                if (x_k != x_k)
-                    continue; /* NaN guard */
+                double c_k = mmpf->online_em.coefficients[k];
 
-                /* Streaming sufficient statistics update */
-                mmpf->online_em.sum_w[k] = alpha * mmpf->online_em.sum_w[k] + w_k;
-                mmpf->online_em.sum_wx[k] = alpha * mmpf->online_em.sum_wx[k] + w_k * x_k;
-                mmpf->online_em.sum_wx2[k] = alpha * mmpf->online_em.sum_wx2[k] + w_k * x_k * x_k;
+                /* Current prediction for model k */
+                double pred_k = mmpf->online_em.base_level + c_k * mmpf->online_em.spread;
 
-                /* Update mean and variance using MAP (Maximum A Posteriori)
-                 *
-                 * MLE (old):  μ = Σ(w·x) / Σw
-                 * MAP (new):  μ = (Σ(w·x) + κ·μ_prior) / (Σw + κ)
-                 *
-                 * The prior acts as a "gravitational anchor" that prevents
-                 * mode collapse by keeping models near their structural identity.
-                 * κ (stiffness) = number of "virtual observations" at the prior.
-                 */
-                double sum_w = mmpf->online_em.sum_w[k];
-                double kappa = mmpf->online_em.stiffness[k];
-                double mu_prior = mmpf->online_em.mu_prior[k];
+                /* Prediction error (positive = vol higher than expected) */
+                double error_k = y - pred_k;
 
-                if (sum_w > 1e-10)
-                {
-                    /* MAP estimate for mean */
-                    double new_mu = (mmpf->online_em.sum_wx[k] + kappa * mu_prior) / (sum_w + kappa);
+                /* Accumulate gradients */
+                grad_B += w_k * error_k;       /* If error > 0, move Base UP */
+                grad_S += w_k * error_k * c_k; /* If error > 0 AND c_k > 0, increase Spread */
 
-                    /* Variance still uses MLE (prior on variance adds complexity) */
-                    double new_var = mmpf->online_em.sum_wx2[k] / sum_w - new_mu * new_mu;
-                    if (new_var < 0.01)
-                        new_var = 0.01;
-
-                    mmpf->online_em.mu[k] = new_mu;
-                    mmpf->online_em.sigma[k] = sqrt(new_var);
-                }
+                total_weight += w_k;
             }
 
-            /* Push learned μ_vol to RBPFs (after warmup)
+            /* Normalize gradients (proper expectation) */
+            if (total_weight > 1e-6)
+            {
+                grad_B /= total_weight;
+                grad_S /= total_weight;
+            }
+
+            /* Update structural parameters (SGD step) */
+            double lr_B = mmpf->online_em.learning_rate_base;
+            double lr_S = mmpf->online_em.learning_rate_spread;
+
+            mmpf->online_em.base_level += lr_B * grad_B;
+            mmpf->online_em.spread += lr_S * grad_S;
+
+            /* Enforce structural constraints */
+            if (mmpf->online_em.spread < mmpf->online_em.min_spread)
+            {
+                mmpf->online_em.spread = mmpf->online_em.min_spread;
+            }
+            if (mmpf->online_em.spread > mmpf->online_em.max_spread)
+            {
+                mmpf->online_em.spread = mmpf->online_em.max_spread;
+            }
+
+            /* Safety bounds on base level (sanity check) */
+            if (mmpf->online_em.base_level < -9.0)
+                mmpf->online_em.base_level = -9.0;
+            if (mmpf->online_em.base_level > 2.0)
+                mmpf->online_em.base_level = 2.0;
+
+            /* Project structural state to model means */
+            /* This GUARANTEES: μ_calm < μ_trend < μ_crisis (forever) */
+            for (int k = 0; k < MMPF_N_MODELS; k++)
+            {
+                double c_k = mmpf->online_em.coefficients[k];
+                mmpf->online_em.mu[k] = mmpf->online_em.base_level + c_k * mmpf->online_em.spread;
+            }
+
+            /* Push learned μ_vol to RBPFs
              * ONLY when adaptive learning is enabled (enable_storvik_sync).
              * When disabled (for unit tests), RBPF uses the fixed hypothesis params
              * that were configured at creation time. */
-            if (mmpf->online_em.tick_count >= mmpf->online_em.warmup_ticks &&
-                mmpf->config.enable_storvik_sync &&   /* Only if adaptive learning enabled */
-                !mmpf->config.enable_global_baseline) /* Skip if baseline controls μ */
+            if (mmpf->config.enable_storvik_sync &&
+                !mmpf->config.enable_global_baseline)
             {
                 for (int k = 0; k < MMPF_N_MODELS; k++)
                 {
@@ -2008,19 +2055,7 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                         ext->rbpf->params[r].mu_vol = (rbpf_real_t)learned_mu;
                     }
 
-                    /* ═══════════════════════════════════════════════════════════════
-                     * CRITICAL FIX: Sync Storvik Priors with Online EM ("Moving Leash")
-                     *
-                     * Without this, Storvik particles use stale priors from initialization.
-                     * When Online EM discovers a new regime center:
-                     *   - RBPF params update ✓ (particles see new target)
-                     *   - Storvik priors stay old ✗ (drift clamp fights new target)
-                     *   - Result: Mode collapse as particles hit mu_drift_max
-                     *
-                     * The fix: Update Storvik's prior mean (m) to match Online EM.
-                     * Keep phi/sigma fixed to structural defaults for stability.
-                     * This allows particles to explore the new regime freely.
-                     *═══════════════════════════════════════════════════════════════*/
+                    /* Sync Storvik priors with structural estimates */
                     if (ext->storvik_initialized)
                     {
                         const MMPF_HypothesisParams *hp = &mmpf->config.hypotheses[k];
@@ -2030,14 +2065,15 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                             param_learn_set_prior(
                                 &ext->storvik,
                                 r,
-                                (param_real)learned_mu,      /* New center from EM */
-                                (param_real)(1.0 - hp->phi), /* Keep structural phi */
-                                (param_real)hp->sigma_eta    /* Keep structural sigma */
-                            );
+                                (param_real)learned_mu,
+                                (param_real)(1.0 - hp->phi),
+                                (param_real)hp->sigma_eta);
                         }
                     }
                 }
             }
+
+        skip_structural_update:;
         }
 
         /*═══════════════════════════════════════════════════════════════════════
