@@ -37,8 +37,8 @@ if(RBPF_ENABLE_STORVIK)
         # Robust OCSN likelihood
         ocsn/rbpf_ocsn_robust.c
         
-        # DISABLED: Integration layer needs Liu-West removal
-        # rbpf_ksc_param_integration.c
+        # Integration layer (rbpf_ext_* functions for MMPF)
+        rbpf_ksc_param_integration.c
         
         # Tuner
         tuner/rbpf_tuner.c
@@ -127,15 +127,8 @@ endif()
 if(RBPF_BUILD_TESTS)
 
     #───────────────────────────────────────────────────────────────────────────
-    # DISABLED: All RBPF-level tests (API changes in rbpf_ksc.c)
-    # These will be re-enabled after updating test code to new API:
-    #   - test_rbpf_integration.c
-    #   - test_rbpf_comparison.c  
-    #   - rbpf_comparison_test.c
-    #   - test_param_learn.c
-    #   - test_rbpf_tuner.c
-    #   - test_rbpf_scenarios.c
-    #   - test_rbpf_csv.c
+    # DISABLED: RBPF-level tests (API changes in rbpf_ksc.c)
+    # Re-enable after updating test code to new API
     #───────────────────────────────────────────────────────────────────────────
 
     #───────────────────────────────────────────────────────────────────────────

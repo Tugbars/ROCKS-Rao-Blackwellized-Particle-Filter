@@ -16,14 +16,9 @@
 #include <immintrin.h>
 #endif
 
-/* MKL for batch RNG */
-#ifdef USE_MKL
+/* MKL for batch RNG and aligned allocation */
 #include <mkl.h>
 #include <mkl_vsl.h>
-#define HAS_MKL 1
-#else
-#define HAS_MKL 0
-#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -59,79 +54,46 @@ void mmpf_mcmc_config_defaults(MMPF_MCMC_Config *cfg)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * SCRATCH BUFFER MANAGEMENT
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void mmpf_mcmc_scratch_alloc(MMPF_MCMC_Scratch *scratch,
-                             int n_part, int n_models, int n_steps)
-{
-    int total = n_part * n_steps; /* Per-model, reused across models */
-
-    /* Round up to cache line (64 bytes = 8 doubles) */
-    total = (total + 7) & ~7;
-
-#if HAS_MKL
-    scratch->rng_gauss = (double *)mkl_malloc(total * sizeof(double), 64);
-    scratch->rng_log_u = (double *)mkl_malloc(total * sizeof(double), 64);
-#else
-    scratch->rng_gauss = (double *)aligned_alloc(64, total * sizeof(double));
-    scratch->rng_log_u = (double *)aligned_alloc(64, total * sizeof(double));
-#endif
-
-    scratch->capacity = total;
-    (void)n_models; /* Reserved for future use */
-}
-
-void mmpf_mcmc_scratch_free(MMPF_MCMC_Scratch *scratch)
-{
-    if (scratch->rng_gauss)
-    {
-#if HAS_MKL
-        mkl_free(scratch->rng_gauss);
-        mkl_free(scratch->rng_log_u);
-#else
-        free(scratch->rng_gauss);
-        free(scratch->rng_log_u);
-#endif
-    }
-    scratch->rng_gauss = NULL;
-    scratch->rng_log_u = NULL;
-    scratch->capacity = 0;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
  * MMPF INTEGRATION: INIT / DESTROY
  *═══════════════════════════════════════════════════════════════════════════*/
 
 void mmpf_mcmc_init(MMPF_ROCKS *mmpf, int n_part, int n_models, int n_steps)
 {
-    /* Initialize scratch buffers */
-    mmpf_mcmc_scratch_alloc(&mmpf->mcmc_scratch, n_part, n_models, n_steps);
+    /* Initialize scratch buffers directly */
+    int total = n_part * n_steps;
+    total = (total + 7) & ~7; /* Round up to cache line */
 
-#if HAS_MKL
+    mmpf->mcmc_scratch.rng_gauss = (double *)mkl_malloc(total * sizeof(double), 64);
+    mmpf->mcmc_scratch.rng_log_u = (double *)mkl_malloc(total * sizeof(double), 64);
+    mmpf->mcmc_scratch.capacity = total;
+
+    (void)n_models; /* Reserved for future use */
+
     /* Create dedicated VSL stream for MCMC */
-    /* Use SFMT19937 for high quality, fast generation */
-    vslNewStream(&mmpf->mcmc_vsl_stream, VSL_BRNG_SFMT19937,
-                 (unsigned int)(12345 + (size_t)mmpf)); /* Seed varies per instance */
-#else
-    mmpf->mcmc_vsl_stream = NULL;
-#endif
+    vslNewStream((VSLStreamStatePtr *)&mmpf->mcmc_vsl_stream, VSL_BRNG_SFMT19937,
+                 (unsigned int)(12345 + (size_t)mmpf));
 
     /* Initialize statistics */
-    memset(&mmpf->mcmc_stats, 0, sizeof(MMPF_MCMC_Stats));
+    memset(&mmpf->mcmc_stats, 0, sizeof(mmpf->mcmc_stats));
 }
 
 void mmpf_mcmc_destroy(MMPF_ROCKS *mmpf)
 {
-    mmpf_mcmc_scratch_free(&mmpf->mcmc_scratch);
+    /* Free scratch buffers */
+    if (mmpf->mcmc_scratch.rng_gauss)
+    {
+        mkl_free(mmpf->mcmc_scratch.rng_gauss);
+        mkl_free(mmpf->mcmc_scratch.rng_log_u);
+        mmpf->mcmc_scratch.rng_gauss = NULL;
+        mmpf->mcmc_scratch.rng_log_u = NULL;
+        mmpf->mcmc_scratch.capacity = 0;
+    }
 
-#if HAS_MKL
     if (mmpf->mcmc_vsl_stream)
     {
-        vslDeleteStream(&mmpf->mcmc_vsl_stream);
+        vslDeleteStream((VSLStreamStatePtr *)&mmpf->mcmc_vsl_stream);
         mmpf->mcmc_vsl_stream = NULL;
     }
-#endif
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -179,50 +141,6 @@ __m256d mmpf_mcmc_loglik_avx(__m256d h_vec, double y_log_sq)
 #endif /* __AVX2__ */
 
 /*═══════════════════════════════════════════════════════════════════════════
- * SIMPLE RNG FOR NON-MKL BUILDS
- *═══════════════════════════════════════════════════════════════════════════*/
-
-#if !HAS_MKL
-
-/* xoroshiro128+ */
-static uint64_t s_rng_state[2] = {0x853c49e6748fea9bULL, 0xda3e39cb94b95bdbULL};
-
-static inline uint64_t rotl(uint64_t x, int k)
-{
-    return (x << k) | (x >> (64 - k));
-}
-
-static inline uint64_t xoro_next(void)
-{
-    uint64_t s0 = s_rng_state[0];
-    uint64_t s1 = s_rng_state[1];
-    uint64_t result = s0 + s1;
-
-    s1 ^= s0;
-    s_rng_state[0] = rotl(s0, 24) ^ s1 ^ (s1 << 16);
-    s_rng_state[1] = rotl(s1, 37);
-
-    return result;
-}
-
-static inline double rand_uniform(void)
-{
-    return (xoro_next() >> 11) * (1.0 / 9007199254740992.0);
-}
-
-/* Box-Muller for Gaussian */
-static inline double rand_gaussian(void)
-{
-    double u1 = rand_uniform();
-    double u2 = rand_uniform();
-    if (u1 < 1e-10)
-        u1 = 1e-10;
-    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
-}
-
-#endif /* !HAS_MKL */
-
-/*═══════════════════════════════════════════════════════════════════════════
  * SCALAR MCMC IMPLEMENTATION
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -250,14 +168,12 @@ static void mcmc_scalar(MMPF_ROCKS *mmpf, double y_log_sq,
             /* Run MH steps */
             for (int step = 0; step < n_steps; step++)
             {
-#if HAS_MKL
-                /* MKL path uses pre-generated randoms (handled in AVX version) */
-                double noise = 0.0;
-                double u = 0.5;
-#else
-                double noise = rand_gaussian() * sigma;
-                double u = rand_uniform();
-#endif
+                /* Generate randoms inline using MKL */
+                double noise, u;
+                vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER,
+                              (VSLStreamStatePtr)mmpf->mcmc_vsl_stream, 1, &noise, 0.0, sigma);
+                vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD,
+                             (VSLStreamStatePtr)mmpf->mcmc_vsl_stream, 1, &u, 0.0, 1.0);
 
                 /* Propose */
                 double h_prop = h_curr + noise;
@@ -291,7 +207,7 @@ static void mcmc_scalar(MMPF_ROCKS *mmpf, double y_log_sq,
  * AVX2 + MKL OPTIMIZED MCMC
  *═══════════════════════════════════════════════════════════════════════════*/
 
-#if defined(__AVX2__) && HAS_MKL
+#ifdef __AVX2__
 
 static void mcmc_avx_mkl(MMPF_ROCKS *mmpf, double y_log_sq,
                          const MMPF_MCMC_Config *cfg)
@@ -299,9 +215,6 @@ static void mcmc_avx_mkl(MMPF_ROCKS *mmpf, double y_log_sq,
     int n_steps = cfg->n_steps;
     double sigma = cfg->proposal_sigma;
     double var_reset = cfg->var_reset;
-
-    /* Use pre-allocated scratch from MMPF struct */
-    MMPF_MCMC_Scratch *scratch = &mmpf->mcmc_scratch;
 
     /* Compute total random numbers needed */
     int max_particles = 0;
@@ -315,19 +228,25 @@ static void mcmc_avx_mkl(MMPF_ROCKS *mmpf, double y_log_sq,
     int total_rng = max_particles * n_steps;
 
     /* Verify scratch capacity (should be pre-allocated at init) */
-    if (total_rng > scratch->capacity)
+    if (total_rng > mmpf->mcmc_scratch.capacity)
     {
         /* Emergency resize - should not happen in production */
-        /* Log warning in real code */
-        mmpf_mcmc_scratch_free(scratch);
-        mmpf_mcmc_scratch_alloc(scratch, max_particles, MMPF_N_MODELS, n_steps);
+        if (mmpf->mcmc_scratch.rng_gauss)
+        {
+            mkl_free(mmpf->mcmc_scratch.rng_gauss);
+            mkl_free(mmpf->mcmc_scratch.rng_log_u);
+        }
+        int new_cap = (total_rng + 7) & ~7;
+        mmpf->mcmc_scratch.rng_gauss = (double *)mkl_malloc(new_cap * sizeof(double), 64);
+        mmpf->mcmc_scratch.rng_log_u = (double *)mkl_malloc(new_cap * sizeof(double), 64);
+        mmpf->mcmc_scratch.capacity = new_cap;
     }
 
-    double *rng_gauss = scratch->rng_gauss;
-    double *rng_log_u = scratch->rng_log_u;
+    double *rng_gauss = mmpf->mcmc_scratch.rng_gauss;
+    double *rng_log_u = mmpf->mcmc_scratch.rng_log_u;
 
     /* Use VSL stream from MMPF (or create temp if not available) */
-    VSLStreamStatePtr vsl_stream = mmpf->mcmc_vsl_stream;
+    VSLStreamStatePtr vsl_stream = (VSLStreamStatePtr)mmpf->mcmc_vsl_stream;
     int own_stream = 0;
 
     if (!vsl_stream)
@@ -441,7 +360,7 @@ static void mcmc_avx_mkl(MMPF_ROCKS *mmpf, double y_log_sq,
     }
 }
 
-#endif /* __AVX2__ && HAS_MKL */
+#endif /* __AVX2__ */
 
 /*═══════════════════════════════════════════════════════════════════════════
  * PUBLIC API
@@ -489,7 +408,7 @@ void mmpf_inject_shock_mcmc_avx(MMPF_ROCKS *mmpf, double y_log_sq,
         cfg = &default_cfg;
     }
 
-#if defined(__AVX2__) && HAS_MKL
+#ifdef __AVX2__
     mcmc_avx_mkl(mmpf, y_log_sq, cfg);
 #else
     /* Fall back to scalar */
@@ -519,13 +438,29 @@ void mmpf_inject_shock_mcmc_avx(MMPF_ROCKS *mmpf, double y_log_sq,
 
 void mmpf_mcmc_get_stats(const MMPF_ROCKS *mmpf, MMPF_MCMC_Stats *stats)
 {
-    /* TODO: Implement statistics tracking */
-    memset(stats, 0, sizeof(MMPF_MCMC_Stats));
-    (void)mmpf;
+    if (!mmpf || !stats)
+        return;
+
+    /* Copy field by field to avoid type mismatch */
+    stats->total_shocks = mmpf->mcmc_stats.total_shocks;
+    stats->total_proposals = mmpf->mcmc_stats.total_proposals;
+    stats->total_accepts = mmpf->mcmc_stats.total_accepts;
+    stats->avg_acceptance = mmpf->mcmc_stats.avg_acceptance;
+    stats->last_pre_mean = mmpf->mcmc_stats.last_pre_mean;
+    stats->last_post_mean = mmpf->mcmc_stats.last_post_mean;
+    stats->last_teleport = mmpf->mcmc_stats.last_teleport;
 }
 
 void mmpf_mcmc_reset_stats(MMPF_ROCKS *mmpf)
 {
-    /* TODO: Implement statistics reset */
-    (void)mmpf;
+    if (!mmpf)
+        return;
+
+    mmpf->mcmc_stats.total_shocks = 0;
+    mmpf->mcmc_stats.total_proposals = 0;
+    mmpf->mcmc_stats.total_accepts = 0;
+    mmpf->mcmc_stats.avg_acceptance = 0.0;
+    mmpf->mcmc_stats.last_pre_mean = 0.0;
+    mmpf->mcmc_stats.last_post_mean = 0.0;
+    mmpf->mcmc_stats.last_teleport = 0.0;
 }

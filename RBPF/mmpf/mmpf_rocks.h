@@ -511,9 +511,8 @@ extern "C"
          *   - Entropy: Detects filter stability (triggers shock exit)
          *═══════════════════════════════════════════════════════════════════════*/
 
-        /* MCMC scratch buffers (pre-allocated for zero-alloc hot path)
-         * Must match MMPF_MCMC_Scratch layout in mmpf_mcmc.h */
-        struct
+        /* MCMC scratch buffers (pre-allocated for zero-alloc hot path) */
+        struct MMPF_MCMC_Scratch_t
         {
             double *rng_gauss; /* Gaussian proposals: n_particles × n_steps */
             double *rng_log_u; /* log(uniform) for acceptance */
@@ -522,8 +521,8 @@ extern "C"
 
         void *mcmc_vsl_stream; /* VSLStreamStatePtr for MKL RNG */
 
-        /* MCMC diagnostic statistics (matches MMPF_MCMC_Stats in mmpf_mcmc.h) */
-        struct
+        /* MCMC diagnostic statistics */
+        struct MMPF_MCMC_Stats_t
         {
             int total_shocks;
             int total_proposals;

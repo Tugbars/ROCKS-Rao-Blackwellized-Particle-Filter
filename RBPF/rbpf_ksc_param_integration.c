@@ -561,15 +561,8 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     }
 
     /* Configure per-particle parameter mode (Option B) */
-    if (mode == RBPF_PARAM_STORVIK)
-    {
-        ext->rbpf->use_learned_params = 1;
-        /* liu_west.enabled stays 0 */
-    }
-    else if (mode == RBPF_PARAM_LIU_WEST || mode == RBPF_PARAM_HYBRID)
-    {
-        rbpf_ksc_enable_liu_west(ext->rbpf, 0.98f, 100);
-    }
+    ext->rbpf->use_learned_params = 1;
+
 
     /* Initialize Hawkes (disabled by default) */
     ext->hawkes.enabled = 0;
@@ -1587,17 +1580,12 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
                                     &output->learned_mu_vol[r],
                                     &output->learned_sigma_vol[r]);
     }
-    
-    /* Liu-West tick counter */
-    if (rbpf->liu_west.enabled) {
-        rbpf->liu_west.tick_count++;
-    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
  * APF STEP - OPTIMIZED
  *═══════════════════════════════════════════════════════════════════════════*/
-
+/*
 void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
                        rbpf_real_t obs_next, RBPF_KSC_Output *output)
 {
@@ -1608,20 +1596,19 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
     const int n = rbpf->n_particles;
     const int n_regimes = rbpf->n_regimes;
 
-    /* STEP 0: Structural break */
+    
     if (ext->structural_break_signaled && ext->storvik_initialized)
     {
         param_learn_signal_structural_break(&ext->storvik);
         ext->structural_break_signaled = 0;
     }
 
-    /* STEP 1: APF step with index output */
+
     int resample_indices[2048];
     int *indices = (n <= 2048) ? resample_indices : (int *)malloc(n * sizeof(int));
 
     rbpf_ksc_step_apf_indexed(rbpf, obs_current, obs_next, output, indices);
 
-    /* STEP 2: Storvik update */
     if (ext->storvik_initialized)
     {
         if (output->resampled)
@@ -1632,7 +1619,6 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
         extract_particle_info_optimized(ext, output->resampled);
         param_learn_update(&ext->storvik, ext->particle_info, n);
 
-        /* Also resample RBPF per-particle param arrays */
         if (output->resampled && rbpf->particle_mu_vol && rbpf->particle_sigma_vol)
         {
             const int total = n * n_regimes;
@@ -1669,7 +1655,6 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
         }
     }
 
-    /* STEP 3: Transition learning */
     if (ext->trans_learn_enabled)
     {
         update_transition_counts_optimized(ext);
@@ -1681,13 +1666,12 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
         }
     }
 
-    /* STEP 4: Lag buffers */
+
     update_lag_buffers(ext);
 
-    /* STEP 5: Sync params */
+
     sync_storvik_to_rbpf_optimized(ext);
 
-    /* STEP 6: Output */
     for (int r = 0; r < n_regimes; r++)
     {
         rbpf_ext_get_learned_params(ext, r,
@@ -1697,6 +1681,15 @@ void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
 
     if (n > 2048)
         free(indices);
+}
+*/
+
+void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
+                       rbpf_real_t obs_next, RBPF_KSC_Output *output)
+{
+    /* APF disabled - fallback to standard step */
+    rbpf_ext_step(ext, obs_current, output);
+    (void)obs_next;  /* Unused in fallback */
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -1737,9 +1730,6 @@ void rbpf_ext_get_learned_params(const RBPF_Extended *ext, int regime,
         }
         break;
 
-    case RBPF_PARAM_LIU_WEST:
-        rbpf_ksc_get_learned_params(ext->rbpf, regime, mu_vol, sigma_vol);
-        break;
 
     default:
         if (mu_vol)

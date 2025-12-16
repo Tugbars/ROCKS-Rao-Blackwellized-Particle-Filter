@@ -165,16 +165,6 @@ extern "C"
      *═══════════════════════════════════════════════════════════════════════════*/
 
     /**
-     * @brief MCMC scratch buffers (avoid malloc in hot path)
-     */
-    typedef struct
-    {
-        double *rng_gauss; /**< Gaussian proposals: n_particles × n_steps */
-        double *rng_log_u; /**< log(uniform) for acceptance: same size */
-        int capacity;      /**< Current buffer capacity */
-    } MMPF_MCMC_Scratch;
-
-    /**
      * @brief Initialize MCMC subsystem for an MMPF instance
      *
      * Call once at MMPF creation. Pre-allocates scratch buffers.
@@ -192,24 +182,6 @@ extern "C"
      * Call at MMPF destruction.
      */
     void mmpf_mcmc_destroy(MMPF_ROCKS *mmpf);
-
-    /**
-     * @brief Allocate MCMC scratch buffers (standalone)
-     *
-     * Use if you want to manage scratch separately from MMPF.
-     *
-     * @param scratch   Scratch struct to initialize
-     * @param n_part    Number of particles per model
-     * @param n_models  Number of models
-     * @param n_steps   MCMC steps per shock
-     */
-    void mmpf_mcmc_scratch_alloc(MMPF_MCMC_Scratch *scratch,
-                                 int n_part, int n_models, int n_steps);
-
-    /**
-     * @brief Free MCMC scratch buffers
-     */
-    void mmpf_mcmc_scratch_free(MMPF_MCMC_Scratch *scratch);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * LIKELIHOOD EVALUATION
