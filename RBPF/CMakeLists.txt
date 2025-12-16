@@ -240,6 +240,37 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_bocpd_mmpf PRIVATE ${COMMON_DEFS})
     endif()
 
+    #───────────────────────────────────────────────────────────────────────────
+    # MMPF Parameter Tuners
+    #───────────────────────────────────────────────────────────────────────────
+
+    # MMPF Stage 1 Tuner (Static parameters: swim lanes, ν, stickiness)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_tuner.c)
+        add_executable(mmpf_tuner
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_tuner.c
+        )
+        target_link_libraries(mmpf_tuner PRIVATE rocks)
+        target_compile_options(mmpf_tuner PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(mmpf_tuner PRIVATE ${COMMON_DEFS})
+    endif()
+
+    # MMPF Stage 2 Tuner (BOCPD integration: thresholds, shock params)
+    #if(RBPF_ENABLE_STORVIK AND TARGET bocpd AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_tuner_stage2.c)
+    #    add_executable(mmpf_tuner_stage2
+           # ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_tuner_stage2.c
+     #   )
+     #   target_link_libraries(mmpf_tuner_stage2 PRIVATE rocks bocpd)
+     #   if(NOT WIN32)
+    #        target_link_libraries(mmpf_tuner_stage2 PRIVATE m)
+    #    endif()
+    #    target_include_directories(mmpf_tuner_stage2 PRIVATE 
+    #        ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
+    #        ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
+    #    )
+    #    target_compile_options(mmpf_tuner_stage2 PRIVATE ${COMMON_FLAGS})
+    #    target_compile_definitions(mmpf_tuner_stage2 PRIVATE ${COMMON_DEFS})
+    #endif()
+
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
         add_executable(example_usage
