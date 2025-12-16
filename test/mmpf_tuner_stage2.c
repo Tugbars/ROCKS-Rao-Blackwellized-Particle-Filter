@@ -271,160 +271,9 @@ typedef struct {
 } TuningMetrics;
 
 /*═══════════════════════════════════════════════════════════════════════════
- * SIMPLE BOCPD IMPLEMENTATION (Inline for tuner)
- * 
- * Replace with your actual BOCPD if you have one.
+ * SHOCK INJECTION: Uses mmpf_inject_shock() and mmpf_restore_from_shock() 
+ * from mmpf_rocks.h
  *═══════════════════════════════════════════════════════════════════════════*/
-
-typedef struct {
-    double *r;          /* Run length probabilities */
-    int max_run;        /* Maximum run length tracked */
-    double hazard;      /* Constant hazard rate */
-    double mu0;         /* Prior mean */
-    double kappa0;      /* Prior precision (observations) */
-    double alpha0;      /* Prior shape */
-    double beta0;       /* Prior scale */
-    
-    /* Sufficient statistics per run length */
-    double *sum_x;
-    double *sum_x2;
-    double *count;
-} SimpleBOCPD;
-
-static void bocpd_init(SimpleBOCPD *b, int max_run, double hazard) {
-    b->max_run = max_run;
-    b->hazard = hazard;
-    b->mu0 = 0.0;
-    b->kappa0 = 1.0;
-    b->alpha0 = 1.0;
-    b->beta0 = 0.01;
-    
-    b->r = (double*)calloc(max_run, sizeof(double));
-    b->sum_x = (double*)calloc(max_run, sizeof(double));
-    b->sum_x2 = (double*)calloc(max_run, sizeof(double));
-    b->count = (double*)calloc(max_run, sizeof(double));
-    
-    b->r[0] = 1.0;
-}
-
-static void bocpd_free(SimpleBOCPD *b) {
-    free(b->r);
-    free(b->sum_x);
-    free(b->sum_x2);
-    free(b->count);
-}
-
-static double student_t_pdf(double x, double mu, double sigma, double nu) {
-    double z = (x - mu) / sigma;
-    double coeff = tgamma((nu + 1.0) / 2.0) / (tgamma(nu / 2.0) * sqrt(nu * 3.14159265358979) * sigma);
-    return coeff * pow(1.0 + z * z / nu, -(nu + 1.0) / 2.0);
-}
-
-static void bocpd_step(SimpleBOCPD *b, double x) {
-    int max_run = b->max_run;
-    double *r_new = (double*)calloc(max_run, sizeof(double));
-    
-    /* Compute predictive probabilities for each run length */
-    double *pred = (double*)malloc(max_run * sizeof(double));
-    for (int i = 0; i < max_run; i++) {
-        if (b->r[i] < 1e-10) {
-            pred[i] = 1e-10;
-            continue;
-        }
-        
-        /* Posterior parameters */
-        double n = b->count[i];
-        double kappa_n = b->kappa0 + n;
-        double alpha_n = b->alpha0 + n / 2.0;
-        double mu_n = (b->kappa0 * b->mu0 + b->sum_x[i]) / kappa_n;
-        double beta_n = b->beta0 + 0.5 * b->sum_x2[i] + 
-                       0.5 * b->kappa0 * b->mu0 * b->mu0 -
-                       0.5 * kappa_n * mu_n * mu_n;
-        if (beta_n < 1e-10) beta_n = 1e-10;
-        
-        /* Predictive distribution is Student-t */
-        double nu = 2.0 * alpha_n;
-        double sigma = sqrt(beta_n * (kappa_n + 1.0) / (alpha_n * kappa_n));
-        
-        pred[i] = student_t_pdf(x, mu_n, sigma, nu);
-    }
-    
-    /* Growth probabilities */
-    for (int i = 0; i < max_run - 1; i++) {
-        r_new[i + 1] = b->r[i] * pred[i] * (1.0 - b->hazard);
-    }
-    
-    /* Changepoint probability */
-    double cp_mass = 0.0;
-    for (int i = 0; i < max_run; i++) {
-        cp_mass += b->r[i] * pred[i] * b->hazard;
-    }
-    r_new[0] = cp_mass;
-    
-    /* Normalize */
-    double sum = 0.0;
-    for (int i = 0; i < max_run; i++) sum += r_new[i];
-    if (sum > 1e-10) {
-        for (int i = 0; i < max_run; i++) r_new[i] /= sum;
-    } else {
-        r_new[0] = 1.0;
-    }
-    
-    /* Update sufficient statistics */
-    double *new_sum_x = (double*)calloc(max_run, sizeof(double));
-    double *new_sum_x2 = (double*)calloc(max_run, sizeof(double));
-    double *new_count = (double*)calloc(max_run, sizeof(double));
-    
-    /* Run length 0: reset */
-    new_sum_x[0] = x;
-    new_sum_x2[0] = x * x;
-    new_count[0] = 1.0;
-    
-    /* Run length > 0: grow */
-    for (int i = 1; i < max_run; i++) {
-        new_sum_x[i] = b->sum_x[i-1] + x;
-        new_sum_x2[i] = b->sum_x2[i-1] + x * x;
-        new_count[i] = b->count[i-1] + 1.0;
-    }
-    
-    /* Swap */
-    memcpy(b->r, r_new, max_run * sizeof(double));
-    memcpy(b->sum_x, new_sum_x, max_run * sizeof(double));
-    memcpy(b->sum_x2, new_sum_x2, max_run * sizeof(double));
-    memcpy(b->count, new_count, max_run * sizeof(double));
-    
-    free(r_new);
-    free(pred);
-    free(new_sum_x);
-    free(new_sum_x2);
-    free(new_count);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * SHOCK INJECTION (Temporary implementation)
- *═══════════════════════════════════════════════════════════════════════════*/
-
-static void mmpf_inject_shock(MMPF_ROCKS *mmpf, double multiplier)
-{
-    /* Widen particle spread to explore new regime */
-    /* This is a simplified version - your real implementation may differ */
-    
-    /* Save original transition matrix */
-    /* Temporarily boost crisis entry probability */
-    /* Increase particle variance */
-    
-    (void)mmpf;
-    (void)multiplier;
-    /* TODO: Implement based on your MMPF internals */
-}
-
-static void mmpf_restore_shock(MMPF_ROCKS *mmpf, int lockout_ticks)
-{
-    /* Restore normal dynamics after lockout period */
-    (void)mmpf;
-    (void)lockout_ticks;
-    /* TODO: Implement based on your MMPF internals */
-}
 
 /*═══════════════════════════════════════════════════════════════════════════
  * RUN INTEGRATED CONFIGURATION
@@ -455,9 +304,18 @@ static TuningMetrics run_config(
         return metrics;
     }
     
-    /* Initialize BOCPD */
-    SimpleBOCPD bocpd;
-    bocpd_init(&bocpd, 200, 1.0 / 100.0);  /* hazard = 1/100 */
+    /* Initialize BOCPD with power-law hazard
+     * Prior centered on typical log(r²) ≈ -9 (1% daily vol) */
+    bocpd_t bocpd;
+    bocpd_hazard_t hazard;
+    bocpd_prior_t prior;
+    prior.mu0 = -9.0;     /* E[log(r²)] for ~1% vol */
+    prior.kappa0 = 1.0;   /* Weak prior on mean */
+    prior.alpha0 = 1.0;   /* Weak prior on variance */
+    prior.beta0 = 2.0;    /* Var ≈ 2 for log-chi² noise */
+    
+    bocpd_hazard_init_power_law(&hazard, 0.8, 512);
+    bocpd_init_with_hazard(&bocpd, &hazard, prior);
     
     /* Accumulators */
     double sum_sq_err = 0.0;
@@ -489,6 +347,7 @@ static TuningMetrics run_config(
     
     /* Window for matching BOCPD fires to true shocks */
     const int MATCH_WINDOW = 5;
+    const int WARMUP = 50;  /* Skip first ticks for BOCPD to stabilize */
     
     MMPF_Output output;
     
@@ -497,45 +356,50 @@ static TuningMetrics run_config(
         double true_vol = data->true_vol[t];
         int true_regime = data->true_regime[t];
         int scenario = data->scenario_id[t];
-        int is_true_shock = data->is_shock_tick[t];
+        
+        /* Transform to log(r²) for BOCPD */
+        double y_log = (fabs(r) > 1e-10) ? log(r * r) : -20.0;
         
         /* Step BOCPD */
-        double y_log = (fabs(r) > 1e-10) ? log(r * r) : -20.0;
         bocpd_step(&bocpd, y_log);
         
-        /* Check for shock detection */
+        /* Check for shock detection (after warmup, respecting refractory) */
+        double r0_prob = bocpd.r[0];
+        
         int shock_fired = 0;
-        if (refractory_counter > 0) {
-            refractory_counter--;
-        } else if (bocpd.r[0] > bocpd_r0_thresh) {
-            shock_fired = 1;
-            shock_count++;
-            refractory_counter = bocpd_refractory;
-            
-            /* Check for flicker (rapid successive fires) */
-            if (t - last_shock_tick < 20) {
-                flicker_count++;
-            }
-            last_shock_tick = t;
-            
-            /* Classify as TP or FP */
-            /* Look backward and forward for true shock */
-            int matched = 0;
-            for (int dt = -MATCH_WINDOW; dt <= MATCH_WINDOW; dt++) {
-                int check_t = t + dt;
-                if (check_t >= 0 && check_t < total_ticks && data->is_shock_tick[check_t]) {
-                    matched = 1;
-                    if (n_detections < 1000) {
-                        detection_lags[n_detections++] = (dt >= 0) ? dt : -dt;
-                    }
-                    break;
+        if (t >= WARMUP) {
+            if (refractory_counter > 0) {
+                refractory_counter--;
+            } else if (r0_prob > bocpd_r0_thresh) {
+                shock_fired = 1;
+                shock_count++;
+                refractory_counter = bocpd_refractory;
+                
+                /* Check for flicker (rapid successive fires) */
+                if (t - last_shock_tick < 20) {
+                    flicker_count++;
                 }
-            }
-            
-            if (matched) {
-                true_positives++;
-            } else {
-                false_positives++;
+                last_shock_tick = t;
+                
+                /* Classify as TP or FP */
+                /* Look backward and forward for true shock */
+                int matched = 0;
+                for (int dt = -MATCH_WINDOW; dt <= MATCH_WINDOW; dt++) {
+                    int check_t = t + dt;
+                    if (check_t >= 0 && check_t < total_ticks && data->is_shock_tick[check_t]) {
+                        matched = 1;
+                        if (n_detections < 1000) {
+                            detection_lags[n_detections++] = (dt >= 0) ? dt : -dt;
+                        }
+                        break;
+                    }
+                }
+                
+                if (matched) {
+                    true_positives++;
+                } else {
+                    false_positives++;
+                }
             }
         }
         
@@ -546,11 +410,13 @@ static TuningMetrics run_config(
         
         /* Step MMPF with optional shock injection */
         if (shock_fired && lockout_counter == 0) {
-            mmpf_inject_shock(mmpf, shock_mult);
+            mmpf_inject_shock(mmpf);
+            mmpf_step(mmpf, (rbpf_real_t)r, &output);
+            mmpf_restore_from_shock(mmpf);
             lockout_counter = post_shock_lockout;
+        } else {
+            mmpf_step(mmpf, (rbpf_real_t)r, &output);
         }
-        
-        mmpf_step(mmpf, (rbpf_real_t)r, &output);
         
         /* Vol error */
         double vol_err = output.volatility - true_vol;
@@ -627,6 +493,7 @@ static TuningMetrics run_config(
     /* Cleanup */
     mmpf_destroy(mmpf);
     bocpd_free(&bocpd);
+    bocpd_hazard_free(&hazard);
     
     return metrics;
 }
