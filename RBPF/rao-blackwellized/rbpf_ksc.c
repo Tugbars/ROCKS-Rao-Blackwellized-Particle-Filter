@@ -1038,10 +1038,17 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
 
     if (rbpf->use_silverman_bandwidth && rbpf->silverman_scratch != NULL)
     {
-        /* Silverman adaptive bandwidth - no ESS scaling needed */
-#ifdef RBPF_USE_FLOAT
+        /* Silverman adaptive bandwidth - no ESS scaling needed
+         *
+         * CRITICAL: Must match rbpf_real_t precision!
+         * Default is float (when neither RBPF_USE_FLOAT nor RBPF_USE_DOUBLE defined)
+         * Check for DOUBLE first - if not double, assume float.
+         */
+#ifndef RBPF_USE_DOUBLE
+        /* Single precision (float) - DEFAULT */
         h_mu = rbpf_silverman_bandwidth_f(mu, n, rbpf->silverman_scratch);
 #else
+        /* Double precision */
         h_mu = (rbpf_real_t)rbpf_silverman_bandwidth(
             (const double *)mu, n, (double *)rbpf->silverman_scratch);
 #endif
