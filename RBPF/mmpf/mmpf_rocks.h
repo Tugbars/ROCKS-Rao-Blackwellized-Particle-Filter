@@ -544,6 +544,19 @@ extern "C"
             double alpha;                  /* EMA decay (0.995 = 200 tick half-life) */
             int warmup_ticks;              /* Ticks before output is trusted */
             int tick_count;                /* Current tick */
+
+            /* ═══════════════════════════════════════════════════════════════════
+             * MAP Prior (Bayesian Anchor to prevent mode collapse)
+             *
+             * Instead of pure MLE:  μ = Σ(w·x) / Σw
+             * We use MAP:           μ = (Σ(w·x) + κ·μ_prior) / (Σw + κ)
+             *
+             * This provides a "gravitational anchor" that prevents all models
+             * from collapsing to the same center. The stiffness κ represents
+             * the prior strength in "virtual observations."
+             *═══════════════════════════════════════════════════════════════════*/
+            double mu_prior[MMPF_N_MODELS];  /* Anchor centers (structural identity) */
+            double stiffness[MMPF_N_MODELS]; /* κ: prior strength (virtual observations) */
         } online_em;
 
         /* Entropy state (stability detection for shock exit) */

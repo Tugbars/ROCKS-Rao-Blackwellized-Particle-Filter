@@ -563,17 +563,17 @@ MMPF_Config mmpf_config_defaults(void)
      */
     cfg.hypotheses[MMPF_CALM].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CALM];
     cfg.hypotheses[MMPF_CALM].phi = RBPF_REAL(0.995);      /* Very persistent (slow) */
-    cfg.hypotheses[MMPF_CALM].sigma_eta = RBPF_REAL(0.05); /* Low vol-of-vol */
+    cfg.hypotheses[MMPF_CALM].sigma_eta = RBPF_REAL(0.15); /* Tripled: Allow particles to breathe */
     cfg.hypotheses[MMPF_CALM].nu = cfg.hypothesis_nu[MMPF_CALM];
 
     cfg.hypotheses[MMPF_TREND].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_TREND];
     cfg.hypotheses[MMPF_TREND].phi = RBPF_REAL(0.95);       /* Moderate persistence */
-    cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.15); /* Medium vol-of-vol */
+    cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.25); /* Wider: Better coverage */
     cfg.hypotheses[MMPF_TREND].nu = cfg.hypothesis_nu[MMPF_TREND];
 
     cfg.hypotheses[MMPF_CRISIS].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CRISIS];
     cfg.hypotheses[MMPF_CRISIS].phi = RBPF_REAL(0.85);       /* Fast mean reversion */
-    cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50); /* High vol-of-vol */
+    cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50); /* High vol-of-vol (unchanged) */
     cfg.hypotheses[MMPF_CRISIS].nu = cfg.hypothesis_nu[MMPF_CRISIS];
 
     /* IMM settings - "Switch, Don't Jump" config */
@@ -1128,6 +1128,17 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         mmpf->online_em.warmup_ticks = 50;
         mmpf->online_em.tick_count = 0;
 
+        /* Default stiffness values (κ = prior strength in virtual observations)
+         *
+         * These are "Bungee Cords" not "Anchors" - light enough to let
+         * models adapt quickly to data while preventing total mode collapse.
+         *
+         * κ = 0   → Pure MLE (no anchor, allows mode collapse)
+         * κ = 1-5 → Light anchor (adapts in ~10-50 ticks)
+         * κ = 50+ → Too stiff (locks to prior, can't adapt)
+         */
+        const double default_stiffness[MMPF_N_MODELS] = {5.0, 2.0, 1.0};
+
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
             /* Initialize to CONFIGURED hypothesis centers (not baseline + offsets)
@@ -1137,6 +1148,10 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
             mmpf->online_em.sum_w[k] = 1.0; /* Prevent div-by-zero */
             mmpf->online_em.sum_wx[k] = mmpf->online_em.mu[k];
             mmpf->online_em.sum_wx2[k] = mmpf->online_em.mu[k] * mmpf->online_em.mu[k] + 0.25;
+
+            /* MAP Prior: Anchor to configured centers with per-model stiffness */
+            mmpf->online_em.mu_prior[k] = (double)cfg.hypotheses[k].mu_vol;
+            mmpf->online_em.stiffness[k] = default_stiffness[k];
         }
     }
 
@@ -1528,6 +1543,40 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
 
     /* 2. Compute mixing weights */
     compute_mixing_weights(mmpf);
+
+    /* 2.5 Temperature-Based Weight Sharpening (Entropy Annealing)
+     *
+     * The IMM weights are often "mushy" because overlapping distributions
+     * give partial credit to multiple models. We force a decision by
+     * raising weights to a power (T < 1 sharpens, T > 1 softens).
+     *
+     * Effect: w_k^(1/T) / Σ w_j^(1/T)
+     *   T = 1.0 → No change (standard IMM)
+     *   T = 0.5 → Squaring effect: 0.4 vs 0.35 becomes 0.53 vs 0.38
+     *   T = 0.1 → Aggressive: Winner takes almost all
+     */
+    {
+        const double T = 0.5; /* Temperature < 1.0 sharpens */
+        double sum_w = 0.0;
+
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            mmpf->weights[k] = (rbpf_real_t)pow((double)mmpf->weights[k], 1.0 / T);
+            sum_w += (double)mmpf->weights[k];
+        }
+
+        /* Renormalize */
+        if (sum_w > 1e-30)
+        {
+            rbpf_real_t inv_sum = (rbpf_real_t)(1.0 / sum_w);
+            for (int k = 0; k < MMPF_N_MODELS; k++)
+            {
+                mmpf->weights[k] *= inv_sum;
+                mmpf->log_weights[k] = rbpf_log(mmpf->weights[k]);
+            }
+        }
+    }
+
     compute_mixing_counts(mmpf);
 
     /* 3-5. IMM mixing step */
@@ -1913,11 +1962,25 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 mmpf->online_em.sum_wx[k] = alpha * mmpf->online_em.sum_wx[k] + w_k * x_k;
                 mmpf->online_em.sum_wx2[k] = alpha * mmpf->online_em.sum_wx2[k] + w_k * x_k * x_k;
 
-                /* Update mean and variance */
+                /* Update mean and variance using MAP (Maximum A Posteriori)
+                 *
+                 * MLE (old):  μ = Σ(w·x) / Σw
+                 * MAP (new):  μ = (Σ(w·x) + κ·μ_prior) / (Σw + κ)
+                 *
+                 * The prior acts as a "gravitational anchor" that prevents
+                 * mode collapse by keeping models near their structural identity.
+                 * κ (stiffness) = number of "virtual observations" at the prior.
+                 */
                 double sum_w = mmpf->online_em.sum_w[k];
+                double kappa = mmpf->online_em.stiffness[k];
+                double mu_prior = mmpf->online_em.mu_prior[k];
+
                 if (sum_w > 1e-10)
                 {
-                    double new_mu = mmpf->online_em.sum_wx[k] / sum_w;
+                    /* MAP estimate for mean */
+                    double new_mu = (mmpf->online_em.sum_wx[k] + kappa * mu_prior) / (sum_w + kappa);
+
+                    /* Variance still uses MLE (prior on variance adds complexity) */
                     double new_var = mmpf->online_em.sum_wx2[k] / sum_w - new_mu * new_mu;
                     if (new_var < 0.01)
                         new_var = 0.01;
