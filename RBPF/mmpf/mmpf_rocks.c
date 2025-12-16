@@ -33,6 +33,22 @@
 #include <mkl_vsl.h>
 #endif
 
+/* Cross-platform aligned allocation */
+#ifdef _MSC_VER
+#include <malloc.h>
+#define mmpf_aligned_alloc(alignment, size) _aligned_malloc((size), (alignment))
+#define mmpf_aligned_free(ptr) _aligned_free(ptr)
+#else
+static inline void *mmpf_aligned_alloc(size_t alignment, size_t size)
+{
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0)
+        return NULL;
+    return ptr;
+}
+#define mmpf_aligned_free(ptr) free(ptr)
+#endif
+
 /* SIMD intrinsics for double→float conversion */
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -1077,8 +1093,8 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         int capacity = n_particles * n_mcmc_steps;
 
         mmpf->mcmc_scratch.capacity = capacity;
-        mmpf->mcmc_scratch.rng_gauss = (double *)aligned_alloc(64, capacity * 2 * sizeof(double));
-        mmpf->mcmc_scratch.rng_log_u = (double *)aligned_alloc(64, capacity * sizeof(double));
+        mmpf->mcmc_scratch.rng_gauss = (double *)mmpf_aligned_alloc(64, capacity * 2 * sizeof(double));
+        mmpf->mcmc_scratch.rng_log_u = (double *)mmpf_aligned_alloc(64, capacity * sizeof(double));
 
         if (!mmpf->mcmc_scratch.rng_gauss || !mmpf->mcmc_scratch.rng_log_u)
         {
@@ -1208,9 +1224,9 @@ void mmpf_destroy(MMPF_ROCKS *mmpf)
 
     /* Free MCMC scratch buffers */
     if (mmpf->mcmc_scratch.rng_gauss)
-        free(mmpf->mcmc_scratch.rng_gauss);
+        mmpf_aligned_free(mmpf->mcmc_scratch.rng_gauss);
     if (mmpf->mcmc_scratch.rng_log_u)
-        free(mmpf->mcmc_scratch.rng_log_u);
+        mmpf_aligned_free(mmpf->mcmc_scratch.rng_log_u);
 
 #ifdef MMPF_USE_MKL
     if (mmpf->mcmc_vsl_stream)

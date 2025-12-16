@@ -884,6 +884,15 @@ typedef float rbpf_real_t;
     void rbpf_ksc_enable_student_t(RBPF_KSC *rbpf, rbpf_real_t nu);
 
     /**
+     * Allocate Student-t arrays (lambda, etc.)
+     * Called internally by rbpf_ksc_create when RBPF_ENABLE_STUDENT_T is set.
+     *
+     * @param rbpf     RBPF instance
+     * @return         0 on success, -1 on allocation failure
+     */
+    int rbpf_ksc_alloc_student_t(RBPF_KSC *rbpf);
+
+    /**
      * Disable Student-t, revert to Gaussian observations
      */
     void rbpf_ksc_disable_student_t(RBPF_KSC *rbpf);

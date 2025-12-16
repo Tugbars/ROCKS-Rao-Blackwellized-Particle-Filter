@@ -23,8 +23,8 @@ set(ROCKS_SOURCES
     rao-blackwellized/rbpf_silverman.c
     rao-blackwellized/rbpf_sprt.c
     
-    # Auxiliary particle filter
-    apf/rbpf_apf.c
+    # DISABLED: APF needs Liu-West removal
+    # apf/rbpf_apf.c
 )
 
 # Add Storvik parameter learning and related modules if enabled
@@ -37,8 +37,8 @@ if(RBPF_ENABLE_STORVIK)
         # Robust OCSN likelihood
         ocsn/rbpf_ocsn_robust.c
         
-        # Integration layer
-        rbpf_ksc_param_integration.c
+        # DISABLED: Integration layer needs Liu-West removal
+        # rbpf_ksc_param_integration.c
         
         # Tuner
         tuner/rbpf_tuner.c
