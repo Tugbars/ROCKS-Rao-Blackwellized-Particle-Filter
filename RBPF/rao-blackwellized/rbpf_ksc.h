@@ -440,7 +440,11 @@ typedef float rbpf_real_t;
     } RBPF_SmoothEntry;
 
     /**
-     * Self-aware detection state (no external model needed)
+     * Self-aware detection state
+     *
+     * Two modes:
+     * 1. SPRT (default): Statistical regime switching via Sequential Probability Ratio Test
+     * 2. Counter (legacy): Hysteresis-based smoothing
      */
     typedef struct
     {
@@ -449,7 +453,21 @@ typedef float rbpf_real_t;
         int prev_regime;           /* For structural change detection */
         int cooldown;              /* Ticks since last detection */
 
-        /* Regime smoothing (hysteresis to prevent flickering) */
+        /* SPRT-based regime detection (preferred)
+         * Uses log-likelihood ratios for statistically principled switching.
+         * Error rates (alpha, beta) control false positive/negative tradeoff.
+         */
+        int use_sprt;                             /* 1 = SPRT, 0 = counter */
+        double sprt_log_ratios[RBPF_MAX_REGIMES]; /* Cumulative log-LR vs current */
+        double sprt_threshold_high;               /* Accept H1 threshold: log((1-β)/α) */
+        double sprt_threshold_low;                /* Accept H0 threshold: log(β/(1-α)) */
+        int sprt_current_regime;                  /* SPRT-confirmed regime */
+        int sprt_min_dwell;                       /* Min ticks before switch allowed */
+        int sprt_ticks_in_current;                /* Ticks since last switch */
+
+        /* Counter-based smoothing (legacy fallback)
+         * Kept for backward compatibility. Use SPRT for new code.
+         */
         int stable_regime;          /* Smoothed regime output */
         int candidate_regime;       /* Current candidate for new stable regime */
         int hold_count;             /* Ticks candidate has been dominant */
@@ -820,8 +838,28 @@ typedef float rbpf_real_t;
 
     /* Regime smoothing: prevent regime flickering with hysteresis
      * hold_threshold: ticks new regime must hold before switching (default: 5)
-     * prob_threshold: probability for immediate switch (default: 0.7) */
+     * prob_threshold: probability for immediate switch (default: 0.7)
+     * NOTE: This is legacy counter-based smoothing. Use SPRT for new code. */
     void rbpf_ksc_set_regime_smoothing(RBPF_KSC *rbpf, int hold_threshold, rbpf_real_t prob_threshold);
+
+    /* SPRT regime detection: statistically principled switching
+     * Uses Sequential Probability Ratio Test (Wald's optimal stopping).
+     * Default: enabled with α=β=0.01 (1% error rates).
+     *
+     * enable: 1 = SPRT (recommended), 0 = counter-based (legacy) */
+    void rbpf_ksc_set_sprt_detection(RBPF_KSC *rbpf, int enable);
+
+    /* Configure SPRT parameters
+     * alpha: Type I error rate (false positive), typically 0.01-0.05
+     * beta:  Type II error rate (false negative), typically 0.01-0.05
+     * min_dwell: Minimum ticks before allowing regime switch (default: 3)
+     *
+     * Lower α, β → more samples needed → fewer errors
+     * Higher α, β → faster decisions → more errors */
+    void rbpf_ksc_set_sprt_params(RBPF_KSC *rbpf, double alpha, double beta, int min_dwell);
+
+    /* Reset SPRT state (call after external shock injection) */
+    void rbpf_ksc_reset_sprt(RBPF_KSC *rbpf);
 
     /* Fixed-lag smoothing: dual output for HFT
      * lag: number of ticks delay for smooth signal (0 to disable, max RBPF_MAX_SMOOTH_LAG)
