@@ -69,7 +69,6 @@ extern "C"
 {
 #endif
 
-
     /*═══════════════════════════════════════════════════════════════════════════
      * STUDENT-T COMPILE-TIME SWITCH
      *
@@ -81,7 +80,6 @@ extern "C"
 #ifndef RBPF_ENABLE_STUDENT_T
 #define RBPF_ENABLE_STUDENT_T 1 /* 1 = Student-t enabled, 0 = Gaussian only */
 #endif
-
 
     /*─────────────────────────────────────────────────────────────────────────────
      * CONFIGURATION
@@ -126,7 +124,7 @@ extern "C"
 #define RBPF_MKL_BLOCK_SIZE 2048
 #endif
 
-#define RBPF_MKL_N_COMPONENTS_TOTAL 11  /* 10 KSC + 1 outlier */
+#define RBPF_MKL_N_COMPONENTS_TOTAL 11 /* 10 KSC + 1 outlier */
 
     /*─────────────────────────────────────────────────────────────────────────────
      * PORTABLE SIMD HINTS
@@ -561,18 +559,18 @@ typedef float rbpf_real_t;
 
     typedef struct
     {
-        void   *ptr_block;        /**< Base pointer (single mkl_malloc) */
-        size_t  capacity_bytes;   /**< Allocated size */
-        
+        void *ptr_block;       /**< Base pointer (single mkl_malloc) */
+        size_t capacity_bytes; /**< Allocated size */
+
         /* Aliased pointers into ptr_block (do NOT free individually) */
-        double *S_all;            /**< Innovation variance: block × 11 */
-        double *log_S_all;        /**< log(S): block × 11 */
-        double *innov_all;        /**< Innovations: block × 11 */
-        double *log_lik_all;      /**< Log-likelihoods: block × 11 */
-        double *lik_all;          /**< Likelihoods (exp): block × 11 */
-        double *mu_post_all;      /**< Posterior means: block × 11 */
-        double *var_post_all;     /**< Posterior variances: block × 11 */
-        double *max_log_lik;      /**< Max log-lik per particle: block */
+        double *S_all;        /**< Innovation variance: block × 11 */
+        double *log_S_all;    /**< log(S): block × 11 */
+        double *innov_all;    /**< Innovations: block × 11 */
+        double *log_lik_all;  /**< Log-likelihoods: block × 11 */
+        double *lik_all;      /**< Likelihoods (exp): block × 11 */
+        double *mu_post_all;  /**< Posterior means: block × 11 */
+        double *var_post_all; /**< Posterior variances: block × 11 */
+        double *max_log_lik;  /**< Max log-lik per particle: block */
     } RBPF_MKL_Workspace;
 
     /**
@@ -671,6 +669,11 @@ typedef float rbpf_real_t;
         rbpf_real_t reg_scale_max;
         rbpf_real_t last_ess;
 
+        /* Silverman adaptive bandwidth */
+        rbpf_real_t *silverman_scratch;       /* [n] scratch buffer for IQR computation */
+        int use_silverman_bandwidth;          /* 1 = Silverman adaptive, 0 = fixed */
+        rbpf_real_t last_silverman_bandwidth; /* Diagnostic: last computed bandwidth */
+
         /* Regime diversity preservation (prevents particle collapse to single regime) */
         int min_particles_per_regime;     /* Minimum particles guaranteed per regime */
         rbpf_real_t regime_mutation_prob; /* Probability of random regime mutation [0, 0.1] */
@@ -707,7 +710,7 @@ typedef float rbpf_real_t;
         /*========================================================================
          * MKL OPTIMIZATION WORKSPACE
          *======================================================================*/
-        RBPF_MKL_Workspace mkl_workspace;  /**< Scratch buffers for batched MKL ops */
+        RBPF_MKL_Workspace mkl_workspace; /**< Scratch buffers for batched MKL ops */
 
         /*========================================================================
          * PRECOMPUTED
@@ -803,6 +806,12 @@ typedef float rbpf_real_t;
                                     rbpf_real_t theta, rbpf_real_t mu_vol, rbpf_real_t sigma_vol);
     void rbpf_ksc_build_transition_lut(RBPF_KSC *rbpf, const rbpf_real_t *trans_matrix);
     void rbpf_ksc_set_regularization(RBPF_KSC *rbpf, rbpf_real_t h_mu, rbpf_real_t h_var);
+
+    /* Silverman adaptive bandwidth: density-based jitter
+     * enable: 1 = use Silverman's Rule, 0 = use fixed bandwidth
+     * Default is enabled. Silverman adapts jitter to particle distribution. */
+    void rbpf_ksc_set_silverman_bandwidth(RBPF_KSC *rbpf, int enable);
+    rbpf_real_t rbpf_ksc_get_last_silverman_bandwidth(const RBPF_KSC *rbpf);
 
     /* Regime diversity: prevent particle collapse to single regime
      * min_per_regime: minimum particles per regime (0 to disable)
