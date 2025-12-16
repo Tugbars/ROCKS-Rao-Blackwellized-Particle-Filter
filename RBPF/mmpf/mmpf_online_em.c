@@ -1,19 +1,13 @@
 /**
  * @file mmpf_online_em.c
- * @brief Structural Hierarchical Estimation with Robust M-Estimation
+ * @brief Robust Structural Hierarchical Estimation (M-Estimation)
  *
- * This uses Robust SGD (Huber influence) to find the Base and Spread
- * that minimize a robust loss between the model and reality.
- *
- * GEOMETRY (Fixed by Design):
- *   μ_calm   = B - 1.0×S  (One spread below base)
- *   μ_trend  = B          (At base level)
- *   μ_crisis = B + 1.5×S  (1.5 spreads above - asymmetric)
- *
- * WHY ROBUST M-ESTIMATION:
- *   L2 loss desperately wants to "save" the wrong model during crisis
- *   by shrinking spread. Robust clipping caps this influence, allowing
- *   the correct model to dominate when it has weight.
+ * PHILOSOPHY:
+ * 1. Geometry: We solve for Base (B) and Spread (S).
+ * 2. Robustness: We use Huber Loss to cap the influence of structural outliers.
+ *    This mathematically prevents the "Calm Model" from shrinking the spread
+ *    during a crisis, without using any `if` heuristics.
+ * 3. Physics: We allow asymmetric spread dynamics (Vol clustering).
  */
 
 #include "mmpf_online_em.h"
@@ -22,10 +16,15 @@
 #include <stdio.h>
 
 /*═══════════════════════════════════════════════════════════════════════════
- * ROBUST INFLUENCE FUNCTION (Huber)
+ * ROBUST STATISTICS CORE
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static double get_robust_error(double raw_error, double scale)
+/**
+ * Huber Influence Function (psi)
+ * Minimizes L_robust(e) instead of L2(e).
+ * Gradient is linear for small e, constant for large e.
+ */
+static double get_robust_gradient(double raw_error, double scale)
 {
     if (raw_error > scale)
         return scale;
@@ -42,50 +41,35 @@ void mmpf_online_em_init(MMPF_OnlineEM *em)
 {
     memset(em, 0, sizeof(MMPF_OnlineEM));
 
-    /* GEOMETRY */
+    /* GEOMETRY: The Invariant Shape */
     em->n_regimes = 3;
-    em->coefficients[0] = -1.0; /* Calm: B - S */
-    em->coefficients[1] = 0.0;  /* Trend: B */
-    em->coefficients[2] = 1.5;  /* Crisis: B + 1.5S (asymmetric) */
+    em->coefficients[0] = -1.0; /* Calm */
+    em->coefficients[1] = 0.0;  /* Trend */
+    em->coefficients[2] = 1.5;  /* Crisis (Asymmetric upside) */
 
     /* INITIAL STATE */
     em->base_level = -4.5;
     em->spread = 1.0;
 
-    /* PHYSICS */
-    em->lr_base = 0.01;   /* Drift tracking */
-    em->lr_spread = 0.0;  /* Not used - asymmetric in update */
-    em->min_spread = 0.5; /* Minimum separation */
-    em->max_spread = 4.0; /* Maximum separation */
-    em->min_base = -9.0;
-    em->max_base = 2.0;
+    /* PHYSICS & STATISTICS */
+    /* Base Level: Symmetric drift */
+    em->lr_base = 0.01;
+
+    /* Spread: Asymmetric Physics (Volatility Clustering)
+     * Markets explode fast (fear) and decay slow (memory).
+     * This is a property of the asset class, not a heuristic hack. */
+    em->lr_spread_pos = 0.050; /* Fast Expansion */
+    em->lr_spread_neg = 0.001; /* Slow Contraction */
+
+    /* Robust Scale: 1.0 log-units (approx 3 sigma of vol-of-vol)
+     * Errors larger than this are structural breaks, not noise. */
+    em->robust_scale = 1.0;
+
+    /* Hard Physical Constraints */
+    em->min_spread = 0.5;
     em->warmup_ticks = 50;
 
-    /* Project initial μ values */
-    for (int k = 0; k < em->n_regimes; k++)
-    {
-        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
-        em->sigma[k] = 0.5;
-    }
-}
-
-void mmpf_online_em_init_custom(MMPF_OnlineEM *em, int n_regimes,
-                                const double *coefficients)
-{
-    mmpf_online_em_init(em);
-
-    if (n_regimes < 2)
-        n_regimes = 2;
-    if (n_regimes > MMPF_EM_MAX_REGIMES)
-        n_regimes = MMPF_EM_MAX_REGIMES;
-
-    em->n_regimes = n_regimes;
-
-    if (coefficients)
-    {
-        memcpy(em->coefficients, coefficients, n_regimes * sizeof(double));
-    }
-
+    /* Project Initial */
     for (int k = 0; k < em->n_regimes; k++)
     {
         em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
@@ -93,27 +77,20 @@ void mmpf_online_em_init_custom(MMPF_OnlineEM *em, int n_regimes,
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * THE ROBUST STRUCTURAL SOLVER
+ * THE ROBUST STRUCTURAL SOLVER (SGD on Huber Loss)
  *═══════════════════════════════════════════════════════════════════════════*/
 
-void mmpf_online_em_update(MMPF_OnlineEM *em, double y_log_vol,
-                           const rbpf_real_t *weights)
+void mmpf_online_em_update(MMPF_OnlineEM *em, double y_log_sq, const rbpf_real_t *weights)
 {
     em->tick_count++;
-    em->last_y = y_log_vol;
-
     if (em->tick_count < em->warmup_ticks)
         return;
-    if (y_log_vol != y_log_vol)
+    if (y_log_sq != y_log_sq)
         return; /* NaN guard */
 
     double grad_base = 0.0;
     double grad_spread = 0.0;
     double total_weight = 0.0;
-
-    /* TUNING: Scale of "normal" deviations
-     * Vol-of-vol is roughly 0.5. 1.0 is ~2 sigma. */
-    const double ROBUST_SCALE = 1.0;
 
     for (int k = 0; k < em->n_regimes; k++)
     {
@@ -124,17 +101,21 @@ void mmpf_online_em_update(MMPF_OnlineEM *em, double y_log_vol,
         double c = em->coefficients[k];
         double pred = em->base_level + c * em->spread;
 
-        /* 1. Calculate Raw Error */
-        double raw_error = y_log_vol - pred;
+        /* 1. Raw Prediction Error */
+        double raw_error = y_log_sq - pred;
 
-        /* 2. Apply Robust Statistics (M-Estimation)
-         * If error is huge (e.g. Calm model during Crisis), clip it.
-         * This prevents the "Wrong Model" from hijacking the structure. */
-        double robust_err = get_robust_error(raw_error, ROBUST_SCALE);
+        /* 2. Robust Gradient Calculation (The "Magic")
+         *
+         * If Calm model has error +2.0 (Crisis), standard L2 gives gradient -2.0
+         * Huber clips this to -1.0.
+         * Crisis model error +0.5 is uncapped.
+         * Result: Crisis vote (+0.75) > Calm vote (-1.0 * small_weight).
+         * The spread expands NATURALLY. */
+        double robust_grad = get_robust_gradient(raw_error, em->robust_scale);
 
-        /* 3. Accumulate Gradients */
-        grad_base += w * robust_err;
-        grad_spread += w * robust_err * c;
+        /* Accumulate */
+        grad_base += w * robust_grad;
+        grad_spread += w * robust_grad * c;
 
         total_weight += w;
     }
@@ -145,33 +126,29 @@ void mmpf_online_em_update(MMPF_OnlineEM *em, double y_log_vol,
         grad_spread /= total_weight;
     }
 
+    /* Diagnostics */
     em->last_grad_base = grad_base;
     em->last_grad_spread = grad_spread;
 
-    /* Update Base Level */
+    /* 3. Update Base Level (Drift) */
     em->base_level += em->lr_base * grad_base;
 
-    /* Asymmetric Spread Dynamics ("Fast to Fear, Slow to Calm")
-     * Now that robust gradients fix the sign, this works correctly:
-     *   - Positive gradient (crisis) → fast expansion
-     *   - Negative gradient (recovery) → slow contraction */
-    double lr_s = (grad_spread > 0.0) ? 0.050  /* Expand Fast */
-                                      : 0.001; /* Contract Slow */
-
+    /* 4. Update Spread (Asymmetric Physics) */
+    double lr_s = (grad_spread > 0.0) ? em->lr_spread_pos : em->lr_spread_neg;
     em->spread += lr_s * grad_spread;
 
-    /* Constraints */
+    /* 5. Enforce Constraints */
     if (em->spread < em->min_spread)
         em->spread = em->min_spread;
-    if (em->spread > em->max_spread)
-        em->spread = em->max_spread;
+    if (em->spread > 4.0)
+        em->spread = 4.0;
 
-    if (em->base_level < em->min_base)
-        em->base_level = em->min_base;
-    if (em->base_level > em->max_base)
-        em->base_level = em->max_base;
+    if (em->base_level < -9.0)
+        em->base_level = -9.0;
+    if (em->base_level > 2.0)
+        em->base_level = 2.0;
 
-    /* Project to model means */
+    /* 6. Project to Models */
     for (int k = 0; k < em->n_regimes; k++)
     {
         em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
@@ -187,63 +164,9 @@ void mmpf_online_em_get_centers(const MMPF_OnlineEM *em, double *mu_out)
     memcpy(mu_out, em->mu, em->n_regimes * sizeof(double));
 }
 
-void mmpf_online_em_set_learning_rates(MMPF_OnlineEM *em,
-                                       double lr_base, double lr_spread)
-{
-    if (lr_base < 0.0001)
-        lr_base = 0.0001;
-    if (lr_base > 0.1)
-        lr_base = 0.1;
-    em->lr_base = lr_base;
-    em->lr_spread = lr_spread; /* Not used in asymmetric mode */
-}
-
-void mmpf_online_em_set_constraints(MMPF_OnlineEM *em,
-                                    double min_spread, double max_spread)
-{
-    if (min_spread < 0.1)
-        min_spread = 0.1;
-    if (max_spread < min_spread)
-        max_spread = min_spread + 1.0;
-
-    em->min_spread = min_spread;
-    em->max_spread = max_spread;
-
-    if (em->spread < em->min_spread)
-        em->spread = em->min_spread;
-    if (em->spread > em->max_spread)
-        em->spread = em->max_spread;
-
-    for (int k = 0; k < em->n_regimes; k++)
-    {
-        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
-    }
-}
-
-void mmpf_online_em_reset(MMPF_OnlineEM *em)
-{
-    int n = em->n_regimes;
-    double coeffs[MMPF_EM_MAX_REGIMES];
-    memcpy(coeffs, em->coefficients, n * sizeof(double));
-
-    mmpf_online_em_init(em);
-
-    em->n_regimes = n;
-    memcpy(em->coefficients, coeffs, n * sizeof(double));
-
-    for (int k = 0; k < em->n_regimes; k++)
-    {
-        em->mu[k] = em->base_level + em->coefficients[k] * em->spread;
-    }
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * DIAGNOSTICS
- *═══════════════════════════════════════════════════════════════════════════*/
-
 void mmpf_online_em_dump(const MMPF_OnlineEM *em)
 {
-    printf("=== Structural Hierarchical Estimation (Robust) ===\n");
+    printf("=== Robust Structural Estimation ===\n");
     printf("Base Level (B): %.4f\n", em->base_level);
     printf("Spread (S):     %.4f\n", em->spread);
     printf("Ticks:          %d\n", em->tick_count);
@@ -256,5 +179,5 @@ void mmpf_online_em_dump(const MMPF_OnlineEM *em)
     printf("\nLast Gradients:\n");
     printf("  grad_B: %.6f\n", em->last_grad_base);
     printf("  grad_S: %.6f\n", em->last_grad_spread);
-    printf("================================================\n");
+    printf("====================================\n");
 }

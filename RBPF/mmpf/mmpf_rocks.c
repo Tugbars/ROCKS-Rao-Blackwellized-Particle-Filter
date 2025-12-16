@@ -1133,9 +1133,11 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
      *═══════════════════════════════════════════════════════════════════════════*/
     {
         /* Learning parameters */
-        mmpf->online_em.alpha = 0.995;              /* EMA decay for smoothing */
-        mmpf->online_em.learning_rate_base = 0.01;  /* Drift tracking */
-        mmpf->online_em.learning_rate_spread = 0.0; /* Not used - asymmetric in update */
+        mmpf->online_em.alpha = 0.995;             /* EMA decay (legacy) */
+        mmpf->online_em.learning_rate_base = 0.01; /* Drift tracking */
+        mmpf->online_em.lr_spread_pos = 0.050;     /* Fast Fear (expansion) */
+        mmpf->online_em.lr_spread_neg = 0.001;     /* Slow Decay (contraction) */
+        mmpf->online_em.robust_scale = 1.0;        /* Huber scale (~3σ vol-of-vol) */
         mmpf->online_em.warmup_ticks = 50;
         mmpf->online_em.tick_count = 0;
 
@@ -1978,15 +1980,11 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
             if (y_raw != y_raw)
                 goto skip_structural_update; /* NaN guard */
 
-            /* Robust Influence Function (Huber)
-             * Clips large errors to prevent "wrong" models from dominating.
-             * Scale of 1.0 = ~2 sigma for typical vol-of-vol. */
-            const double ROBUST_SCALE = 1.0;
-
-            /* Compute gradients with ROBUST errors */
+            /* Compute gradients with ROBUST errors (Huber influence) */
             double grad_B = 0.0;
             double grad_S = 0.0;
             double total_weight = 0.0;
+            const double robust_scale = mmpf->online_em.robust_scale;
 
             for (int k = 0; k < MMPF_N_MODELS; k++)
             {
@@ -2002,18 +2000,22 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 /* Raw prediction error */
                 double raw_error = y_raw - pred_k;
 
-                /* ROBUST error: Clip large errors (M-Estimation / Huber)
-                 * This prevents the "wrong" model from hijacking the structure.
-                 * During crisis: Calm's +2.0 error clips to +1.0 */
-                double robust_err = raw_error;
-                if (robust_err > ROBUST_SCALE)
-                    robust_err = ROBUST_SCALE;
-                if (robust_err < -ROBUST_SCALE)
-                    robust_err = -ROBUST_SCALE;
+                /* ROBUST gradient (Huber): The "Magic"
+                 *
+                 * If Calm model has error +2.0 (Crisis), standard L2 gives -2.0
+                 * Huber clips this to -1.0.
+                 * Crisis model error +0.5 is uncapped.
+                 * Result: Crisis vote (+0.75) > Calm vote (-1.0 * small_weight).
+                 * The spread expands NATURALLY. */
+                double robust_grad = raw_error;
+                if (robust_grad > robust_scale)
+                    robust_grad = robust_scale;
+                if (robust_grad < -robust_scale)
+                    robust_grad = -robust_scale;
 
                 /* Accumulate gradients using ROBUST error */
-                grad_B += w_k * robust_err;
-                grad_S += w_k * robust_err * c_k;
+                grad_B += w_k * robust_grad;
+                grad_S += w_k * robust_grad * c_k;
 
                 total_weight += w_k;
             }
@@ -2025,18 +2027,15 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 grad_S /= total_weight;
             }
 
-            /* Update Base Level */
+            /* Update Base Level (Drift) */
             double lr_B = mmpf->online_em.learning_rate_base;
             mmpf->online_em.base_level += lr_B * grad_B;
 
-            /* Asymmetric Spread Dynamics ("Fast to Fear, Slow to Calm")
-             * Now that robust gradients fix the sign, this works correctly:
-             *   - Positive gradient (crisis) → fast expansion
-             *   - Negative gradient (recovery) → slow contraction
-             */
-            double lr_S = (grad_S > 0.0) ? 0.050  /* Expand fast (fear) */
-                                         : 0.001; /* Contract slow (recovery) */
-
+            /* Update Spread (Asymmetric Physics)
+             * Markets explode fast (fear) and decay slow (memory).
+             * This is a property of the asset class, not a heuristic hack. */
+            double lr_S = (grad_S > 0.0) ? mmpf->online_em.lr_spread_pos
+                                         : mmpf->online_em.lr_spread_neg;
             mmpf->online_em.spread += lr_S * grad_S;
 
             /* Enforce structural constraints */

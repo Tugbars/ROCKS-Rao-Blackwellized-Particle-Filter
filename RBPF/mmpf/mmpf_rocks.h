@@ -550,12 +550,12 @@ extern "C"
          * WHY THIS IS BULLETPROOF:
          *   - Zero collapse risk: S_min enforces minimum separation
          *   - Coupled learning: All data informs B, fleet stays in formation
-         *   - Noise immunity: Even mushy weights find the centroid
-         *   - Adaptive: B and S can both shift as market evolves
+         *   - Robust M-estimation: Huber loss clips "wrong model" influence
+         *   - Asymmetric dynamics: Fast fear, slow recovery (market physics)
          *═══════════════════════════════════════════════════════════════════════*/
         struct
         {
-            /* Structural State */
+            /* Structural State (Only these are learned) */
             double base_level; /* B: Center of gravity */
             double spread;     /* S: Regime separation */
 
@@ -564,10 +564,12 @@ extern "C"
             double min_spread;                  /* Minimum separation (prevents collapse) */
             double max_spread;                  /* Maximum separation (prevents explosion) */
 
-            /* Learning Parameters */
-            double learning_rate_base;   /* α for base level updates */
-            double learning_rate_spread; /* α for spread updates (usually slower) */
-            double alpha;                /* EMA decay for smoothing */
+            /* Physics & Statistics (Tunable) */
+            double learning_rate_base; /* Base level drift rate */
+            double lr_spread_pos;      /* Spread expansion rate (Fast Fear) */
+            double lr_spread_neg;      /* Spread contraction rate (Slow Decay) */
+            double robust_scale;       /* Huber scale (~3σ of vol-of-vol) */
+            double alpha;              /* EMA decay (legacy, unused) */
 
             /* Output Cache (Projected means) */
             double mu[MMPF_N_MODELS];    /* μ_k = B + coeff[k] × S */
