@@ -1076,11 +1076,11 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         int n_mcmc_steps = 10; /* Typical MCMC steps per teleport */
         int capacity = n_particles * n_mcmc_steps;
 
-        mmpf->mcmc_scratch_capacity = capacity;
-        mmpf->mcmc_rng_gauss = (double *)aligned_alloc(64, capacity * 2 * sizeof(double));
-        mmpf->mcmc_rng_log_u = (double *)aligned_alloc(64, capacity * sizeof(double));
+        mmpf->mcmc_scratch.capacity = capacity;
+        mmpf->mcmc_scratch.rng_gauss = (double *)aligned_alloc(64, capacity * 2 * sizeof(double));
+        mmpf->mcmc_scratch.rng_log_u = (double *)aligned_alloc(64, capacity * sizeof(double));
 
-        if (!mmpf->mcmc_rng_gauss || !mmpf->mcmc_rng_log_u)
+        if (!mmpf->mcmc_scratch.rng_gauss || !mmpf->mcmc_scratch.rng_log_u)
         {
             fprintf(stderr, "MMPF: Failed to allocate MCMC scratch buffers\n");
             /* Non-fatal - MCMC will fall back to per-call allocation */
@@ -1101,6 +1101,9 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
 #else
         mmpf->mcmc_vsl_stream = NULL;
 #endif
+
+        /* Initialize MCMC stats */
+        memset(&mmpf->mcmc_stats, 0, sizeof(mmpf->mcmc_stats));
     }
 
     /* Online EM for regime center learning */
@@ -1204,10 +1207,10 @@ void mmpf_destroy(MMPF_ROCKS *mmpf)
     }
 
     /* Free MCMC scratch buffers */
-    if (mmpf->mcmc_rng_gauss)
-        free(mmpf->mcmc_rng_gauss);
-    if (mmpf->mcmc_rng_log_u)
-        free(mmpf->mcmc_rng_log_u);
+    if (mmpf->mcmc_scratch.rng_gauss)
+        free(mmpf->mcmc_scratch.rng_gauss);
+    if (mmpf->mcmc_scratch.rng_log_u)
+        free(mmpf->mcmc_scratch.rng_log_u);
 
 #ifdef MMPF_USE_MKL
     if (mmpf->mcmc_vsl_stream)
@@ -2340,44 +2343,16 @@ void mmpf_inject_shock_adaptive(MMPF_ROCKS *mmpf, rbpf_real_t y_log_sq)
      * instead of the slow random walk from the legacy noise×50 approach.
      */
 #ifdef MMPF_ENABLE_MCMC
-    /* Pre-fill RNG buffers using MKL for efficiency */
-    if (mmpf->mcmc_vsl_stream && mmpf->mcmc_rng_gauss && mmpf->mcmc_rng_log_u)
-    {
-#ifdef MMPF_USE_MKL
-        int capacity = mmpf->mcmc_scratch_capacity;
-        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER,
-                      (VSLStreamStatePtr)mmpf->mcmc_vsl_stream,
-                      capacity * 2, mmpf->mcmc_rng_gauss, 0.0, 1.0);
-        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD,
-                     (VSLStreamStatePtr)mmpf->mcmc_vsl_stream,
-                     capacity, mmpf->mcmc_rng_log_u, 0.0, 1.0);
-        /* Convert uniform to log for MH accept check */
-        for (int i = 0; i < capacity; i++)
-        {
-            mmpf->mcmc_rng_log_u[i] = log(mmpf->mcmc_rng_log_u[i]);
-        }
-#endif
-    }
-
-    MMPF_MCMC_Config mcmc_cfg = mmpf_mcmc_default_config();
+    /* Use the proper MCMC API which handles all the details */
+    MMPF_MCMC_Config mcmc_cfg;
+    mmpf_mcmc_config_defaults(&mcmc_cfg);
     mcmc_cfg.n_steps = 10;
-    mcmc_cfg.proposal_std = 0.5;
+    mcmc_cfg.proposal_sigma = 0.5;
 
-    for (int k = 0; k < MMPF_N_MODELS; k++)
-    {
-        RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
+    mmpf_inject_shock_mcmc_avx(mmpf, (double)y_log_sq, &mcmc_cfg);
 
-        /* MCMC teleports particles to likelihood peak */
-        mmpf_mcmc_teleport_particles(
-            rbpf->mu,
-            rbpf->n_particles,
-            (double)y_log_sq,
-            (double)rbpf->params[0].mu_vol,
-            (double)rbpf->params[0].sigma_vol,
-            &mcmc_cfg,
-            mmpf->mcmc_rng_gauss,
-            mmpf->mcmc_rng_log_u);
-    }
+    /* Note: mmpf_inject_shock_mcmc_avx already sets shock_active = 1 */
+    return; /* Early return - shock state already set by MCMC function */
 #else
     /* Fallback when MCMC not compiled: Likelihood-weighted teleport
      *

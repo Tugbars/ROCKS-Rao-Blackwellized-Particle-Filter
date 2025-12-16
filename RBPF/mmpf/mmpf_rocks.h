@@ -511,11 +511,28 @@ extern "C"
          *   - Entropy: Detects filter stability (triggers shock exit)
          *═══════════════════════════════════════════════════════════════════════*/
 
-        /* MCMC scratch buffers (pre-allocated for zero-alloc hot path) */
-        double *mcmc_rng_gauss;    /* [n_particles * n_steps * 2] */
-        double *mcmc_rng_log_u;    /* [n_particles * n_steps] */
-        int mcmc_scratch_capacity; /* Allocated capacity */
-        void *mcmc_vsl_stream;     /* VSLStreamStatePtr */
+        /* MCMC scratch buffers (pre-allocated for zero-alloc hot path)
+         * Must match MMPF_MCMC_Scratch layout in mmpf_mcmc.h */
+        struct
+        {
+            double *rng_gauss; /* Gaussian proposals: n_particles × n_steps */
+            double *rng_log_u; /* log(uniform) for acceptance */
+            int capacity;      /* Buffer capacity */
+        } mcmc_scratch;
+
+        void *mcmc_vsl_stream; /* VSLStreamStatePtr for MKL RNG */
+
+        /* MCMC diagnostic statistics (matches MMPF_MCMC_Stats in mmpf_mcmc.h) */
+        struct
+        {
+            int total_shocks;
+            int total_proposals;
+            int total_accepts;
+            double avg_acceptance;
+            double last_pre_mean;
+            double last_post_mean;
+            double last_teleport;
+        } mcmc_stats;
 
         /* Online EM state (streaming GMM for regime center learning) */
         struct

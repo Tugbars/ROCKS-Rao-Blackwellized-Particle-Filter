@@ -360,10 +360,6 @@ void rbpf_ksc_set_regime_params(RBPF_KSC *rbpf, int r,
     rbpf->params[r].mu_vol = mu_vol;
     rbpf->params[r].sigma_vol = sigma_vol;
     rbpf->params[r].q = sigma_vol * sigma_vol;
-
-    /* Also update Liu-West cached means (these are the fallback values) */
-    rbpf->lw_mu_vol_mean[r] = mu_vol;
-    rbpf->lw_sigma_vol_mean[r] = sigma_vol;
 }
 
 void rbpf_ksc_build_transition_lut(RBPF_KSC *rbpf, const rbpf_real_t *trans_matrix)
@@ -619,11 +615,7 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
     }
     rbpf->detection.sprt_current_regime = 0;
     rbpf->detection.sprt_ticks_in_current = 0;
-
-    /* Reset legacy counter-based smoothing */
     rbpf->detection.stable_regime = 0;
-    rbpf->detection.candidate_regime = 0;
-    rbpf->detection.hold_count = 0;
 
     /* Reset fixed-lag smoothing buffer */
     rbpf->smooth_head = 0;
