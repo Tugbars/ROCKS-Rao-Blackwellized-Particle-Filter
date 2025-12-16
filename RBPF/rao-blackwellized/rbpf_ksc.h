@@ -401,26 +401,16 @@ typedef float rbpf_real_t;
     } RBPF_RegimeParams;
 
     /**
-     * Liu-West parameter learning configuration
+     * Parameter bounds for clamping learned parameters
+     * (Used by Online EM at MMPF level, pushed down via rbpf_ksc_set_regime_params)
      */
     typedef struct
     {
-        int enabled;               /* 0=off, 1=on */
-        rbpf_real_t shrinkage;     /* a in [0.90, 0.99], closer to 1 = slower adaptation */
-        rbpf_real_t min_mu_vol;    /* Floor for μ_vol (e.g., log(0.001)) */
-        rbpf_real_t max_mu_vol;    /* Ceiling for μ_vol (e.g., log(0.5)) */
-        rbpf_real_t min_sigma_vol; /* Floor for σ_vol */
-        rbpf_real_t max_sigma_vol; /* Ceiling for σ_vol */
-        int learn_mu_vol;          /* Learn μ_vol per regime */
-        int learn_sigma_vol;       /* Learn σ_vol per regime */
-        int warmup_ticks;          /* Ticks before learning starts */
-        int tick_count;            /* Current tick counter */
-
-        /* Aggressive resampling for learning mode */
-        rbpf_real_t resample_threshold; /* ESS threshold (0.85 for learning, 0.5 normal) */
-        int max_ticks_no_resample;      /* Force resample after this many ticks */
-        int ticks_since_resample;       /* Counter */
-    } RBPF_LiuWest;
+        rbpf_real_t min_mu_vol;    /* Floor for μ_vol (e.g., log(0.001) = -6.9) */
+        rbpf_real_t max_mu_vol;    /* Ceiling for μ_vol (e.g., log(0.5) = -0.69) */
+        rbpf_real_t min_sigma_vol; /* Floor for σ_vol (e.g., 0.01) */
+        rbpf_real_t max_sigma_vol; /* Ceiling for σ_vol (e.g., 1.0) */
+    } RBPF_ParamBounds;
 
     /**
      * Fixed-lag smoothing history entry
@@ -453,11 +443,13 @@ typedef float rbpf_real_t;
         int prev_regime;           /* For structural change detection */
         int cooldown;              /* Ticks since last detection */
 
-        /* SPRT-based regime detection (preferred)
-         * Uses log-likelihood ratios for statistically principled switching.
-         * Error rates (alpha, beta) control false positive/negative tradeoff.
+        /* SPRT regime detection (MANDATORY)
+         * Sequential Probability Ratio Test for statistically principled switching.
+         * Uses log-likelihood ratios accumulated over time.
+         *
+         * Wald's optimal stopping: minimizes expected samples at given error rates.
+         * Default: α=β=0.01 → thresholds ≈ ±4.6
          */
-        int use_sprt;                             /* 1 = SPRT, 0 = counter */
         double sprt_log_ratios[RBPF_MAX_REGIMES]; /* Cumulative log-LR vs current */
         double sprt_threshold_high;               /* Accept H1 threshold: log((1-β)/α) */
         double sprt_threshold_low;                /* Accept H0 threshold: log(β/(1-α)) */
@@ -465,14 +457,8 @@ typedef float rbpf_real_t;
         int sprt_min_dwell;                       /* Min ticks before switch allowed */
         int sprt_ticks_in_current;                /* Ticks since last switch */
 
-        /* Counter-based smoothing (legacy fallback)
-         * Kept for backward compatibility. Use SPRT for new code.
-         */
-        int stable_regime;          /* Smoothed regime output */
-        int candidate_regime;       /* Current candidate for new stable regime */
-        int hold_count;             /* Ticks candidate has been dominant */
-        int hold_threshold;         /* Ticks required before switching (default: 5) */
-        rbpf_real_t prob_threshold; /* Probability for immediate switch (default: 0.7) */
+        /* Output field (kept for API compatibility) */
+        int stable_regime; /* Smoothed regime output (= sprt_current_regime) */
 
         /* Confirmation window (reduces false positives) */
         int consecutive_surprise;  /* Consecutive ticks with high surprise */
@@ -697,21 +683,15 @@ typedef float rbpf_real_t;
         rbpf_real_t regime_mutation_prob; /* Probability of random regime mutation [0, 0.1] */
 
         /*========================================================================
-         * LIU-WEST PARAMETER LEARNING
+         * PARAMETER BOUNDS & STORVIK ARRAYS
          *======================================================================*/
-        RBPF_LiuWest liu_west;
+        RBPF_ParamBounds param_bounds;
 
-        /* Per-particle parameters (learned online) */
+        /* Per-particle parameters (used by Storvik learner via MMPF) */
         rbpf_real_t *particle_mu_vol;     /* [n * n_regimes] μ_vol per particle per regime */
         rbpf_real_t *particle_sigma_vol;  /* [n * n_regimes] σ_vol per particle per regime */
         rbpf_real_t *particle_mu_vol_tmp; /* Double buffer */
         rbpf_real_t *particle_sigma_vol_tmp;
-
-        /* Liu-West workspace */
-        rbpf_real_t lw_mu_vol_mean[RBPF_MAX_REGIMES];    /* Weighted mean of μ_vol */
-        rbpf_real_t lw_mu_vol_var[RBPF_MAX_REGIMES];     /* Weighted variance of μ_vol */
-        rbpf_real_t lw_sigma_vol_mean[RBPF_MAX_REGIMES]; /* Weighted mean of σ_vol */
-        rbpf_real_t lw_sigma_vol_var[RBPF_MAX_REGIMES];  /* Weighted variance of σ_vol */
 
         /*========================================================================
          * FIXED-LAG SMOOTHING (Dual Output)
@@ -870,18 +850,6 @@ typedef float rbpf_real_t;
      *
      * Typical usage: lag=5 for regime confirmation, lag=0 for pure filtering */
     void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag);
-
-    /* Liu-West parameter learning (Phase 3) */
-    void rbpf_ksc_enable_liu_west(RBPF_KSC *rbpf, rbpf_real_t shrinkage, int warmup_ticks);
-    void rbpf_ksc_disable_liu_west(RBPF_KSC *rbpf);
-    void rbpf_ksc_set_liu_west_bounds(RBPF_KSC *rbpf,
-                                      rbpf_real_t min_mu_vol, rbpf_real_t max_mu_vol,
-                                      rbpf_real_t min_sigma_vol, rbpf_real_t max_sigma_vol);
-    void rbpf_ksc_set_liu_west_resample(RBPF_KSC *rbpf,
-                                        rbpf_real_t ess_threshold,  /* 0.85 = resample at 85% ESS */
-                                        int max_ticks_no_resample); /* Force resample after N ticks */
-    void rbpf_ksc_get_learned_params(const RBPF_KSC *rbpf, int regime,
-                                     rbpf_real_t *mu_vol_out, rbpf_real_t *sigma_vol_out);
 
     /* PMMH injection (call every 50-100 ticks with offline PMMH results)
      * Resets per-particle parameters toward PMMH estimates with controlled jitter */
@@ -1181,7 +1149,6 @@ typedef float rbpf_real_t;
     void rbpf_ksc_resample_internal(RBPF_KSC *rbpf);
     void rbpf_ksc_transition_internal(RBPF_KSC *rbpf);
     void rbpf_ksc_compute_outputs_internal(RBPF_KSC *rbpf, rbpf_real_t marginal, RBPF_KSC_Output *out);
-    void rbpf_ksc_liu_west_update_internal(RBPF_KSC *rbpf);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * RBPF PIPELINE: Unified Change Detection + Volatility Tracking
