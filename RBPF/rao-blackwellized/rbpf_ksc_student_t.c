@@ -298,7 +298,8 @@ rbpf_real_t rbpf_ksc_update_student_t_nu(RBPF_KSC *rbpf, rbpf_real_t y, rbpf_rea
     {
         const rbpf_real_t mp = rbpf->mu_pred[i];
         const rbpf_real_t vp = rbpf->var_pred[i];
-        rbpf_real_t innov_dom, var_eff, beta, lam, inv_lam;
+        rbpf_real_t innov_dom, var_eff, beta, lam;
+        rbpf_real_t log_lam, y_shifted; /* For Student-t mean shift */
         rbpf_real_t max_ll, lik_total, mu_acc, mu2_acc;
         rbpf_real_t inv_lik, mu_new, var_new, ll;
 
@@ -328,9 +329,18 @@ rbpf_real_t rbpf_ksc_update_student_t_nu(RBPF_KSC *rbpf, rbpf_real_t y, rbpf_rea
         rbpf->lambda[i] = lam;
         rbpf->log_lambda[i] = rbpf_log(lam);
 
-        inv_lam = RBPF_REAL(1.0) / lam;
+        /* CRITICAL FIX: Student-t λ is a MEAN SHIFT, not variance scaling!
+         *
+         * Math: y = 2h + log(ε²) - log(λ)
+         *       y + log(λ) = 2h + log(ε²)  ← Standard KSC form
+         *
+         * The KSC mixture constants approximate log(ε²), whose variance
+         * is FIXED. The λ term shifts the observation, not the variance.
+         */
+        log_lam = rbpf->log_lambda[i];
+        y_shifted = y + log_lam; /* Shift observation by +log(λ) */
 
-        /* 10-component mixture update with λ-scaled variance */
+        /* 10-component mixture update with SHIFTED observation */
         max_ll = RBPF_REAL(-1e30);
         lik_total = RBPF_REAL(0.0);
         mu_acc = RBPF_REAL(0.0);
@@ -338,8 +348,8 @@ rbpf_real_t rbpf_ksc_update_student_t_nu(RBPF_KSC *rbpf, rbpf_real_t y, rbpf_rea
 
         for (k = 0; k < 10; k++)
         {
-            rbpf_real_t S = H2 * vp + (rbpf_real_t)KSC_VAR_ST[k] * inv_lam;
-            rbpf_real_t innov = y - (rbpf_real_t)KSC_MEAN_ST[k] - H * mp;
+            rbpf_real_t S = H2 * vp + (rbpf_real_t)KSC_VAR_ST[k]; /* NO inv_lam! */
+            rbpf_real_t innov = y_shifted - (rbpf_real_t)KSC_MEAN_ST[k] - H * mp;
             rbpf_real_t inv_S = RBPF_REAL(1.0) / S;
             rbpf_real_t log_lik, K, mu_post, var_post, w;
 
@@ -427,7 +437,8 @@ rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
         const rbpf_real_t mp = rbpf->mu_pred[i];
         const rbpf_real_t vp = rbpf->var_pred[i];
         rbpf_real_t ocsn_var, ocsn_pi;
-        rbpf_real_t innov_dom, var_eff, beta, lam, inv_lam;
+        rbpf_real_t innov_dom, var_eff, beta, lam;
+        rbpf_real_t log_lam, y_shifted; /* For Student-t mean shift */
         rbpf_real_t log_1_minus_pi, log_pi;
         rbpf_real_t max_ll;
         rbpf_real_t log_liks[11], mu_posts[11], var_posts[11];
@@ -468,18 +479,22 @@ rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
         rbpf->lambda[i] = lam;
         rbpf->log_lambda[i] = rbpf_log(lam);
 
-        inv_lam = RBPF_REAL(1.0) / lam;
+        /* CRITICAL FIX: Student-t λ is a MEAN SHIFT, not variance scaling!
+         * y_shifted = y + log(λ) transforms to standard KSC form */
+        log_lam = rbpf->log_lambda[i];
+        y_shifted = y + log_lam;
+
         log_1_minus_pi = rbpf_log(RBPF_REAL(1.0) - ocsn_pi);
         log_pi = rbpf_log(ocsn_pi);
 
         /* 11-component mixture (10 KSC + 1 outlier) */
         max_ll = RBPF_REAL(-1e30);
 
-        /* 10 KSC components */
+        /* 10 KSC components with SHIFTED observation */
         for (k = 0; k < 10; k++)
         {
-            rbpf_real_t S = H2 * vp + (rbpf_real_t)KSC_VAR_ST[k] * inv_lam;
-            rbpf_real_t innov = y - (rbpf_real_t)KSC_MEAN_ST[k] - H * mp;
+            rbpf_real_t S = H2 * vp + (rbpf_real_t)KSC_VAR_ST[k]; /* NO inv_lam! */
+            rbpf_real_t innov = y_shifted - (rbpf_real_t)KSC_MEAN_ST[k] - H * mp;
             rbpf_real_t inv_S = RBPF_REAL(1.0) / S;
             rbpf_real_t K;
 
@@ -493,10 +508,16 @@ rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
             var_posts[k] = (RBPF_REAL(1.0) - K * H) * vp;
         }
 
-        /* Outlier component (NOT λ-scaled) */
+        /* Outlier component - ALSO uses SHIFTED observation for consistency!
+         *
+         * The λ scaling is part of the observation process, not the error model.
+         * Whether log(ε²) came from KSC or OCSN, the observation still contains
+         * the -log(λ) term. Using unshifted y would create a mismatch where
+         * OCSN could "win" due to λ shift, not true outlier status.
+         */
         {
             rbpf_real_t S = H2 * vp + ocsn_var;
-            rbpf_real_t innov = y - H * mp;
+            rbpf_real_t innov = y_shifted - H * mp; /* Use shifted observation! */
             rbpf_real_t inv_S = RBPF_REAL(1.0) / S;
             rbpf_real_t K;
 
@@ -564,6 +585,231 @@ rbpf_real_t rbpf_ksc_update_student_t_robust(RBPF_KSC *rbpf, rbpf_real_t y,
     }
 
     return rbpf_exp(max_log_weight + rbpf_log(sum_weight) - rbpf_log((rbpf_real_t)n));
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * OPTIMIZED LOW-N FUSED KERNEL
+ *
+ * For n < 512 particles, MKL overhead exceeds benefit. This kernel:
+ *   - Processes one particle completely before moving to next
+ *   - Keeps all 11 component values in registers/L1 cache
+ *   - Uses streaming log-sum-exp (single pass)
+ *   - No memory round-trips, no MKL dispatch overhead
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+rbpf_real_t rbpf_ksc_update_student_t_fused(
+    RBPF_KSC *rbpf,
+    rbpf_real_t y,
+    rbpf_real_t nu,
+    const RBPF_RobustOCSN *ocsn)
+{
+    const int n = rbpf->n_particles;
+    const rbpf_real_t H = RBPF_REAL(2.0);
+    const rbpf_real_t H2 = RBPF_REAL(4.0);
+    const rbpf_real_t nu_half = nu * RBPF_REAL(0.5);
+    const rbpf_real_t nu_plus_1_half = (nu + RBPF_REAL(1.0)) * RBPF_REAL(0.5);
+    const rbpf_real_t EPS = RBPF_REAL(1e-30);
+
+    int ocsn_active = (ocsn && ocsn->enabled);
+    rbpf_real_t max_log_weight_global = RBPF_REAL(-1e30);
+    rbpf_real_t sum_weight;
+    int i, k;
+
+    /* Process one particle completely before moving to next */
+    for (i = 0; i < n; i++)
+    {
+        const int r = rbpf->regime[i];
+        const rbpf_real_t mp = rbpf->mu_pred[i];
+        const rbpf_real_t vp = rbpf->var_pred[i];
+        rbpf_real_t lam, innov_dom, var_eff, beta;
+        rbpf_real_t log_lam, y_shifted; /* For Student-t mean shift */
+        rbpf_real_t lik_total, w_mu_sum, w_mu2_sum, current_max_ll;
+        rbpf_real_t H_vp, H2_vp, innov_base_shifted;
+        rbpf_real_t ocsn_var, ocsn_pi, log_1_minus_pi, log_pi;
+        rbpf_real_t inv_lik_total, mu_new, var_new;
+
+        /* Sample Lambda */
+        innov_dom = (y - KSC_MEAN_ST[4]) - H * mp;
+        if (innov_dom > RBPF_REAL(50.0))
+            innov_dom = RBPF_REAL(50.0);
+        else if (innov_dom < RBPF_REAL(-50.0))
+            innov_dom = RBPF_REAL(-50.0);
+
+        var_eff = H2 * vp + KSC_VAR_ST[4];
+        beta = nu_half + RBPF_REAL(0.5) * innov_dom * innov_dom / var_eff;
+        if (beta < RBPF_REAL(0.1))
+            beta = RBPF_REAL(0.1);
+        else if (beta > RBPF_REAL(100.0))
+            beta = RBPF_REAL(100.0);
+
+        lam = rbpf_pcg32_gamma(&rbpf->pcg[0], nu_plus_1_half, beta);
+        if (!(lam > RBPF_REAL(0.0)))
+            lam = RBPF_REAL(1.0);
+        else if (lam < RBPF_LAMBDA_FLOOR)
+            lam = RBPF_LAMBDA_FLOOR;
+        else if (lam > RBPF_LAMBDA_CEIL)
+            lam = RBPF_LAMBDA_CEIL;
+
+        rbpf->lambda[i] = lam;
+        rbpf->log_lambda[i] = rbpf_log(lam);
+
+        /* CRITICAL FIX: Student-t λ is a MEAN SHIFT, not variance scaling!
+         * y_shifted = y + log(λ) transforms to standard KSC form */
+        log_lam = rbpf->log_lambda[i];
+        y_shifted = y + log_lam;
+
+        /* Pre-calculate common terms */
+        H_vp = H * vp;
+        H2_vp = H2 * vp;
+        innov_base_shifted = y_shifted - H * mp; /* All components use shifted observation */
+
+        /* OCSN params */
+        if (ocsn_active)
+        {
+            ocsn_var = ocsn->regime[r].variance;
+            ocsn_pi = ocsn->regime[r].prob;
+            if (ocsn_var < RBPF_OUTLIER_VAR_MIN)
+                ocsn_var = RBPF_OUTLIER_VAR_MIN;
+            if (ocsn_var > RBPF_OUTLIER_VAR_MAX)
+                ocsn_var = RBPF_OUTLIER_VAR_MAX;
+            log_1_minus_pi = rbpf_log(RBPF_REAL(1.0) - ocsn_pi);
+            log_pi = rbpf_log(ocsn_pi);
+        }
+        else
+        {
+            ocsn_var = RBPF_REAL(0.0);
+            log_1_minus_pi = RBPF_REAL(0.0);
+            log_pi = RBPF_REAL(-1e30);
+        }
+
+        /* Streaming log-sum-exp over 11 components */
+        lik_total = RBPF_REAL(0.0);
+        w_mu_sum = RBPF_REAL(0.0);
+        w_mu2_sum = RBPF_REAL(0.0);
+        current_max_ll = RBPF_REAL(-1e30);
+
+        for (k = 0; k < 11; k++)
+        {
+            rbpf_real_t S, innov, log_prob_prior, inv_S, log_lik;
+            rbpf_real_t w, K, mu_post, var_post, diff, scale;
+
+            if (k < 10)
+            {
+                /* KSC components: use SHIFTED observation, NO variance scaling */
+                S = H2_vp + KSC_VAR_ST[k]; /* NO inv_lam! */
+                innov = innov_base_shifted - KSC_MEAN_ST[k];
+                log_prob_prior = KSC_LOG_PROB_ST[k] + log_1_minus_pi;
+            }
+            else
+            {
+                /* OCSN outlier: ALSO use SHIFTED observation for consistency!
+                 * The λ scaling is part of the observation process.
+                 * Whether log(ε²) is KSC or OCSN, the -log(λ) term applies. */
+                if (!ocsn_active)
+                    continue;
+                S = H2_vp + ocsn_var;
+                innov = innov_base_shifted; /* Use shifted, not innov_base! */
+                log_prob_prior = log_pi;
+            }
+
+            inv_S = RBPF_REAL(1.0) / S;
+            log_lik = log_prob_prior - RBPF_REAL(0.5) * (rbpf_log(S) + innov * innov * inv_S);
+
+            /* Kalman update */
+            K = H_vp * inv_S;
+            mu_post = mp + K * innov;
+            var_post = (RBPF_REAL(1.0) - K * H) * vp;
+
+            /* Streaming log-sum-exp trick */
+            if (log_lik > current_max_ll)
+            {
+                diff = current_max_ll - log_lik;
+                scale = rbpf_exp(diff);
+                lik_total *= scale;
+                w_mu_sum *= scale;
+                w_mu2_sum *= scale;
+                current_max_ll = log_lik;
+            }
+
+            w = rbpf_exp(log_lik - current_max_ll);
+            lik_total += w;
+            w_mu_sum += w * mu_post;
+            w_mu2_sum += w * (var_post + mu_post * mu_post);
+        }
+
+        /* GPB1 collapse */
+        inv_lik_total = RBPF_REAL(1.0) / (lik_total + EPS);
+        mu_new = w_mu_sum * inv_lik_total;
+        var_new = (w_mu2_sum * inv_lik_total) - (mu_new * mu_new);
+
+        if (var_new < RBPF_REAL(1e-6))
+            var_new = RBPF_REAL(1e-6);
+        if (var_new != var_new)
+            var_new = vp;
+        if (mu_new != mu_new)
+            mu_new = mp;
+
+        rbpf->mu[i] = mu_new;
+        rbpf->var[i] = var_new;
+
+        /* Update log-weight */
+        rbpf->log_weight[i] += current_max_ll + rbpf_log(lik_total + EPS);
+
+        if (rbpf->log_weight[i] > max_log_weight_global)
+        {
+            max_log_weight_global = rbpf->log_weight[i];
+        }
+    }
+
+    /* Normalize weights */
+    sum_weight = RBPF_REAL(0.0);
+    for (i = 0; i < n; i++)
+    {
+        rbpf_real_t w;
+        rbpf->log_weight[i] -= max_log_weight_global;
+        w = rbpf_exp(rbpf->log_weight[i]);
+        rbpf->w_norm[i] = w;
+        sum_weight += w;
+    }
+
+    if (sum_weight < EPS)
+        sum_weight = EPS;
+    {
+        rbpf_real_t inv_sum = RBPF_REAL(1.0) / sum_weight;
+        for (i = 0; i < n; i++)
+        {
+            rbpf->w_norm[i] *= inv_sum;
+        }
+    }
+
+    return rbpf_exp(max_log_weight_global + rbpf_log(sum_weight) - rbpf_log((rbpf_real_t)n));
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * AUTO-DISPATCH: Choose optimal kernel based on particle count
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+rbpf_real_t rbpf_ksc_update_student_t_robust_auto(
+    RBPF_KSC *rbpf,
+    rbpf_real_t y,
+    rbpf_real_t nu,
+    const RBPF_RobustOCSN *ocsn)
+{
+    /*
+     * Threshold tuning:
+     *   - Below 512: Fused kernel wins (no MKL overhead, L1-resident)
+     *   - Above 512: MKL batching amortizes overhead
+     *
+     * This threshold depends on CPU. Adjust based on benchmarks.
+     */
+    if (rbpf->n_particles < 512)
+    {
+        return rbpf_ksc_update_student_t_fused(rbpf, y, nu, ocsn);
+    }
+    else
+    {
+        return rbpf_ksc_update_student_t_robust_mkl(rbpf, y, nu, ocsn);
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -696,7 +942,8 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
         for (i = 0; i < n_batch; i++)
         {
             int r;
-            float mp, vp, innov_dom, var_eff, beta, lam, inv_lam;
+            float mp, vp, innov_dom, var_eff, beta, lam;
+            float log_lam, y_shifted; /* For Student-t mean shift */
             float ocsn_var, ocsn_pi, log_1_minus_pi, log_pi;
 
             gi = b_start + i;
@@ -729,7 +976,10 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
             rbpf->lambda[gi] = lam;
             rbpf->log_lambda[gi] = logf(lam);
 
-            inv_lam = 1.0f / lam;
+            /* CRITICAL FIX: Student-t λ is a MEAN SHIFT, not variance scaling!
+             * y_shifted = y + log(λ) transforms to standard KSC form */
+            log_lam = rbpf->log_lambda[gi];
+            y_shifted = y_f + log_lam;
 
             ocsn_var = ocsn->regime[r].variance;
             ocsn_pi = ocsn->regime[r].prob;
@@ -743,15 +993,18 @@ rbpf_real_t rbpf_ksc_update_student_t_robust_mkl(
 
             base = i * N_COMPONENTS_TOTAL;
 
+            /* 10 KSC components with SHIFTED observation, NO variance scaling */
             for (k = 0; k < 10; k++)
             {
-                S_all[base + k] = H2 * vp + (float)KSC_VAR_ST[k] * inv_lam;
-                innov_all[base + k] = y_f - (float)KSC_MEAN_ST[k] - H * mp;
+                S_all[base + k] = H2 * vp + (float)KSC_VAR_ST[k]; /* NO inv_lam! */
+                innov_all[base + k] = y_shifted - (float)KSC_MEAN_ST[k] - H * mp;
                 log_lik_all[base + k] = log_1_minus_pi + (float)KSC_LOG_PROB_ST[k];
             }
 
+            /* Outlier component - ALSO uses SHIFTED observation for consistency!
+             * The λ scaling is part of the observation process, not the error model. */
             S_all[base + 10] = H2 * vp + ocsn_var;
-            innov_all[base + 10] = y_f - H * mp;
+            innov_all[base + 10] = y_shifted - H * mp; /* Use shifted! */
             log_lik_all[base + 10] = log_pi;
         }
 
