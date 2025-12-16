@@ -1130,8 +1130,9 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
 
         for (int k = 0; k < MMPF_N_MODELS; k++)
         {
-            /* Initialize to hypothesis centers */
-            mmpf->online_em.mu[k] = (double)(cfg.global_mu_vol_init + cfg.mu_vol_offsets[k]);
+            /* Initialize to CONFIGURED hypothesis centers (not baseline + offsets)
+             * This ensures tests that override cfg.hypotheses[k].mu_vol work correctly */
+            mmpf->online_em.mu[k] = (double)cfg.hypotheses[k].mu_vol;
             mmpf->online_em.sigma[k] = 0.5; /* Initial spread */
             mmpf->online_em.sum_w[k] = 1.0; /* Prevent div-by-zero */
             mmpf->online_em.sum_wx[k] = mmpf->online_em.mu[k];
@@ -1926,8 +1927,12 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 }
             }
 
-            /* Push learned μ_vol to RBPFs (after warmup) */
+            /* Push learned μ_vol to RBPFs (after warmup)
+             * ONLY when adaptive learning is enabled (enable_storvik_sync).
+             * When disabled (for unit tests), RBPF uses the fixed hypothesis params
+             * that were configured at creation time. */
             if (mmpf->online_em.tick_count >= mmpf->online_em.warmup_ticks &&
+                mmpf->config.enable_storvik_sync &&   /* Only if adaptive learning enabled */
                 !mmpf->config.enable_global_baseline) /* Skip if baseline controls μ */
             {
                 for (int k = 0; k < MMPF_N_MODELS; k++)
