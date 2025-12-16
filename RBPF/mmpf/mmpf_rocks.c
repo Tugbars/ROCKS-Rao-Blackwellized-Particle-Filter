@@ -545,6 +545,10 @@ MMPF_Config mmpf_config_defaults(void)
     cfg.enable_gated_learning = 1;
     cfg.gated_learning_threshold = RBPF_REAL(0.0); /* Pure WTA */
 
+    /* Diagnostic settings (ENABLED for targeted debugging) */
+    cfg.enable_crisis_diagnostic = 1;
+    cfg.crisis_diagnostic_threshold = RBPF_REAL(-2.5);
+
     /* Initial hypothesis params - PHYSICS provides differentiation
      *
      * Calm: Heavy, slow ship. High persistence, low volatility, thin tails.
@@ -568,12 +572,12 @@ MMPF_Config mmpf_config_defaults(void)
 
     cfg.hypotheses[MMPF_TREND].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_TREND];
     cfg.hypotheses[MMPF_TREND].phi = RBPF_REAL(0.95);       /* Moderate persistence */
-    cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.25); /* Wider: Better coverage */
+    cfg.hypotheses[MMPF_TREND].sigma_eta = RBPF_REAL(0.25); /* Medium flexibility */
     cfg.hypotheses[MMPF_TREND].nu = cfg.hypothesis_nu[MMPF_TREND];
 
     cfg.hypotheses[MMPF_CRISIS].mu_vol = cfg.global_mu_vol_init + cfg.mu_vol_offsets[MMPF_CRISIS];
     cfg.hypotheses[MMPF_CRISIS].phi = RBPF_REAL(0.85);       /* Fast mean reversion */
-    cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50); /* High vol-of-vol (unchanged) */
+    cfg.hypotheses[MMPF_CRISIS].sigma_eta = RBPF_REAL(0.50); /* High vol-of-vol */
     cfg.hypotheses[MMPF_CRISIS].nu = cfg.hypothesis_nu[MMPF_CRISIS];
 
     /* IMM settings - "Switch, Don't Jump" config */
@@ -1135,7 +1139,7 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         /* Learning parameters */
         mmpf->online_em.alpha = 0.995;             /* EMA decay (legacy) */
         mmpf->online_em.learning_rate_base = 0.01; /* Drift tracking */
-        mmpf->online_em.lr_spread_pos = 0.050;     /* Fast Fear (expansion) */
+        mmpf->online_em.lr_spread_pos = 0.50;      /* Fast Fear - UNLEASHED (was 0.050) */
         mmpf->online_em.lr_spread_neg = 0.001;     /* Slow Decay (contraction) */
         mmpf->online_em.robust_scale = 1.0;        /* Huber scale (~3σ vol-of-vol) */
         mmpf->online_em.warmup_ticks = 50;
@@ -2108,6 +2112,21 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
 
         /*═══════════════════════════════════════════════════════════════════════
+         * CRISIS DIAGNOSTIC (Targeted)
+         *
+         * Print diagnostic for specific tick range only.
+         * Sudden Crisis likely starts ~tick 2286 (8000 ticks / 7 scenarios)
+         *═══════════════════════════════════════════════════════════════════════*/
+        if (mmpf->config.enable_crisis_diagnostic)
+        {
+            /* Only print for ticks 2290-2295 (start of Sudden Crisis) */
+            if (mmpf->total_steps >= 2290 && mmpf->total_steps <= 2295)
+            {
+                mmpf_crisis_diagnostic(mmpf, y_log);
+            }
+        }
+
+        /*═══════════════════════════════════════════════════════════════════════
          * ENTROPY TRACKING: Detect filter stability for shock exit
          *
          * H_norm = -Σ w_k log(w_k) / log(K)  ∈ [0, 1]
@@ -2770,3 +2789,136 @@ void mmpf_get_diagnostics(const MMPF_ROCKS *mmpf,
     if (imm_mix_count)
         *imm_mix_count = mmpf->imm_mix_count;
 }
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * CRISIS DIAGNOSTIC DUMP
+ *
+ * Call this to understand exactly what's happening during regime transitions.
+ * Answers three key questions:
+ *   1. Is Storvik running? (Compare Storvik mu vs Structural mu)
+ *   2. What are the likelihoods? (Why isn't IMM switching?)
+ *   3. What is the gradient? (Is Calm sabotaging spread expansion?)
+ *═══════════════════════════════════════════════════════════════════════════════*/
+void mmpf_crisis_diagnostic(const MMPF_ROCKS *mmpf, rbpf_real_t y_log)
+{
+    const char *model_names[] = {"Calm", "Trend", "Crisis"};
+
+    printf("\n╔═══════════════════════════════════════════════════════════════════╗\n");
+    printf("║           MMPF CRISIS DIAGNOSTIC (Tick %lu)                       ║\n",
+           (unsigned long)mmpf->total_steps);
+    printf("╠═══════════════════════════════════════════════════════════════════╣\n");
+
+    /* Raw observation */
+    printf("║ RAW OBSERVATION                                                   ║\n");
+    printf("║   y_log = %.4f                                                   ║\n", (double)y_log);
+    printf("╠═══════════════════════════════════════════════════════════════════╣\n");
+
+    /* Question 1: Is Storvik Running? */
+    printf("║ Q1: STORVIK vs STRUCTURAL (Is Storvik being overwritten?)         ║\n");
+    printf("║   Model     Structural_μ    Storvik_prior   RBPF_param_μ          ║\n");
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        double structural_mu = mmpf->online_em.mu[k];
+        double storvik_mu = 0.0;
+        double rbpf_mu = 0.0;
+
+        if (mmpf->ext[k] && mmpf->ext[k]->storvik_initialized)
+        {
+            /* Prior mean is in priors[regime].m */
+            storvik_mu = (double)mmpf->ext[k]->storvik.priors[0].m;
+        }
+        if (mmpf->ext[k] && mmpf->ext[k]->rbpf)
+        {
+            rbpf_mu = (double)mmpf->ext[k]->rbpf->params[0].mu_vol;
+        }
+
+        printf("║   %-7s  %8.4f        %8.4f        %8.4f              ║\n",
+               model_names[k], structural_mu, storvik_mu, rbpf_mu);
+    }
+    printf("╠═══════════════════════════════════════════════════════════════════╣\n");
+
+    /* Question 2: What are the Likelihoods? */
+    printf("║ Q2: LIKELIHOODS (Why isn't IMM switching?)                        ║\n");
+    printf("║   Model     Weight      Log-Lik     Marginal_Lik    Output_μ     ║\n");
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        printf("║   %-7s  %.4f      %8.2f    %12.6e    %8.4f     ║\n",
+               model_names[k],
+               (double)mmpf->weights[k],
+               (double)mmpf->log_weights[k],
+               (double)mmpf->model_likelihood[k],
+               (double)mmpf->model_output[k].log_vol_mean);
+    }
+    printf("╠═══════════════════════════════════════════════════════════════════╣\n");
+
+    /* Question 3: What is the Gradient? */
+    printf("║ Q3: GRADIENT DECOMPOSITION (Is Calm sabotaging expansion?)        ║\n");
+    printf("║   Structural State: B=%.4f, S=%.4f                             ║\n",
+           mmpf->online_em.base_level, mmpf->online_em.spread);
+    printf("║                                                                   ║\n");
+    printf("║   Model     Coeff    Pred_μ     Error     Robust    Vote_S       ║\n");
+
+    double total_vote_S = 0.0;
+    double total_vote_B = 0.0;
+    const double robust_scale = mmpf->online_em.robust_scale;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        double w_k = (double)mmpf->weights[k];
+        double c_k = mmpf->online_em.coefficients[k];
+        double pred_k = mmpf->online_em.base_level + c_k * mmpf->online_em.spread;
+        double raw_error = (double)y_log - pred_k;
+
+        double robust_err = raw_error;
+        if (robust_err > robust_scale)
+            robust_err = robust_scale;
+        if (robust_err < -robust_scale)
+            robust_err = -robust_scale;
+
+        double vote_S = w_k * robust_err * c_k;
+        double vote_B = w_k * robust_err;
+
+        total_vote_S += vote_S;
+        total_vote_B += vote_B;
+
+        printf("║   %-7s  %5.1f    %7.4f    %7.4f   %7.4f   %8.5f     ║\n",
+               model_names[k], c_k, pred_k, raw_error, robust_err, vote_S);
+    }
+    printf("║   ─────────────────────────────────────────────────────────────   ║\n");
+    printf("║   TOTAL grad_B = %8.5f    grad_S = %8.5f                     ║\n",
+           total_vote_B, total_vote_S);
+    printf("║   lr_S = %.3f (pos) / %.4f (neg)                                ║\n",
+           mmpf->online_em.lr_spread_pos, mmpf->online_em.lr_spread_neg);
+    printf("║   Δspread = %.5f                                                ║\n",
+           (total_vote_S > 0 ? mmpf->online_em.lr_spread_pos : mmpf->online_em.lr_spread_neg) * total_vote_S);
+    printf("╠═══════════════════════════════════════════════════════════════════╣\n");
+
+    /* Summary */
+    printf("║ DIAGNOSIS:                                                        ║\n");
+    if (total_vote_S < 0 && (double)y_log > mmpf->online_em.base_level)
+    {
+        printf("║   ⚠ GRADIENT BUG: y > B but grad_S < 0 (spread shrinking!)       ║\n");
+        printf("║   → Calm model is sabotaging expansion                           ║\n");
+    }
+    else if (total_vote_S > 0)
+    {
+        printf("║   ✓ Spread expanding (grad_S > 0)                                ║\n");
+    }
+    else
+    {
+        printf("║   → Spread contracting (normal if y < B)                         ║\n");
+    }
+
+    if ((double)mmpf->weights[MMPF_CRISIS] < 0.3 && (double)y_log > -3.5)
+    {
+        printf("║   ⚠ WEIGHT BUG: Crisis weight low (%.2f) despite high vol        ║\n",
+               (double)mmpf->weights[MMPF_CRISIS]);
+    }
+
+    printf("╚═══════════════════════════════════════════════════════════════════╝\n\n");
+}
+
+/* Add declaration to header or use static inline */
+#ifndef MMPF_DIAGNOSTIC_THRESHOLD
+#define MMPF_DIAGNOSTIC_THRESHOLD (-3.0) /* Trigger diagnostic when y_log > this */
+#endif

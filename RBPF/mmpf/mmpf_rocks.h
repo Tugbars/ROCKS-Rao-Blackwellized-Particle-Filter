@@ -303,6 +303,16 @@ extern "C"
         int enable_gated_learning;            /* 1 = weight dynamics updates by regime prob */
         rbpf_real_t gated_learning_threshold; /* Min weight to update (0.0 = soft gate) */
 
+        /*═══════════════════════════════════════════════════════════════════════
+         * DIAGNOSTIC OUTPUT
+         *
+         * When enabled, prints detailed crisis diagnostics when y_log exceeds
+         * the threshold. Useful for debugging regime switching behavior.
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        int enable_crisis_diagnostic;            /* 1 = print diagnostic during high-vol ticks */
+        rbpf_real_t crisis_diagnostic_threshold; /* Trigger when y_log > this (default: -3.0) */
+
     } MMPF_Config;
 
     /*═══════════════════════════════════════════════════════════════════════════
@@ -1032,6 +1042,20 @@ extern "C"
                               uint64_t *total_steps,
                               uint64_t *regime_switches,
                               uint64_t *imm_mix_count);
+
+    /**
+     * Print comprehensive crisis diagnostic.
+     *
+     * Call this to understand what's happening during regime transitions.
+     * Answers three key questions:
+     *   1. Is Storvik running? (Compare Storvik mu vs Structural mu)
+     *   2. What are the likelihoods? (Why isn't IMM switching?)
+     *   3. What is the gradient? (Is Calm sabotaging spread expansion?)
+     *
+     * @param mmpf   MMPF instance
+     * @param y_log  Current observation (log return squared)
+     */
+    void mmpf_crisis_diagnostic(const MMPF_ROCKS *mmpf, rbpf_real_t y_log);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * PARTICLE BUFFER API (Internal, but exposed for testing)
