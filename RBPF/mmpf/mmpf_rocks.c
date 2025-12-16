@@ -628,7 +628,7 @@ MMPF_Config mmpf_config_defaults(void)
     for (int r = 0; r < PARAM_LEARN_MAX_REGIMES; r++)
     {
         cfg.robust_ocsn.regime[r].prob = RBPF_REAL(0.05);      /* 5% outlier prior */
-        cfg.robust_ocsn.regime[r].variance = RBPF_REAL(150.0); /* HUGE → K ≈ 0 (was 80) */
+        cfg.robust_ocsn.regime[r].variance = RBPF_REAL(150.0); /* Wide → protects state during outliers */
     }
 
     /* Storvik config */
@@ -1134,8 +1134,8 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
     {
         /* Learning parameters */
         mmpf->online_em.alpha = 0.995;              /* EMA decay for smoothing */
-        mmpf->online_em.learning_rate_base = 0.005; /* Base moves moderately fast (drift) */
-        mmpf->online_em.learning_rate_spread = 0.0; /* FIXED GEOMETRY - spread doesn't learn */
+        mmpf->online_em.learning_rate_base = 0.01;  /* Drift tracking */
+        mmpf->online_em.learning_rate_spread = 0.0; /* Not used - asymmetric in update */
         mmpf->online_em.warmup_ticks = 50;
         mmpf->online_em.tick_count = 0;
 
@@ -1143,18 +1143,15 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
          * These coefficients define how each model relates to the base level:
          *   CALM:   Below base (quiet markets)
          *   TREND:  At base (normal/trending)
-         *   CRISIS: Above base (high volatility)
-         *
-         * SYMMETRIC design: Calm and Crisis are equidistant from Trend
-         * This matches the original mu_vol_offsets: [-0.5, 0.0, +0.5]
+         *   CRISIS: Above base (high volatility, asymmetric - crisis is further out)
          */
         mmpf->online_em.coefficients[MMPF_CALM] = -1.0;  /* One spread below */
         mmpf->online_em.coefficients[MMPF_TREND] = 0.0;  /* At base level */
-        mmpf->online_em.coefficients[MMPF_CRISIS] = 1.0; /* One spread above (symmetric) */
+        mmpf->online_em.coefficients[MMPF_CRISIS] = 1.5; /* 1.5 spreads above (asymmetric) */
 
         /* Structural constraints (prevent collapse and explosion) */
-        mmpf->online_em.min_spread = 0.5; /* Minimum separation - matches original design */
-        mmpf->online_em.max_spread = 3.0; /* Maximum separation (prevents explosion) */
+        mmpf->online_em.min_spread = 0.5; /* Minimum separation */
+        mmpf->online_em.max_spread = 4.0; /* Maximum separation */
 
         /* Initialize structural state from configured hypotheses
          *
@@ -1945,7 +1942,7 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
         }
 
         /*═══════════════════════════════════════════════════════════════════════
-         * STRUCTURAL HIERARCHICAL ESTIMATION
+         * STRUCTURAL HIERARCHICAL ESTIMATION (with Robust M-Estimation)
          *
          * Instead of learning 3 independent μ values (which collapse),
          * we learn 2 structural parameters using gradient descent:
@@ -1953,11 +1950,18 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
          *   B = Base Level (where is the market overall?)
          *   S = Spread (how far apart are the regimes?)
          *
-         * Loss: L = 0.5 × Σ w_k × (y - (B + c_k × S))²
+         * CRITICAL: We use ROBUST gradients (Huber influence function)!
          *
-         * Key insight: We use weighted_log_vol (already computed) as the
-         * "truth" signal. This closes the loop:
-         *   RBPF tells EM where vol is → EM tells RBPF where regimes are
+         * The Problem with L2 Loss:
+         *   During crisis, Calm model has HUGE error (+2.0)
+         *   L2 gradient: 2.0 × (-1.0) = -2.0 → SHRINK spread to "save" Calm
+         *   This is BACKWARDS! We want spread to EXPAND.
+         *
+         * The Solution (M-Estimation):
+         *   Clip large errors → "wrong" models can't hijack the structure
+         *   Calm's +2.0 error clips to +1.0 → gradient capped
+         *   Crisis's +0.5 error unchanged → dominates when it has weight
+         *   Result: Spread EXPANDS during crisis (correct behavior!)
          *═══════════════════════════════════════════════════════════════════════*/
         {
             mmpf->online_em.tick_count++;
@@ -1968,13 +1972,18 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 goto skip_structural_update;
             }
 
-            /* Use weighted posterior log-vol as the "truth" signal */
-            double y = (double)mmpf->weighted_log_vol;
+            /* Use RAW observation, not model consensus */
+            double y_raw = (double)y_log;
 
-            if (y != y)
+            if (y_raw != y_raw)
                 goto skip_structural_update; /* NaN guard */
 
-            /* Compute gradients for structural parameters */
+            /* Robust Influence Function (Huber)
+             * Clips large errors to prevent "wrong" models from dominating.
+             * Scale of 1.0 = ~2 sigma for typical vol-of-vol. */
+            const double ROBUST_SCALE = 1.0;
+
+            /* Compute gradients with ROBUST errors */
             double grad_B = 0.0;
             double grad_S = 0.0;
             double total_weight = 0.0;
@@ -1990,12 +1999,21 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 /* Current prediction for model k */
                 double pred_k = mmpf->online_em.base_level + c_k * mmpf->online_em.spread;
 
-                /* Prediction error (positive = vol higher than expected) */
-                double error_k = y - pred_k;
+                /* Raw prediction error */
+                double raw_error = y_raw - pred_k;
 
-                /* Accumulate gradients */
-                grad_B += w_k * error_k;       /* If error > 0, move Base UP */
-                grad_S += w_k * error_k * c_k; /* If error > 0 AND c_k > 0, increase Spread */
+                /* ROBUST error: Clip large errors (M-Estimation / Huber)
+                 * This prevents the "wrong" model from hijacking the structure.
+                 * During crisis: Calm's +2.0 error clips to +1.0 */
+                double robust_err = raw_error;
+                if (robust_err > ROBUST_SCALE)
+                    robust_err = ROBUST_SCALE;
+                if (robust_err < -ROBUST_SCALE)
+                    robust_err = -ROBUST_SCALE;
+
+                /* Accumulate gradients using ROBUST error */
+                grad_B += w_k * robust_err;
+                grad_S += w_k * robust_err * c_k;
 
                 total_weight += w_k;
             }
@@ -2007,11 +2025,18 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 grad_S /= total_weight;
             }
 
-            /* Update structural parameters (SGD step) */
+            /* Update Base Level */
             double lr_B = mmpf->online_em.learning_rate_base;
-            double lr_S = mmpf->online_em.learning_rate_spread;
-
             mmpf->online_em.base_level += lr_B * grad_B;
+
+            /* Asymmetric Spread Dynamics ("Fast to Fear, Slow to Calm")
+             * Now that robust gradients fix the sign, this works correctly:
+             *   - Positive gradient (crisis) → fast expansion
+             *   - Negative gradient (recovery) → slow contraction
+             */
+            double lr_S = (grad_S > 0.0) ? 0.050  /* Expand fast (fear) */
+                                         : 0.001; /* Contract slow (recovery) */
+
             mmpf->online_em.spread += lr_S * grad_S;
 
             /* Enforce structural constraints */
@@ -2024,24 +2049,30 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 mmpf->online_em.spread = mmpf->online_em.max_spread;
             }
 
-            /* Safety bounds on base level (sanity check) */
+            /* Safety bounds on base level */
             if (mmpf->online_em.base_level < -9.0)
                 mmpf->online_em.base_level = -9.0;
             if (mmpf->online_em.base_level > 2.0)
                 mmpf->online_em.base_level = 2.0;
 
             /* Project structural state to model means */
-            /* This GUARANTEES: μ_calm < μ_trend < μ_crisis (forever) */
             for (int k = 0; k < MMPF_N_MODELS; k++)
             {
                 double c_k = mmpf->online_em.coefficients[k];
                 mmpf->online_em.mu[k] = mmpf->online_em.base_level + c_k * mmpf->online_em.spread;
             }
 
-            /* Push learned μ_vol to RBPFs
-             * ONLY when adaptive learning is enabled (enable_storvik_sync).
-             * When disabled (for unit tests), RBPF uses the fixed hypothesis params
-             * that were configured at creation time. */
+            /* Push structural estimates to RBPF params and Storvik priors
+             *
+             * With Robust M-Estimation, the gradients are now correct:
+             *   - Large errors (wrong models) are CLIPPED
+             *   - Small errors (correct models) dominate
+             *   - Spread EXPANDS during crisis (correct behavior!)
+             *
+             * We update BOTH:
+             *   1. RBPF params: Direct mu_vol update (fast response)
+             *   2. Storvik priors: Gravitational anchor (prevents infinite drift)
+             */
             if (mmpf->config.enable_storvik_sync &&
                 !mmpf->config.enable_global_baseline)
             {
@@ -2050,12 +2081,13 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                     RBPF_Extended *ext = mmpf->ext[k];
                     double learned_mu = mmpf->online_em.mu[k];
 
+                    /* Update RBPF params directly */
                     for (int r = 0; r < ext->rbpf->n_regimes; r++)
                     {
                         ext->rbpf->params[r].mu_vol = (rbpf_real_t)learned_mu;
                     }
 
-                    /* Sync Storvik priors with structural estimates */
+                    /* Update Storvik priors (gravitational anchor) */
                     if (ext->storvik_initialized)
                     {
                         const MMPF_HypothesisParams *hp = &mmpf->config.hypotheses[k];
