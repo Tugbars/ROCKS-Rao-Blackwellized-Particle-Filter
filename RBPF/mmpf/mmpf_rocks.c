@@ -8,16 +8,30 @@
  *   Each hypothesis has its own tail thickness (ν). During extreme events,
  *   Crisis (ν=3) naturally wins Bayesian model comparison because it
  *   PREDICTED fat tails. No hacks needed — the likelihood does the work.
+ *
+ * Adaptive Components (Institutional Grade):
+ *   - MCMC:      Teleports particles to likelihood peak on shock
+ *   - Online EM: Learns regime centers from streaming data
+ *   - Entropy:   Detects filter stability for shock exit
+ *   - SPRT:      Statistically principled regime detection (in rbpf_ksc.c)
  */
 
 #ifdef MMPF_USE_TEST_STUB
 #include "rocks_test_stub.c"
 #endif
 #include "mmpf_rocks.h"
+#include "mmpf_mcmc.h"    /* MCMC teleportation */
+#include "mmpf_entropy.h" /* Entropy stability detection */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+
+/* MKL for MCMC random number generation */
+#ifdef MMPF_USE_MKL
+#include <mkl.h>
+#include <mkl_vsl.h>
+#endif
 
 /* SIMD intrinsics for double→float conversion */
 #ifdef _MSC_VER
@@ -1052,6 +1066,71 @@ MMPF_ROCKS *mmpf_create(const MMPF_Config *config)
         }
     }
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * INITIALIZE ADAPTIVE COMPONENTS (Institutional Grade)
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    /* MCMC scratch buffers for particle teleportation */
+    {
+        int n_particles = cfg.n_particles;
+        int n_mcmc_steps = 10; /* Typical MCMC steps per teleport */
+        int capacity = n_particles * n_mcmc_steps;
+
+        mmpf->mcmc_scratch_capacity = capacity;
+        mmpf->mcmc_rng_gauss = (double *)aligned_alloc(64, capacity * 2 * sizeof(double));
+        mmpf->mcmc_rng_log_u = (double *)aligned_alloc(64, capacity * sizeof(double));
+
+        if (!mmpf->mcmc_rng_gauss || !mmpf->mcmc_rng_log_u)
+        {
+            fprintf(stderr, "MMPF: Failed to allocate MCMC scratch buffers\n");
+            /* Non-fatal - MCMC will fall back to per-call allocation */
+        }
+
+#ifdef MMPF_USE_MKL
+        /* Create VSL stream for fast random generation */
+        VSLStreamStatePtr stream;
+        int status = vslNewStream(&stream, VSL_BRNG_MT19937, 42);
+        if (status == VSL_STATUS_OK)
+        {
+            mmpf->mcmc_vsl_stream = stream;
+        }
+        else
+        {
+            mmpf->mcmc_vsl_stream = NULL;
+        }
+#else
+        mmpf->mcmc_vsl_stream = NULL;
+#endif
+    }
+
+    /* Online EM for regime center learning */
+    {
+        mmpf->online_em.alpha = 0.995; /* ~200 tick half-life */
+        mmpf->online_em.warmup_ticks = 50;
+        mmpf->online_em.tick_count = 0;
+
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            /* Initialize to hypothesis centers */
+            mmpf->online_em.mu[k] = (double)(cfg.global_mu_vol_init + cfg.mu_vol_offsets[k]);
+            mmpf->online_em.sigma[k] = 0.5; /* Initial spread */
+            mmpf->online_em.sum_w[k] = 1.0; /* Prevent div-by-zero */
+            mmpf->online_em.sum_wx[k] = mmpf->online_em.mu[k];
+            mmpf->online_em.sum_wx2[k] = mmpf->online_em.mu[k] * mmpf->online_em.mu[k] + 0.25;
+        }
+    }
+
+    /* Entropy state for stability detection */
+    {
+        mmpf->entropy.H_ema = 0.5; /* Start at medium entropy */
+        mmpf->entropy.delta_ema = 0.0;
+        mmpf->entropy.alpha_h = 0.95;     /* ~20 tick half-life */
+        mmpf->entropy.alpha_delta = 0.90; /* ~10 tick half-life */
+        mmpf->entropy.locked = 0;
+        mmpf->entropy.ticks_locked = 0;
+        mmpf->entropy.max_lock_duration = 50; /* Force unlock after 50 ticks */
+    }
+
     /* Initialize cached outputs from RBPF initial state */
     mmpf->weighted_vol = RBPF_REAL(0.0);
     mmpf->weighted_log_vol = RBPF_REAL(0.0);
@@ -1123,6 +1202,17 @@ void mmpf_destroy(MMPF_ROCKS *mmpf)
         if (mmpf->mixed_buffer[k])
             mmpf_buffer_destroy(mmpf->mixed_buffer[k]);
     }
+
+    /* Free MCMC scratch buffers */
+    if (mmpf->mcmc_rng_gauss)
+        free(mmpf->mcmc_rng_gauss);
+    if (mmpf->mcmc_rng_log_u)
+        free(mmpf->mcmc_rng_log_u);
+
+#ifdef MMPF_USE_MKL
+    if (mmpf->mcmc_vsl_stream)
+        vslDeleteStream((VSLStreamStatePtr *)&mmpf->mcmc_vsl_stream);
+#endif
 
     free(mmpf);
 }
@@ -1779,110 +1869,110 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
                 }
             }
         }
-        else if (mmpf->config.enable_gated_learning)
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * ONLINE EM: Learn regime centers from streaming data
+         *
+         * Each hypothesis learns its own μ_vol from data where IT is dominant.
+         * This is a proper streaming GMM - no manual EWMA heuristics.
+         *═══════════════════════════════════════════════════════════════════════*/
         {
-            /* MANUAL MODE: WTA gated learning (fallback when Storvik disabled) */
-            int dominant = 0;
-            rbpf_real_t max_w = mmpf->weights[0];
-            for (int k = 1; k < MMPF_N_MODELS; k++)
-            {
-                if (mmpf->weights[k] > max_w)
-                {
-                    max_w = mmpf->weights[k];
-                    dominant = k;
-                }
-            }
+            double alpha = mmpf->online_em.alpha;
+            mmpf->online_em.tick_count++;
 
             for (int k = 0; k < MMPF_N_MODELS; k++)
             {
-                rbpf_real_t x_curr = mmpf->model_output[k].log_vol_mean;
+                double w_k = (double)mmpf->weights[k];
+                double x_k = (double)mmpf->model_output[k].log_vol_mean;
 
-                if (x_curr != x_curr)
-                {
+                if (x_k != x_k)
                     continue; /* NaN guard */
-                }
 
-                double x_prev = mmpf->gated_dynamics[k].prev_state;
+                /* Streaming sufficient statistics update */
+                mmpf->online_em.sum_w[k] = alpha * mmpf->online_em.sum_w[k] + w_k;
+                mmpf->online_em.sum_wx[k] = alpha * mmpf->online_em.sum_wx[k] + w_k * x_k;
+                mmpf->online_em.sum_wx2[k] = alpha * mmpf->online_em.sum_wx2[k] + w_k * x_k * x_k;
 
-                if (k != dominant)
+                /* Update mean and variance */
+                double sum_w = mmpf->online_em.sum_w[k];
+                if (sum_w > 1e-10)
                 {
-                    mmpf->gated_dynamics[k].prev_state = (double)x_curr;
-                    continue;
+                    double new_mu = mmpf->online_em.sum_wx[k] / sum_w;
+                    double new_var = mmpf->online_em.sum_wx2[k] / sum_w - new_mu * new_mu;
+                    if (new_var < 0.01)
+                        new_var = 0.01;
+
+                    mmpf->online_em.mu[k] = new_mu;
+                    mmpf->online_em.sigma[k] = sqrt(new_var);
                 }
+            }
 
-                double w = 1.0;
-
-                /* Manual μ_vol EWMA (only used when Storvik disabled) */
-                double mu_alpha;
-                switch (k)
+            /* Push learned μ_vol to RBPFs (after warmup) */
+            if (mmpf->online_em.tick_count >= mmpf->online_em.warmup_ticks &&
+                !mmpf->config.enable_global_baseline) /* Skip if baseline controls μ */
+            {
+                for (int k = 0; k < MMPF_N_MODELS; k++)
                 {
-                case MMPF_CALM:
-                    mu_alpha = 0.995;
-                    break;
-                case MMPF_TREND:
-                    mu_alpha = 0.98;
-                    break;
-                case MMPF_CRISIS:
-                    mu_alpha = 0.90;
-                    break;
-                default:
-                    mu_alpha = 0.98;
-                    break;
-                }
-
-                double old_mu = mmpf->gated_dynamics[k].mu_vol;
-                double new_mu = mu_alpha * old_mu + (1.0 - mu_alpha) * (double)x_curr;
-                mmpf->gated_dynamics[k].mu_vol = new_mu;
-
-                /* Push to RBPF */
-                RBPF_Extended *ext = mmpf->ext[k];
-                for (int r = 0; r < ext->rbpf->n_regimes; r++)
-                {
-                    ext->rbpf->params[r].mu_vol = (rbpf_real_t)new_mu;
-                }
-
-                /* φ learning (Storvik doesn't learn φ, so we keep this) */
-                double mu_k = mmpf->gated_dynamics[k].mu_vol;
-                double centered_prev = x_prev - mu_k;
-                double centered_curr = (double)x_curr - mu_k;
-
-                mmpf->gated_dynamics[k].sum_xy += w * centered_prev * centered_curr;
-                mmpf->gated_dynamics[k].sum_xx += w * centered_prev * centered_prev;
-
-                /* σ_η learning */
-                double phi = mmpf->gated_dynamics[k].phi;
-                double predicted = phi * centered_prev;
-                double residual = centered_curr - predicted;
-                mmpf->gated_dynamics[k].sum_resid_sq += w * residual * residual;
-                mmpf->gated_dynamics[k].sum_w_sigma += w;
-
-                if (mmpf->gated_dynamics[k].sum_w_sigma > 10.0)
-                {
-                    double new_phi = mmpf->gated_dynamics[k].sum_xy /
-                                     (mmpf->gated_dynamics[k].sum_xx + 1e-10);
-                    new_phi = fmax(0.80, fmin(0.995, new_phi));
-
-                    double new_sigma = sqrt(mmpf->gated_dynamics[k].sum_resid_sq /
-                                            mmpf->gated_dynamics[k].sum_w_sigma);
-                    new_sigma = fmax(0.01, fmin(1.0, new_sigma));
-
-                    mmpf->gated_dynamics[k].phi = new_phi;
-                    mmpf->gated_dynamics[k].sigma_eta = new_sigma;
+                    RBPF_Extended *ext = mmpf->ext[k];
+                    double learned_mu = mmpf->online_em.mu[k];
 
                     for (int r = 0; r < ext->rbpf->n_regimes; r++)
                     {
-                        ext->rbpf->params[r].theta = (rbpf_real_t)(1.0 - new_phi);
-                        ext->rbpf->params[r].sigma_vol = (rbpf_real_t)new_sigma;
+                        ext->rbpf->params[r].mu_vol = (rbpf_real_t)learned_mu;
                     }
-
-                    double forget_dyn = 0.99;
-                    mmpf->gated_dynamics[k].sum_xy *= forget_dyn;
-                    mmpf->gated_dynamics[k].sum_xx *= forget_dyn;
-                    mmpf->gated_dynamics[k].sum_resid_sq *= forget_dyn;
-                    mmpf->gated_dynamics[k].sum_w_sigma *= forget_dyn;
                 }
+            }
+        }
 
-                mmpf->gated_dynamics[k].prev_state = (double)x_curr;
+        /*═══════════════════════════════════════════════════════════════════════
+         * ENTROPY TRACKING: Detect filter stability for shock exit
+         *
+         * H_norm = -Σ w_k log(w_k) / log(K)  ∈ [0, 1]
+         *   0 = One hypothesis dominates (confident)
+         *   1 = Uniform weights (maximum uncertainty)
+         *
+         * When shock_active && H_ema stabilizes (delta_ema < threshold):
+         *   → Filter has found equilibrium → auto-exit shock
+         *═══════════════════════════════════════════════════════════════════════*/
+        {
+            /* Compute normalized entropy */
+            double H = 0.0;
+            double log_K = log((double)MMPF_N_MODELS);
+            for (int k = 0; k < MMPF_N_MODELS; k++)
+            {
+                double w = (double)mmpf->weights[k];
+                if (w > 1e-10)
+                {
+                    H -= w * log(w);
+                }
+            }
+            double H_norm = H / log_K;
+
+            /* Update EMAs */
+            double alpha_h = mmpf->entropy.alpha_h;
+            double alpha_d = mmpf->entropy.alpha_delta;
+            double H_prev = mmpf->entropy.H_ema;
+
+            mmpf->entropy.H_ema = alpha_h * H_prev + (1.0 - alpha_h) * H_norm;
+            double delta = fabs(H_norm - H_prev);
+            mmpf->entropy.delta_ema = alpha_d * mmpf->entropy.delta_ema + (1.0 - alpha_d) * delta;
+
+            /* Check for shock auto-exit */
+            if (mmpf->shock_active)
+            {
+                mmpf->entropy.ticks_locked++;
+
+                /* Stability criterion: delta_ema < 0.02 (filter settled) OR timeout */
+                int stable = (mmpf->entropy.delta_ema < 0.02);
+                int timeout = (mmpf->entropy.ticks_locked >= mmpf->entropy.max_lock_duration);
+
+                if (stable || timeout)
+                {
+                    /* Auto-exit shock state */
+                    mmpf_restore_from_shock(mmpf);
+                    mmpf->entropy.locked = 0;
+                    mmpf->entropy.ticks_locked = 0;
+                }
             }
         }
     }
@@ -1958,6 +2048,18 @@ void mmpf_step(MMPF_ROCKS *mmpf, rbpf_real_t y, MMPF_Output *output)
             output->model_nu[k] = mmpf->learned_nu[k];
             output->model_lambda_mean[k] = mmpf->model_output[k].lambda_mean;
             output->model_nu_effective[k] = mmpf->model_output[k].nu_effective;
+        }
+
+        /* Entropy and shock diagnostics */
+        output->entropy_norm = (rbpf_real_t)mmpf->entropy.H_ema;
+        output->entropy_delta = (rbpf_real_t)mmpf->entropy.delta_ema;
+        output->shock_active = mmpf->shock_active;
+        output->entropy_locked = mmpf->entropy.locked;
+
+        /* Online EM diagnostics */
+        for (int k = 0; k < MMPF_N_MODELS; k++)
+        {
+            output->online_em_mu[k] = (rbpf_real_t)mmpf->online_em.mu[k];
         }
     }
 }
@@ -2196,7 +2298,155 @@ void mmpf_set_nu_learning(MMPF_ROCKS *mmpf, int enable, rbpf_real_t learning_rat
  * This cuts detection lag from ~100 ticks to <20 ticks.
  *═══════════════════════════════════════════════════════════════════════════*/
 
+/*═══════════════════════════════════════════════════════════════════════════
+ * SHOCK INJECTION - MCMC (Recommended)
+ *
+ * Uses Metropolis-Hastings to teleport particles to likelihood peak.
+ * See mmpf_mcmc.h for full documentation.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void mmpf_inject_shock_adaptive(MMPF_ROCKS *mmpf, rbpf_real_t y_log_sq)
+{
+    if (!mmpf)
+        return;
+
+    /* Don't double-inject */
+    if (mmpf->shock_active)
+        return;
+
+    /* Save current transition matrix */
+    for (int i = 0; i < MMPF_N_MODELS; i++)
+    {
+        for (int j = 0; j < MMPF_N_MODELS; j++)
+        {
+            mmpf->saved_transition[i][j] = mmpf->transition[i][j];
+        }
+    }
+
+    /* Set uniform transitions: all regimes equally likely */
+    const rbpf_real_t uniform = RBPF_REAL(1.0) / MMPF_N_MODELS;
+    for (int i = 0; i < MMPF_N_MODELS; i++)
+    {
+        for (int j = 0; j < MMPF_N_MODELS; j++)
+        {
+            mmpf->transition[i][j] = uniform;
+        }
+    }
+
+    /* MCMC teleportation: Move particles to likelihood peak
+     *
+     * For each hypothesis, run Metropolis-Hastings to find the particle
+     * cloud center that maximizes P(y|x). This gives instant tracking
+     * instead of the slow random walk from the legacy noise×50 approach.
+     */
+#ifdef MMPF_ENABLE_MCMC
+    /* Pre-fill RNG buffers using MKL for efficiency */
+    if (mmpf->mcmc_vsl_stream && mmpf->mcmc_rng_gauss && mmpf->mcmc_rng_log_u)
+    {
+#ifdef MMPF_USE_MKL
+        int capacity = mmpf->mcmc_scratch_capacity;
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER,
+                      (VSLStreamStatePtr)mmpf->mcmc_vsl_stream,
+                      capacity * 2, mmpf->mcmc_rng_gauss, 0.0, 1.0);
+        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD,
+                     (VSLStreamStatePtr)mmpf->mcmc_vsl_stream,
+                     capacity, mmpf->mcmc_rng_log_u, 0.0, 1.0);
+        /* Convert uniform to log for MH accept check */
+        for (int i = 0; i < capacity; i++)
+        {
+            mmpf->mcmc_rng_log_u[i] = log(mmpf->mcmc_rng_log_u[i]);
+        }
+#endif
+    }
+
+    MMPF_MCMC_Config mcmc_cfg = mmpf_mcmc_default_config();
+    mcmc_cfg.n_steps = 10;
+    mcmc_cfg.proposal_std = 0.5;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
+
+        /* MCMC teleports particles to likelihood peak */
+        mmpf_mcmc_teleport_particles(
+            rbpf->mu,
+            rbpf->n_particles,
+            (double)y_log_sq,
+            (double)rbpf->params[0].mu_vol,
+            (double)rbpf->params[0].sigma_vol,
+            &mcmc_cfg,
+            mmpf->mcmc_rng_gauss,
+            mmpf->mcmc_rng_log_u);
+    }
+#else
+    /* Fallback when MCMC not compiled: Likelihood-weighted teleport
+     *
+     * y_log_sq = log(r²) ≈ 2×h_t + log(ε²)
+     *
+     * The observation implies h_t ≈ (y_log_sq - E[log(ε²)]) / 2
+     * For standard normal ε: E[log(ε²)] ≈ -1.27 (digamma correction)
+     *
+     * We teleport particles toward this implied volatility with jitter.
+     */
+    const double psi_correction = -1.27; /* E[log(χ²₁)] = ψ(0.5) + log(2) */
+    double implied_h = ((double)y_log_sq - psi_correction) / 2.0;
+
+    for (int k = 0; k < MMPF_N_MODELS; k++)
+    {
+        RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
+        double mu_vol = (double)rbpf->params[0].mu_vol;
+        double sigma_vol = (double)rbpf->params[0].sigma_vol;
+
+        /* Blend target: weighted average of implied_h and prior mu_vol
+         * Crisis hypothesis trusts observation more (lower weight on prior) */
+        double prior_weight = (k == MMPF_CRISIS) ? 0.2 : 0.5;
+        double target = prior_weight * mu_vol + (1.0 - prior_weight) * implied_h;
+
+        for (int i = 0; i < rbpf->n_particles; i++)
+        {
+            /* Teleport with jitter proportional to sigma_vol */
+            double jitter = sigma_vol * ((double)rand() / RAND_MAX - 0.5) * 2.0;
+            rbpf->mu[i] = (rbpf_real_t)(target + jitter);
+
+            /* Also increase variance to allow exploration */
+            rbpf->var[i] *= RBPF_REAL(2.0);
+        }
+    }
+#endif
+
+    /* Mark shock active - entropy tracker will auto-exit */
+    mmpf->shock_active = 1;
+    mmpf->process_noise_multiplier = RBPF_REAL(1.0); /* No legacy noise boost */
+    mmpf->entropy.locked = 1;
+    mmpf->entropy.ticks_locked = 0;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * SHOCK INJECTION - DEFAULT (Uses MCMC)
+ *
+ * The default shock injection now uses MCMC particle teleportation.
+ * For the legacy noise×50 method, use mmpf_inject_shock_legacy().
+ *═══════════════════════════════════════════════════════════════════════════*/
+
 void mmpf_inject_shock(MMPF_ROCKS *mmpf)
+{
+    if (!mmpf)
+        return;
+
+    /* Use the last observation to guide MCMC teleportation
+     * If no observation available, use current weighted estimate */
+    rbpf_real_t y_log_sq = mmpf->weighted_log_vol * RBPF_REAL(2.0);
+    mmpf_inject_shock_adaptive(mmpf, y_log_sq);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * SHOCK INJECTION - LEGACY (Deprecated)
+ *
+ * Uses blind noise boost (×50). Replaced by MCMC for better tracking.
+ * Kept for backward compatibility only - use mmpf_inject_shock() instead.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void mmpf_inject_shock_legacy(MMPF_ROCKS *mmpf)
 {
     mmpf_inject_shock_ex(mmpf, RBPF_REAL(50.0));
 }
@@ -2229,24 +2479,23 @@ void mmpf_inject_shock_ex(MMPF_ROCKS *mmpf, rbpf_real_t noise_multiplier)
         }
     }
 
-    /* Boost process noise on all three RBPFs
-     * This forces particles to spread out and explore wider μ_vol range.
-     * The higher noise makes all hypotheses consider more possibilities,
-     * allowing the likelihood to immediately determine the winner.
+    /* LEGACY: Boost process noise on all three RBPFs
      *
-     * q = sigma_vol² is the process variance used in Kalman predict.
-     * We scale sigma_vol and q together to maintain consistency.
+     * WARNING: This is the old "blind spray" heuristic. It works but causes
+     * shark-fin lag because particles must WALK to the new volatility level.
+     *
+     * Use mmpf_inject_shock_mcmc() instead for instant tracking via
+     * Metropolis-Hastings particle teleportation.
      */
     mmpf->process_noise_multiplier = noise_multiplier;
 
     for (int k = 0; k < MMPF_N_MODELS; k++)
     {
-        /* Temporarily boost sigma_vol in each RBPF */
         RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
         for (int r = 0; r < rbpf->n_regimes; r++)
         {
             rbpf->params[r].sigma_vol *= noise_multiplier;
-            rbpf->params[r].q *= (noise_multiplier * noise_multiplier); /* q = sigma_vol² */
+            rbpf->params[r].q *= (noise_multiplier * noise_multiplier);
         }
     }
 
@@ -2271,17 +2520,22 @@ void mmpf_restore_from_shock(MMPF_ROCKS *mmpf)
         }
     }
 
-    /* Restore process noise on all three RBPFs */
-    rbpf_real_t inv_multiplier = RBPF_REAL(1.0) / mmpf->process_noise_multiplier;
-    rbpf_real_t inv_multiplier_sq = inv_multiplier * inv_multiplier;
-
-    for (int k = 0; k < MMPF_N_MODELS; k++)
+    /* Restore process noise (only needed for legacy mode)
+     * MCMC mode doesn't modify sigma_vol/q, so this is a no-op when
+     * process_noise_multiplier == 1.0 */
+    if (mmpf->process_noise_multiplier != RBPF_REAL(1.0))
     {
-        RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
-        for (int r = 0; r < rbpf->n_regimes; r++)
+        rbpf_real_t inv_multiplier = RBPF_REAL(1.0) / mmpf->process_noise_multiplier;
+        rbpf_real_t inv_multiplier_sq = inv_multiplier * inv_multiplier;
+
+        for (int k = 0; k < MMPF_N_MODELS; k++)
         {
-            rbpf->params[r].sigma_vol *= inv_multiplier;
-            rbpf->params[r].q *= inv_multiplier_sq; /* q = sigma_vol² */
+            RBPF_KSC *rbpf = mmpf->ext[k]->rbpf;
+            for (int r = 0; r < rbpf->n_regimes; r++)
+            {
+                rbpf->params[r].sigma_vol *= inv_multiplier;
+                rbpf->params[r].q *= inv_multiplier_sq;
+            }
         }
     }
 

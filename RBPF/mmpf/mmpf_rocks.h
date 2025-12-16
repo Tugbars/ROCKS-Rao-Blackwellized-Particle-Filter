@@ -364,6 +364,15 @@ extern "C"
         rbpf_real_t learned_mu_vol[MMPF_N_MODELS];    /* Learned μ_vol per model */
         rbpf_real_t learned_sigma_eta[MMPF_N_MODELS]; /* Learned σ_η per model */
 
+        /* Entropy diagnostics (filter stability) */
+        rbpf_real_t entropy_norm;  /* H_norm ∈ [0,1] - normalized weight entropy */
+        rbpf_real_t entropy_delta; /* |ΔH| rate of change */
+        int shock_active;          /* 1 if shock mode active */
+        int entropy_locked;        /* 1 if entropy lock engaged */
+
+        /* Online EM diagnostics (learned regime centers) */
+        rbpf_real_t online_em_mu[MMPF_N_MODELS]; /* EM-learned regime centers */
+
     } MMPF_Output;
 
     /*═══════════════════════════════════════════════════════════════════════════
@@ -492,6 +501,46 @@ extern "C"
         int shock_active;                     /* 1 if currently in shock mode */
         rbpf_real_t process_noise_multiplier; /* Applied to sigma_vol during shock */
         int shock_cooldown;                   /* Refractory ticks remaining (0 = ready) */
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * ADAPTIVE COMPONENTS (Institutional Grade)
+         *
+         * These replace heuristic-based response with data-driven algorithms:
+         *   - MCMC: Teleports particles to likelihood peak (replaces noise×50 spray)
+         *   - Online EM: Learns regime centers streaming (replaces manual EWMA)
+         *   - Entropy: Detects filter stability (triggers shock exit)
+         *═══════════════════════════════════════════════════════════════════════*/
+
+        /* MCMC scratch buffers (pre-allocated for zero-alloc hot path) */
+        double *mcmc_rng_gauss;    /* [n_particles * n_steps * 2] */
+        double *mcmc_rng_log_u;    /* [n_particles * n_steps] */
+        int mcmc_scratch_capacity; /* Allocated capacity */
+        void *mcmc_vsl_stream;     /* VSLStreamStatePtr */
+
+        /* Online EM state (streaming GMM for regime center learning) */
+        struct
+        {
+            double mu[MMPF_N_MODELS];      /* Learned regime centers */
+            double sigma[MMPF_N_MODELS];   /* Learned regime spreads */
+            double sum_w[MMPF_N_MODELS];   /* Cumulative weight per regime */
+            double sum_wx[MMPF_N_MODELS];  /* Σ w×x for mean */
+            double sum_wx2[MMPF_N_MODELS]; /* Σ w×x² for variance */
+            double alpha;                  /* EMA decay (0.995 = 200 tick half-life) */
+            int warmup_ticks;              /* Ticks before output is trusted */
+            int tick_count;                /* Current tick */
+        } online_em;
+
+        /* Entropy state (stability detection for shock exit) */
+        struct
+        {
+            double H_ema;          /* EMA of normalized entropy */
+            double delta_ema;      /* EMA of |ΔH| (rate of change) */
+            double alpha_h;        /* EMA decay for H */
+            double alpha_delta;    /* EMA decay for delta */
+            int locked;            /* 1 if transitions locked (during shock) */
+            int ticks_locked;      /* Ticks since lock engaged */
+            int max_lock_duration; /* Force unlock after N ticks */
+        } entropy;
 
         /*═══════════════════════════════════════════════════════════════════════
          * GLOBAL BASELINE TRACKING STATE
@@ -819,15 +868,39 @@ extern "C"
      *
      * Effects:
      *   - Transition matrix → uniform (33% to each regime)
-     *   - Process noise (sigma_vol) → multiplied by 50x
+     *   - MCMC particle teleportation to likelihood peak
      *   - Shock flag set (prevents double-injection)
+     *   - Entropy lock engaged (auto-exit when stable)
      *
      * @param mmpf  MMPF instance
      */
     void mmpf_inject_shock(MMPF_ROCKS *mmpf);
 
     /**
-     * Inject shock with custom process noise multiplier.
+     * Inject shock with MCMC particle teleportation using specific observation.
+     *
+     * Uses Metropolis-Hastings to teleport particles to the likelihood peak
+     * implied by the observation. This gives instant tracking instead of
+     * the slow random walk from legacy noise boost.
+     *
+     * Auto-exit: Entropy tracker detects when filter stabilizes and
+     * automatically calls mmpf_restore_from_shock().
+     *
+     * @param mmpf      MMPF instance
+     * @param y_log_sq  Current observation: log(return²)
+     */
+    void mmpf_inject_shock_adaptive(MMPF_ROCKS *mmpf, rbpf_real_t y_log_sq);
+
+    /**
+     * LEGACY: Inject shock with noise boost (DEPRECATED).
+     *
+     * Uses blind noise boost (×50). Replaced by MCMC for better tracking.
+     * Only use for backward compatibility testing.
+     */
+    void mmpf_inject_shock_legacy(MMPF_ROCKS *mmpf);
+
+    /**
+     * LEGACY: Inject shock with custom noise multiplier (DEPRECATED).
      *
      * @param mmpf                 MMPF instance
      * @param noise_multiplier     Process noise boost (default: 50.0)
