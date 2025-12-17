@@ -96,14 +96,14 @@ void rbpf_ksc_predict(RBPF_KSC *rbpf)
     const RBPF_RegimeParams *params = rbpf->params;
     const int n_regimes = rbpf->n_regimes;
 
-    /* Per-particle parameters: Set by external learner (Storvik via MMPF) */
-    const int use_particles = rbpf->use_learned_params;
-
     rbpf_real_t *restrict mu = rbpf->mu;
     rbpf_real_t *restrict var = rbpf->var;
     const int *restrict regime = rbpf->regime;
     rbpf_real_t *restrict mu_pred = rbpf->mu_pred;
     rbpf_real_t *restrict var_pred = rbpf->var_pred;
+
+    /* Per-particle parameters: Set by external learner (Storvik via MMPF) */
+    const int use_particles = rbpf->use_learned_params;
 
     if (use_particles)
     {
@@ -505,6 +505,14 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
+ * BOCPD HELPER FUNCTIONS (for MMPF integration - not used in single RBPF)
+ *───────────────────────────────────────────────────────────────────────────*/
+
+/* E[log(χ²₁)] = ψ(0.5) + log(2) ≈ -1.27
+ * Used to convert y = 2h + log(ε²) back to implied h */
+#define PSI_CORRECTION RBPF_REAL(-1.27036)
+
+/*─────────────────────────────────────────────────────────────────────────────
  * MAIN UPDATE - THE HOT PATH
  *───────────────────────────────────────────────────────────────────────────*/
 
@@ -520,6 +528,10 @@ void rbpf_ksc_step(RBPF_KSC *rbpf, rbpf_real_t obs, RBPF_KSC_Output *output)
     {
         y = rbpf_log(obs * obs);
     }
+
+    /* Initialize output flags */
+    output->bocpd_triggered = 0;
+    output->regime_changed = 0;
 
     /* 1. Regime transition */
     rbpf_ksc_transition(rbpf);
@@ -546,82 +558,8 @@ void rbpf_ksc_step(RBPF_KSC *rbpf, rbpf_real_t obs, RBPF_KSC_Output *output)
     /* Store observation for SPRT likelihood computation */
     rbpf->last_y = y;
 
-    /* 4. Compute outputs (before resample) */
+    /* 4. Compute outputs */
     rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
-
-    /*═══════════════════════════════════════════════════════════════════════
-     * BOCPD CHANGEPOINT DETECTION (The "Afterburner")
-     *
-     * If BOCPD is attached, feed it log-vol estimates and check for
-     * changepoints. On detection, force SPRT to reconsider regime.
-     *
-     * This complements the "Pilot Light" (mutation) by providing
-     * event-driven regime switching when volatility structure changes.
-     *═══════════════════════════════════════════════════════════════════════*/
-    output->bocpd_triggered = 0;
-
-    if (rbpf->bocpd != NULL && rbpf->bocpd_delta != NULL)
-    {
-        /* Feed BOCPD with log-vol estimate */
-        bocpd_step(rbpf->bocpd, (double)output->log_vol_mean);
-
-        /* Update delta detector */
-        bocpd_delta_update(rbpf->bocpd_delta,
-                           rbpf->bocpd->r,
-                           rbpf->bocpd->active_len,
-                           rbpf->bocpd_decay);
-
-        /* Check for changepoint */
-        if (bocpd_delta_check(rbpf->bocpd_delta, rbpf->bocpd_threshold))
-        {
-            output->bocpd_triggered = 1;
-
-            /* Pick target regime: find regime closest to current vol estimate
-             * OR go to highest-vol regime for extreme moves */
-            int target_regime = 0;
-            double best_dist = 1e30;
-
-            for (int r = 0; r < rbpf->n_regimes; r++)
-            {
-                double dist = fabs((double)output->log_vol_mean -
-                                   (double)rbpf->params[r].mu_vol);
-                if (dist < best_dist)
-                {
-                    best_dist = dist;
-                    target_regime = r;
-                }
-            }
-
-            /* For extreme observations, bias toward highest-vol regime */
-            if (output->surprise > RBPF_REAL(5.0))
-            {
-                target_regime = rbpf->n_regimes - 1; /* Highest vol regime */
-            }
-
-            /* Force SPRT to target regime */
-            sprt_multi_force_regime(&rbpf->sprt, target_regime);
-            rbpf->detection.stable_regime = target_regime;
-
-            /* Update BOCPD hazard learning if enabled */
-            if (rbpf->bocpd_hazard != NULL &&
-                rbpf->bocpd_hazard->type == HAZARD_LEARNED)
-            {
-                bocpd_hazard_learn_update(rbpf->bocpd_hazard, 1,
-                                          rbpf->bocpd_learn_window);
-            }
-        }
-        else if (rbpf->bocpd_hazard != NULL &&
-                 rbpf->bocpd_hazard->type == HAZARD_LEARNED)
-        {
-            /* No changepoint - update hazard learning */
-            bocpd_hazard_learn_update(rbpf->bocpd_hazard, 0,
-                                      rbpf->bocpd_learn_window);
-        }
-
-        /* Copy BOCPD state to output for diagnostics */
-        output->bocpd_map_runlength = rbpf->bocpd->map_runlength;
-        output->bocpd_p_changepoint = (rbpf_real_t)rbpf->bocpd->p_changepoint;
-    }
 
     /* 5. Resample if needed */
     output->resampled = rbpf_ksc_resample(rbpf);

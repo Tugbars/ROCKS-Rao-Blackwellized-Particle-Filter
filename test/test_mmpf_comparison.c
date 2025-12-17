@@ -451,7 +451,7 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     /* Create extended RBPF with full stack */
     RBPF_Extended *ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
 
-    /* Set regime params (covering the volatility space) */
+    /* Set regime params BEFORE init (so priors are correct) */
     rbpf_ext_set_regime_params(ext, 0, 0.005f, -5.0f, 0.08f); /* Calm */
     rbpf_ext_set_regime_params(ext, 1, 0.02f, -4.0f, 0.12f);  /* Calm-Trend */
     rbpf_ext_set_regime_params(ext, 2, 0.05f, -3.0f, 0.25f);  /* Trend */
@@ -465,8 +465,8 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
         0.00f, 0.01f, 0.03f, 0.96f};
     rbpf_ext_build_transition_lut(ext, trans);
 
-    /* Enable adaptive forgetting */
-    param_learn_set_forgetting(&ext->storvik, 1, 0.997f);
+    /* Configure Storvik: every tick + adaptive forgetting */
+    rbpf_ext_set_full_update_mode(ext);
     param_learn_set_regime_forgetting(&ext->storvik, 0, 0.999f);
     param_learn_set_regime_forgetting(&ext->storvik, 1, 0.998f);
     param_learn_set_regime_forgetting(&ext->storvik, 2, 0.996f);
@@ -483,6 +483,7 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     ext->robust_ocsn.regime[3].prob = 0.05f;
     ext->robust_ocsn.regime[3].variance = 160.0f;
 
+    /* Initialize particles ONCE at the end */
     rbpf_ext_init(ext, -4.5f, 0.1f);
 
     *total_time = 0.0;

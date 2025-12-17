@@ -200,17 +200,17 @@ if(RBPF_BUILD_TESTS)
     endif()
 
     # BOCPD vs Baseline comparison test (targeted scenarios)
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_comparison.c)
-        add_executable(test_bocpd_comparison
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_comparison.c
-        )
-        target_link_libraries(test_bocpd_comparison PRIVATE rocks)
-        if(NOT WIN32)
-            target_link_libraries(test_bocpd_comparison PRIVATE m)
-        endif()
-        target_compile_options(test_bocpd_comparison PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_bocpd_comparison PRIVATE ${COMMON_DEFS})
-    endif()
+    #if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_comparison.c)
+    #    add_executable(test_bocpd_comparison
+    #        ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_comparison.c
+    #    )
+    #    target_link_libraries(test_bocpd_comparison PRIVATE rocks)
+    #    if(NOT WIN32)
+    #        target_link_libraries(test_bocpd_comparison PRIVATE m)
+    #   endif()
+    #    target_compile_options(test_bocpd_comparison PRIVATE ${COMMON_FLAGS})
+    #    target_compile_definitions(test_bocpd_comparison PRIVATE ${COMMON_DEFS})
+    #endif()
 
     # Hawkes test
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_hawkes.c)

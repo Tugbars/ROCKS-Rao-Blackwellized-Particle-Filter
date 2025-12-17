@@ -738,6 +738,7 @@ extern "C"
 
     void rbpf_ext_print_config(const RBPF_Extended *ext);
     void rbpf_ext_print_storvik_stats(const RBPF_Extended *ext, int regime);
+    void rbpf_ext_set_full_update_mode(RBPF_Extended *ext);
 
 #ifdef __cplusplus
 }

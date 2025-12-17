@@ -60,25 +60,23 @@
 #define RBPF_KSC_H
 
 /*═══════════════════════════════════════════════════════════════════════════
- * BOCPD CHANGEPOINT DETECTION INTEGRATION
+ * BOCPD CHANGEPOINT DETECTION (For MMPF Integration)
  *
- * Architecture: "Pilot Light + Afterburner"
+ * NOTE: BOCPD is designed for MMPF architecture, not single RBPF.
  *
- *   Pilot Light (mutation):  Keeps P(regime=k) > 0 at all times
- *                            Prevents absorbing states in Bayes' rule
- *                            Cost: ~0.1% noise (2 particles / 1000)
+ * In MMPF:
+ *   - Multiple warm RBPFs exist (one per regime hypothesis)
+ *   - BOCPD triggers → upweight correct hypothesis instantly
+ *   - Works because alternatives are already tracking
  *
- *   Afterburner (BOCPD):     Event-driven regime switching
- *                            Fires on volatility structure change
- *                            Forces SPRT to reconsider regime
+ * In single RBPF:
+ *   - All particles stuck at current regime
+ *   - BOCPD triggers → no good particles to upweight
+ *   - KSC observation noise (~2.2 std) buries regime signal (~1.5)
+ *   - SNR ≈ 0.7 → unreliable single-tick detection
  *
- * BOCPD monitors log-volatility estimates and detects changepoints using
- * a self-calibrating delta detector. When triggered, it selects target
- * regime based on current vol estimate and forces SPRT to switch.
- *
- * The BOCPD objects are externally owned - caller is responsible for
- * allocation/deallocation. This allows sharing BOCPD across multiple
- * filters or custom lifecycle management.
+ * The attach/detach API is preserved for MMPF integration.
+ * For single RBPF, use SPRT + pilot light for regime detection.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 #include "bocpd.h"
@@ -747,9 +745,9 @@ typedef float rbpf_real_t;
 
         rbpf_real_t last_y; /* Last observation y = log(r²) for SPRT */
 
-        /* ─────────────────────────────────────────────────────────────────────────
-         * RBPF_KSC struct fields (add to existing struct)
-         * ───────────────────────────────────────────────────────────────────────── */
+        /*========================================================================
+         * BOCPD CHANGEPOINT DETECTION
+         *======================================================================*/
 
         /** BOCPD detector instance (externally owned, NULL = disabled) */
         bocpd_t *bocpd;
@@ -773,6 +771,9 @@ typedef float rbpf_real_t;
         /** Window size for hazard learning decay (default: 1000)
          *  Only used when hazard->type == HAZARD_LEARNED */
         size_t bocpd_learn_window;
+
+        /** Cooldown counter: ticks until next BOCPD trigger allowed */
+        int bocpd_cooldown;
 
     } RBPF_KSC;
 
@@ -846,6 +847,10 @@ typedef float rbpf_real_t;
         int student_t_active;                     /* 1 if Student-t update was used */
 
         double sprt_evidence[SPRT_MAX_REGIMES];
+
+        /*========================================================================
+         * BOCPD DIAGNOSTICS
+         *======================================================================*/
 
         /** 1 if BOCPD triggered regime switch this tick, 0 otherwise */
         int bocpd_triggered;
@@ -1411,15 +1416,15 @@ typedef float rbpf_real_t;
 
     void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime);
 
-    /* ─────────────────────────────────────────────────────────────────────────
+    /*─────────────────────────────────────────────────────────────────────────────
      * BOCPD API Functions
-     * ───────────────────────────────────────────────────────────────────────── */
+     *───────────────────────────────────────────────────────────────────────────*/
 
     /**
      * @brief Attach BOCPD changepoint detector to RBPF
      *
-     * Enables the "Afterburner" - event-driven regime switching based on
-     * volatility structure changes detected by BOCPD.
+     * Enables MMPF-style shock injection - event-driven regime exploration
+     * based on volatility structure changes detected by BOCPD.
      *
      * All pointers are borrowed (not owned). Caller must ensure objects
      * remain valid for the lifetime of the RBPF, and must free them after

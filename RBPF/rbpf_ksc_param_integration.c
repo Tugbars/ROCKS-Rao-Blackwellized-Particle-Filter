@@ -1775,6 +1775,23 @@ void rbpf_ext_get_learning_stats(const RBPF_Extended *ext,
         *samples_skipped = ext->storvik.samples_skipped_load;
 }
 
+void rbpf_ext_set_full_update_mode(RBPF_Extended *ext)
+{
+    if (!ext || !ext->storvik_initialized) return;
+    
+    /* Sample every tick for all regimes */
+    for (int r = 0; r < PARAM_LEARN_MAX_REGIMES; r++) {
+        ext->storvik.config.sample_interval[r] = 1;
+    }
+    
+    /* No tick skipping */
+    ext->storvik.config.enable_global_tick_skip = false;
+    
+    /* KEEP forgetting ON - this is finance, not academia */
+    ext->storvik.config.enable_forgetting = true;
+    ext->storvik.config.forgetting_lambda = 0.997;  /* N_eff ≈ 333 */
+}
+
 /*═══════════════════════════════════════════════════════════════════════════
  * DEBUG
  *═══════════════════════════════════════════════════════════════════════════*/
