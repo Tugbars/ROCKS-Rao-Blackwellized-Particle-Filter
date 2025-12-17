@@ -257,6 +257,17 @@ if(RBPF_BUILD_TESTS)
     endif()
 endif()
 
+# RBPF Visualization Export
+if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_viz_export.c)
+    add_executable(rbpf_viz_export
+        ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_viz_export.c
+    )
+    target_link_libraries(rbpf_viz_export PRIVATE rocks)
+    target_compile_options(rbpf_viz_export PRIVATE ${COMMON_FLAGS})
+    target_compile_definitions(rbpf_viz_export PRIVATE ${COMMON_DEFS})
+endif()
+
+
 #───────────────────────────────────────────────────────────────────────────────
 # Benchmark Executables
 #───────────────────────────────────────────────────────────────────────────────
