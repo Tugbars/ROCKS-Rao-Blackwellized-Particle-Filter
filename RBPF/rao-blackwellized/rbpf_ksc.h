@@ -59,6 +59,7 @@
 #ifndef RBPF_KSC_H
 #define RBPF_KSC_H
 
+#include "rbpf_sprt.h"
 #include <mkl.h>
 #include <mkl_vsl.h>
 #include <stdint.h>
@@ -718,6 +719,8 @@ typedef float rbpf_real_t;
 
         int use_learned_params; /* 1 = predict reads particle_mu/sigma_vol arrays */
 
+        SPRT_Multi sprt;
+
     } RBPF_KSC;
 
     /**
@@ -788,6 +791,8 @@ typedef float rbpf_real_t;
         rbpf_real_t nu_effective;                 /* Implied ν from λ variance: ν = 2/Var[λ] */
         rbpf_real_t learned_nu[RBPF_MAX_REGIMES]; /* Current ν estimate per regime */
         int student_t_active;                     /* 1 if Student-t update was used */
+
+        double sprt_evidence[SPRT_MAX_REGIMES];
 
     } RBPF_KSC_Output;
 
@@ -1339,6 +1344,9 @@ typedef float rbpf_real_t;
      * @return Number of indices copied, or 0 if none available
      */
     int rbpf_ksc_apf_get_resample_indices(int *indices_out, int max_n);
+
+    void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime);
+
 
 #ifdef __cplusplus
 }

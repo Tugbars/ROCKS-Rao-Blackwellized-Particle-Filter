@@ -13,6 +13,7 @@
  */
 
 #include "rbpf_ksc.h"
+#include "rbpf_sprt.h"
 #include <string.h>
 #include <math.h>
 #include <mkl_vml.h>
@@ -128,81 +129,38 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     out->dominant_regime = dom;
 
     /*========================================================================
-     * SPRT REGIME DETECTION
+     * SPRT REGIME DETECTION (using dedicated module)
      *
-     * Sequential Probability Ratio Test for statistically principled
-     * regime switching. Uses log-likelihood ratios accumulated over time.
-     *
-     * For each regime k != current, accumulate:
-     *   Λ_k = Σ log(P(y|k) / P(y|current))
-     *
-     * Switch to k if Λ_k > threshold_high (default: log(99) ≈ 4.6)
-     * Reset Λ_k if it drops below threshold_low (default: log(0.01) ≈ -4.6)
+     * Computes per-regime log-likelihoods and delegates to sprt_multi_update().
+     * Currently uses regime_probs as proxy; can upgrade to true observation
+     * log-likelihoods by storing last_y in RBPF_KSC struct.
      *======================================================================*/
 
     RBPF_Detection *det = &rbpf->detection;
 
-    int current = det->sprt_current_regime;
-    det->sprt_ticks_in_current++;
-
-    /* Current regime probability (with floor) */
-    double p_current = (double)out->regime_probs[current];
-    if (p_current < 1e-10)
-        p_current = 1e-10;
-    double log_p_current = log(p_current);
-
-    int new_regime = current;
-    double best_ratio = det->sprt_threshold_high;
-
-    for (int k = 0; k < n_regimes; k++)
+    /* Compute per-regime log-likelihoods for SPRT
+     * TODO: Replace with sprt_logchisq_loglik(last_y, regime_mu) once
+     *       last_y is stored in RBPF_KSC struct for true observation likelihoods.
+     */
+    double log_liks[SPRT_MAX_REGIMES];
+    for (int r = 0; r < n_regimes; r++)
     {
-        if (k == current)
-            continue;
-
-        double p_k = (double)out->regime_probs[k];
-        if (p_k < 1e-10)
-            p_k = 1e-10;
-        double log_p_k = log(p_k);
-
-        double delta = log_p_k - log_p_current;
-
-        /* Clamp to prevent numerical explosion */
-        if (delta > 10.0)
-            delta = 10.0;
-        if (delta < -10.0)
-            delta = -10.0;
-
-        det->sprt_log_ratios[k] += delta;
-
-        /* Reset if evidence strongly against this regime */
-        if (det->sprt_log_ratios[k] < det->sprt_threshold_low)
-        {
-            det->sprt_log_ratios[k] = 0.0;
-        }
-
-        /* Check if regime k should become new regime */
-        if (det->sprt_log_ratios[k] > best_ratio &&
-            det->sprt_ticks_in_current >= det->sprt_min_dwell)
-        {
-            best_ratio = det->sprt_log_ratios[k];
-            new_regime = k;
-        }
+        /* Use weighted log-likelihood from regime posterior
+         * Floor to prevent log(0) */
+        double p_r = (double)out->regime_probs[r];
+        if (p_r < 1e-10)
+            p_r = 1e-10;
+        log_liks[r] = log(p_r);
     }
 
-    /* Switch regime if SPRT triggered */
-    if (new_regime != current)
-    {
-        det->sprt_current_regime = new_regime;
-        det->sprt_ticks_in_current = 0;
+    /* Update SPRT module - handles pairwise tests and regime switching */
+    int sprt_regime = sprt_multi_update(&rbpf->sprt, log_liks);
 
-        for (int k = 0; k < n_regimes; k++)
-        {
-            det->sprt_log_ratios[k] = 0.0;
-        }
-    }
+    out->smoothed_regime = sprt_regime;
+    det->stable_regime = sprt_regime;
 
-    out->smoothed_regime = det->sprt_current_regime;
-    det->stable_regime = det->sprt_current_regime;
+    /* Copy SPRT evidence to output for diagnostics */
+    sprt_multi_get_evidence(&rbpf->sprt, out->sprt_evidence);
 
     /*========================================================================
      * SELF-AWARE SIGNALS

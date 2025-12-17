@@ -15,6 +15,7 @@
  */
 
 #include "rbpf_ksc.h"
+#include "rbpf_sprt.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -165,16 +166,8 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->detection.prev_regime = 0;
     rbpf->detection.cooldown = 0;
 
-    /* SPRT regime detection */
-    for (int r = 0; r < RBPF_MAX_REGIMES; r++)
-    {
-        rbpf->detection.sprt_log_ratios[r] = 0.0;
-    }
-    rbpf->detection.sprt_threshold_high = 4.595;
-    rbpf->detection.sprt_threshold_low = -4.595;
-    rbpf->detection.sprt_current_regime = 0;
-    rbpf->detection.sprt_min_dwell = 3;
-    rbpf->detection.sprt_ticks_in_current = 0;
+    /* SPRT regime detection - use dedicated module */
+    sprt_multi_init(&rbpf->sprt, n_regimes, 0.01, 0.01, 3);
     rbpf->detection.stable_regime = 0;
 
     /* Fixed-lag smoothing */
@@ -349,6 +342,7 @@ void rbpf_ksc_set_sprt_params(RBPF_KSC *rbpf, double alpha, double beta, int min
     if (!rbpf)
         return;
 
+    /* Clamp error rates */
     if (alpha < 0.001)
         alpha = 0.001;
     if (alpha > 0.5)
@@ -357,15 +351,13 @@ void rbpf_ksc_set_sprt_params(RBPF_KSC *rbpf, double alpha, double beta, int min
         beta = 0.001;
     if (beta > 0.5)
         beta = 0.5;
-
-    rbpf->detection.sprt_threshold_high = log((1.0 - beta) / alpha);
-    rbpf->detection.sprt_threshold_low = log(beta / (1.0 - alpha));
-
     if (min_dwell < 1)
         min_dwell = 1;
     if (min_dwell > 100)
         min_dwell = 100;
-    rbpf->detection.sprt_min_dwell = min_dwell;
+
+    /* Re-initialize SPRT module with new params */
+    sprt_multi_init(&rbpf->sprt, rbpf->n_regimes, alpha, beta, min_dwell);
 }
 
 void rbpf_ksc_reset_sprt(RBPF_KSC *rbpf)
@@ -373,11 +365,28 @@ void rbpf_ksc_reset_sprt(RBPF_KSC *rbpf)
     if (!rbpf)
         return;
 
-    for (int r = 0; r < RBPF_MAX_REGIMES; r++)
+    /* Reset all pairwise tests */
+    for (int i = 0; i < rbpf->sprt.n_regimes; i++)
     {
-        rbpf->detection.sprt_log_ratios[r] = 0.0;
+        for (int j = i + 1; j < rbpf->sprt.n_regimes; j++)
+        {
+            sprt_binary_reset(&rbpf->sprt.tests[i][j]);
+        }
+        rbpf->sprt.regime_evidence[i] = 0.0;
     }
-    rbpf->detection.sprt_ticks_in_current = 0;
+    rbpf->sprt.ticks_in_current = 0;
+}
+
+void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime)
+{
+    if (!rbpf)
+        return;
+    if (regime < 0 || regime >= rbpf->n_regimes)
+        return;
+
+    /* Use SPRT module's force function */
+    sprt_multi_force_regime(&rbpf->sprt, regime);
+    rbpf->detection.stable_regime = regime;
 }
 
 void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag)
@@ -514,13 +523,8 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
     rbpf->detection.prev_regime = 0;
     rbpf->detection.cooldown = 0;
 
-    /* Reset SPRT */
-    for (int r = 0; r < rbpf->n_regimes; r++)
-    {
-        rbpf->detection.sprt_log_ratios[r] = 0.0;
-    }
-    rbpf->detection.sprt_current_regime = 0;
-    rbpf->detection.sprt_ticks_in_current = 0;
+    /* Reset SPRT module */
+    rbpf_ksc_reset_sprt(rbpf);
     rbpf->detection.stable_regime = 0;
 
     /* Reset fixed-lag smoothing */
