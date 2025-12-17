@@ -692,11 +692,26 @@ extern "C"
      * @brief Run birth/merge proposals
      *
      * Convenience function: runs birth if high surprise, merge if too many states.
+     * Automatically reorders states by μ afterward to prevent label switching.
      *
      * @param hdp       Sampler
      * @return          Net change in number of states
      */
     int sticky_hdp_birth_merge(StickyHDP *hdp);
+
+    /**
+     * @brief Reorder states by μ (ascending)
+     *
+     * CRITICAL FOR RBPF INTEGRATION: Call this after any operation that
+     * changes the number of states (birth, merge, manual K change) to
+     * ensure consistent regime mapping.
+     *
+     * Without reordering, a merge of states 1&2 shifts state 3→2, causing
+     * RBPF to use "Trend" parameters for what was "Crisis".
+     *
+     * @param hdp       Sampler
+     */
+    void sticky_hdp_reorder_by_mu(StickyHDP *hdp);
 
 #ifdef __cplusplus
 }

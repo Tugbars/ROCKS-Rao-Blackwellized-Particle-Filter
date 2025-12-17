@@ -532,7 +532,12 @@ static double emission_log_likelihood(double y, const HDP_EmissionParams *emit)
 
 /**
  * Batch compute ALL likelihoods for entire window (T × K)
- * Much faster than calling emission_log_likelihood in nested loops
+ *
+ * Precomputes log_lik[t][k] for all t,k upfront.
+ * Better cache locality than computing per-timestep in forward pass.
+ *
+ * Note: MKL vdExp batching was tested but provided <3% improvement
+ * due to cache effects dominating for larger K.
  */
 static void compute_all_likelihoods(StickyHDP *hdp)
 {
@@ -540,7 +545,10 @@ static void compute_all_likelihoods(StickyHDP *hdp)
     const int K = hdp->K;
     const int K_max = hdp->K_max;
 
-    /* For each time step and each state */
+    if (T == 0 || K == 0)
+        return;
+
+    /* Row-major access: good cache locality */
     for (int t = 0; t < T; t++)
     {
         double y = hdp->y[t];
@@ -2055,6 +2063,127 @@ int sticky_hdp_propose_merge(StickyHDP *hdp, double mu_threshold)
     return merges;
 }
 
+/**
+ * Reorder states by μ (ascending) to prevent label switching
+ *
+ * CRITICAL: Must be called after any birth/merge event to ensure
+ * consistent mapping to RBPF regimes. Without this, a merge of
+ * states 1&2 would shift "Crisis" (state 3) to become state 2,
+ * causing the RBPF to use wrong parameters.
+ */
+static void reorder_states_by_mu(StickyHDP *hdp)
+{
+    if (!hdp || hdp->K <= 1)
+        return;
+
+    const int K = hdp->K;
+    const int K_max = hdp->K_max;
+
+    /* Create index array and sort by μ */
+    int order[HDP_MAX_STATES];
+    for (int k = 0; k < K; k++)
+        order[k] = k;
+
+    /* Simple insertion sort (K is small) */
+    for (int i = 1; i < K; i++)
+    {
+        int key = order[i];
+        double mu_key = hdp->emit[key].mu;
+        int j = i - 1;
+        while (j >= 0 && hdp->emit[order[j]].mu > mu_key)
+        {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+
+    /* Check if already sorted */
+    int sorted = 1;
+    for (int k = 0; k < K; k++)
+    {
+        if (order[k] != k)
+        {
+            sorted = 0;
+            break;
+        }
+    }
+    if (sorted)
+        return;
+
+    /* Create inverse mapping: new_idx[old_idx] = new position */
+    int new_idx[HDP_MAX_STATES];
+    for (int k = 0; k < K; k++)
+    {
+        new_idx[order[k]] = k;
+    }
+
+    /* Reorder emissions (use scratch for temp storage) */
+    HDP_EmissionParams emit_temp[HDP_MAX_STATES];
+    for (int k = 0; k < K; k++)
+    {
+        emit_temp[k] = hdp->emit[order[k]];
+    }
+    for (int k = 0; k < K; k++)
+    {
+        hdp->emit[k] = emit_temp[k];
+    }
+
+    /* Reorder beta */
+    double beta_temp[HDP_MAX_STATES];
+    for (int k = 0; k < K; k++)
+        beta_temp[k] = hdp->beta[order[k]];
+    for (int k = 0; k < K; k++)
+        hdp->beta[k] = beta_temp[k];
+    for (int k = 0; k < K; k++)
+        hdp->log_beta[k] = log(hdp->beta[k] + HDP_EPS);
+
+    /* Reorder transition matrix π[i][j] → π[new_idx[i]][new_idx[j]] */
+    double pi_temp[HDP_MAX_STATES * HDP_MAX_STATES];
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            pi_temp[new_idx[i] * K_max + new_idx[j]] = hdp->pi[i * K_max + j];
+        }
+    }
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            hdp->pi[i * K_max + j] = pi_temp[i * K_max + j];
+            hdp->log_pi[i * K_max + j] = log(hdp->pi[i * K_max + j] + HDP_EPS);
+        }
+    }
+
+    /* Reorder transition counts */
+    int n_trans_temp[HDP_MAX_STATES * HDP_MAX_STATES];
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            n_trans_temp[new_idx[i] * K_max + new_idx[j]] = hdp->n_trans[i * K_max + j];
+        }
+    }
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            hdp->n_trans[i * K_max + j] = n_trans_temp[i * K_max + j];
+        }
+    }
+
+    /* Remap state sequence */
+    for (int t = 0; t < hdp->T; t++)
+    {
+        int old_s = hdp->s[t];
+        if (old_s >= 0 && old_s < K)
+        {
+            hdp->s[t] = new_idx[old_s];
+        }
+    }
+}
+
 int sticky_hdp_birth_merge(StickyHDP *hdp)
 {
     if (!hdp)
@@ -2079,5 +2208,17 @@ int sticky_hdp_birth_merge(StickyHDP *hdp)
         net_change -= merges;
     }
 
+    /* CRITICAL: Reorder states by μ to prevent label switching */
+    if (net_change != 0)
+    {
+        reorder_states_by_mu(hdp);
+    }
+
     return net_change;
+}
+
+/* Public API wrapper */
+void sticky_hdp_reorder_by_mu(StickyHDP *hdp)
+{
+    reorder_states_by_mu(hdp);
 }
