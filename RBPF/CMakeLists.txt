@@ -319,6 +319,7 @@ set(ROCKS_HEADERS
     rao-blackwellized/rbpf_ksc.h
     rao-blackwellized/rbpf_silverman.h
     rao-blackwellized/rbpf_sprt.h
+    rbpf_fisher_rao.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.h
 )
 

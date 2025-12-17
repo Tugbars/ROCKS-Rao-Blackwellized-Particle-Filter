@@ -26,6 +26,7 @@
 #include "rbpf_ksc.h"
 #include "rbpf_silverman.h"
 #include "rbpf_sprt.h"
+#include "rbpf_fisher_rao.h"
 #include "bocpd.h"
 #include <stdlib.h>
 #include <string.h>
@@ -444,11 +445,10 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
      * Primary regime switching is handled by BOCPD + SPRT ("afterburner"),
      * but we keep 1-2 particles per regime as mathematical insurance.
      *
-     * Settings (neutered):
-     *   min_particles_per_regime = 2   (just prevent log(0))
-     *   regime_mutation_prob = 0.001   (0.1% - barely noticeable)
-     *
-     * Cost: ~2 particles out of 1000 = negligible noise floor.
+     * NEW: Uses Fisher-Rao geodesic for principled state blending.
+     * The blend parameter t is determined by precision weighting:
+     *   - Uncertain particle (high var) → large t → teleport toward regime
+     *   - Confident particle (low var) → small t → preserve state
      */
     if (rbpf->regime_mutation_prob > RBPF_REAL(0.0))
     {
@@ -481,9 +481,31 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
                             regime_count[r_new]++;
                             regime[i] = r_new;
 
-                            /* Blend state toward new regime center */
-                            rbpf_real_t mu_new = rbpf->params[r_new].mu_vol;
-                            mu[i] = RBPF_REAL(0.7) * mu[i] + RBPF_REAL(0.3) * mu_new;
+                            /* ═══════════════════════════════════════════════
+                             * FISHER-RAO GEODESIC MUTATION
+                             * 
+                             * Instead of arbitrary 70/30 blend, we:
+                             * 1. Compute stationary variance of target regime
+                             * 2. Use precision weighting to determine blend t
+                             * 3. Interpolate along Fisher-Rao geodesic
+                             * ═══════════════════════════════════════════════*/
+                            
+                            const RBPF_RegimeParams *p_new = &rbpf->params[r_new];
+                            
+                            double mu_out, var_out;
+                            fisher_rao_mutate(
+                                (double)mu[i], 
+                                (double)var[i],
+                                (double)p_new->mu_vol,
+                                (double)p_new->theta,
+                                (double)p_new->sigma_vol,
+                                &mu_out, 
+                                &var_out
+                            );
+                            
+                            mu[i] = (rbpf_real_t)mu_out;
+                            var[i] = (rbpf_real_t)var_out;
+                            
                             break;
                         }
                     }
