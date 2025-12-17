@@ -14,6 +14,8 @@ option(RBPF_BUILD_BENCH "Build benchmark executable" ON)
 option(RBPF_BUILD_TESTS "Build test executables" ON)
 option(RBPF_ENABLE_STORVIK "Enable Sleeping Storvik parameter learning" ON)
 option(MMPF_ENABLE_MCMC "Enable MCMC particle teleportation" ON)
+option(RBPF_ENABLE_HDP_BEAM "Enable Sticky HDP-HMM Beam Sampling" ON)
+
 
 #───────────────────────────────────────────────────────────────────────────────
 # BOCPD Library (required for regime detection)
@@ -89,6 +91,12 @@ if(RBPF_ENABLE_STORVIK)
             mmpf/mmpf_mcmc.c
         )
     endif()
+
+    if(RBPF_ENABLE_HDP_BEAM)
+    list(APPEND ROCKS_SOURCES
+        HDP-Beam/sticky_hdp_beam.c
+    )
+    endif()
 endif()
 
 add_library(rocks STATIC ${ROCKS_SOURCES})
@@ -106,6 +114,7 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
+        ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam
         ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
 )
 
@@ -211,6 +220,22 @@ if(RBPF_BUILD_TESTS)
     #    target_compile_options(test_bocpd_comparison PRIVATE ${COMMON_FLAGS})
     #    target_compile_definitions(test_bocpd_comparison PRIVATE ${COMMON_DEFS})
     #endif()
+
+
+    #───────────────────────────────────────────────────────────────────────────────
+    # HDP-Beam Benchmark
+    #───────────────────────────────────────────────────────────────────────────────
+
+    if(RBPF_BUILD_BENCH AND RBPF_ENABLE_HDP_BEAM)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam/bench_sticky_hdp.c)
+        add_executable(bench_sticky_hdp
+            ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam/bench_sticky_hdp.c
+        )
+        target_link_libraries(bench_sticky_hdp PRIVATE rocks)
+        target_compile_options(bench_sticky_hdp PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(bench_sticky_hdp PRIVATE ${COMMON_DEFS})
+        endif()
+    endif()
 
     # Hawkes test
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_hawkes.c)
@@ -346,5 +371,6 @@ install(FILES ${ROCKS_HEADERS}
 )
 
 if(MSVC)
-    target_compile_options(rocks PRIVATE /openmp:experimental)
+    target_compile_options(rocks PRIVATE /openmp:experimental /arch:AVX2)
+    target_compile_definitions(rocks PRIVATE HDP_USE_AVX2=1)
 endif()
