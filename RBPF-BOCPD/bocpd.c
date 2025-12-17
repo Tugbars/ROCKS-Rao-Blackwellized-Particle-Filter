@@ -443,8 +443,8 @@ double bocpd_delta_zscore(const bocpd_delta_detector_t *d, double delta)
         return 0.0;
 
     double sigma_sq = d->beta / d->alpha;
-    if (sigma_sq < 1e-10)
-        sigma_sq = 1e-10;
+    if (sigma_sq < 1e-6)    // Change from 1e-10
+    sigma_sq = 1e-6;
     double sigma = sqrt(sigma_sq);
 
     return (delta - d->mu) / sigma;
