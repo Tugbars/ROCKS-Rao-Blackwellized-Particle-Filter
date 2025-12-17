@@ -48,3 +48,4 @@ RBPF/mmpf/csv/rmse_by_scenario.png
 RBPF/mmpf/csv/.ipynb_checkpoints/mmpf_comparison_analysis-checkpoint.ipynb
 RBPF/mmpf/self_driving_architecture.md
 RBPF/rao-blackwellized/adaptive_ksc.md
+test/rbpf_performance_analysis.md

@@ -451,26 +451,36 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     /* Create extended RBPF with full stack */
     RBPF_Extended *ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
 
-    /* Set regime params BEFORE init (so priors are correct) */
-    rbpf_ext_set_regime_params(ext, 0, 0.005f, -5.0f, 0.08f); /* Calm */
-    rbpf_ext_set_regime_params(ext, 1, 0.02f, -4.0f, 0.12f);  /* Calm-Trend */
-    rbpf_ext_set_regime_params(ext, 2, 0.05f, -3.0f, 0.25f);  /* Trend */
-    rbpf_ext_set_regime_params(ext, 3, 0.15f, -1.5f, 0.50f);  /* Crisis */
+    /* ═══════════════════════════════════════════════════════════════════════════
+     * BEST VOL RMSE CONFIG
+     *
+     * μ_calm=-4.50  μ_crisis=-2.00
+     * σ_calm=0.080  σ_ratio=8.0
+     * θ_calm=0.0030  θ_ratio=40.0
+     * stickiness=0.92  λ_calm=0.9990
+     *
+     * Results: Vol RMSE=0.136, Hypo Acc=64.2%, Trans Lag=12.6, FC=138
+     * ═══════════════════════════════════════════════════════════════════════════*/
 
-    /* Transition matrix */
+    /* Regime params (θ, μ, σ) - linearly interpolated */
+    rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.50f, 0.080f); /* Calm */
+    rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.67f, 0.267f); /* Mild */
+    rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.83f, 0.453f); /* Trend */
+    rbpf_ext_set_regime_params(ext, 3, 0.1200f, -2.00f, 0.640f); /* Crisis */
+
+    /* Transition matrix (stickiness=0.92) */
     rbpf_real_t trans[16] = {
-        0.96f, 0.03f, 0.01f, 0.00f,
-        0.03f, 0.92f, 0.04f, 0.01f,
-        0.01f, 0.04f, 0.92f, 0.03f,
-        0.00f, 0.01f, 0.03f, 0.96f};
+        0.920f, 0.056f, 0.020f, 0.004f,
+        0.032f, 0.920f, 0.036f, 0.012f,
+        0.012f, 0.036f, 0.920f, 0.032f,
+        0.004f, 0.020f, 0.056f, 0.920f};
     rbpf_ext_build_transition_lut(ext, trans);
 
-    /* Configure Storvik: every tick + adaptive forgetting */
-    rbpf_ext_set_full_update_mode(ext);
-    param_learn_set_regime_forgetting(&ext->storvik, 0, 0.999f);
-    param_learn_set_regime_forgetting(&ext->storvik, 1, 0.998f);
-    param_learn_set_regime_forgetting(&ext->storvik, 2, 0.996f);
-    param_learn_set_regime_forgetting(&ext->storvik, 3, 0.993f);
+    /* Forgetting λ per regime */
+    param_learn_set_regime_forgetting(&ext->storvik, 0, 0.9990f);
+    param_learn_set_regime_forgetting(&ext->storvik, 1, 0.9970f);
+    param_learn_set_regime_forgetting(&ext->storvik, 2, 0.9950f);
+    param_learn_set_regime_forgetting(&ext->storvik, 3, 0.9930f);
 
     /* Enable Robust OCSN */
     ext->robust_ocsn.enabled = 1;
@@ -483,7 +493,6 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     ext->robust_ocsn.regime[3].prob = 0.05f;
     ext->robust_ocsn.regime[3].variance = 160.0f;
 
-    /* Initialize particles ONCE at the end */
     rbpf_ext_init(ext, -4.5f, 0.1f);
 
     *total_time = 0.0;

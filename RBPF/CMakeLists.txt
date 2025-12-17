@@ -236,6 +236,16 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(mmpf_tuner PRIVATE ${COMMON_DEFS})
     endif()
 
+     # RBPF Parameter Tuner (Multi-threaded)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_tuner_mp.c)
+        add_executable(rbpf_tuner_mp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_tuner_mp.c
+        )
+        target_link_libraries(rbpf_tuner_mp PRIVATE rocks)
+        target_compile_options(rbpf_tuner_mp PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(rbpf_tuner_mp PRIVATE ${COMMON_DEFS})
+    endif()
+
     # Example usage
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/example_usage.c)
         add_executable(example_usage
