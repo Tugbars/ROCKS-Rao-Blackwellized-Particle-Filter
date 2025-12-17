@@ -721,6 +721,8 @@ typedef float rbpf_real_t;
 
         SPRT_Multi sprt;
 
+        rbpf_real_t last_y;   /* Last observation y = log(r²) for SPRT */
+
     } RBPF_KSC;
 
     /**

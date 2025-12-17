@@ -343,55 +343,24 @@ double sprt_logchisq_loglik(double y_log_sq, double h) {
 
 /*═══════════════════════════════════════════════════════════════════════════
  * REGIME-SPECIFIC LIKELIHOOD FOR MMPF INTEGRATION
+ *
+ * Computes per-regime observation log-likelihoods using the KSC model.
+ * No artificial boosting - trust the math.
  *═══════════════════════════════════════════════════════════════════════════*/
 
-/**
- * @brief Compute regime log-likelihoods for SPRT update
- *
- * This helper computes log P(y | regime k) for each regime,
- * suitable for passing to sprt_multi_update().
- *
- * @param y_log_sq      Observed log(return²)
- * @param regime_mu     Array of regime log-vol means [n_regimes]
- * @param regime_sigma  Array of regime vol-of-vol [n_regimes]
- * @param regime_nu     Array of regime Student-t ν (NULL for Gaussian)
- * @param n_regimes     Number of regimes
- * @param log_liks      Output log-likelihoods [n_regimes]
- */
 void sprt_compute_regime_logliks(double y_log_sq,
                                   const double *regime_mu,
                                   const double *regime_sigma,
                                   const double *regime_nu,
                                   int n_regimes,
                                   double *log_liks) {
+    (void)regime_sigma;  /* Currently unused - could add vol-of-vol weighting */
+    (void)regime_nu;     /* Currently unused - Student-t handled by RBPF obs model */
+    
     for (int k = 0; k < n_regimes; k++) {
-        /* For simplicity, use point estimate h = μ_k (regime center)
-         * A more sophisticated approach would marginalize over h,
-         * but this is sufficient for regime comparison.
-         */
+        /* Use regime center h = μ_k for likelihood computation
+         * The OCSN mixture handles the observation model correctly */
         double h = regime_mu[k];
-        
-        /* Base likelihood from log-χ² observation model */
-        double ll = sprt_logchisq_loglik(y_log_sq, h);
-        
-        /* Adjust for regime-specific tail behavior if Student-t */
-        if (regime_nu != NULL && regime_nu[k] > 0) {
-            /* Student-t adjustment: heavier tails increase likelihood of extremes */
-            double nu = regime_nu[k];
-            
-            /* Simple heuristic: scale likelihood by tail factor
-             * Lower ν → heavier tails → higher likelihood for large deviations
-             */
-            double y_std = (y_log_sq - 2.0 * h) / (regime_sigma[k] > 0 ? 2.0 * regime_sigma[k] : 2.0);
-            if (fabs(y_std) > 2.0) {
-                /* Boost for extreme observations under low ν */
-                double tail_boost = (30.0 - nu) / 30.0;  /* 0 at ν=30, ~0.9 at ν=3 */
-                if (tail_boost > 0) {
-                    ll += tail_boost * (fabs(y_std) - 2.0);
-                }
-            }
-        }
-        
-        log_liks[k] = ll;
+        log_liks[k] = sprt_logchisq_loglik(y_log_sq, h);
     }
 }

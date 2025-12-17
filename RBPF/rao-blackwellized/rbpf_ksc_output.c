@@ -131,26 +131,22 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     /*========================================================================
      * SPRT REGIME DETECTION (using dedicated module)
      *
-     * Computes per-regime log-likelihoods and delegates to sprt_multi_update().
-     * Currently uses regime_probs as proxy; can upgrade to true observation
-     * log-likelihoods by storing last_y in RBPF_KSC struct.
+     * Computes per-regime observation log-likelihoods P(y | regime_k)
+     * using the OCSN (2007) log-χ² mixture model, then delegates to
+     * sprt_multi_update() for pairwise hypothesis testing.
      *======================================================================*/
 
     RBPF_Detection *det = &rbpf->detection;
 
     /* Compute per-regime log-likelihoods for SPRT
-     * TODO: Replace with sprt_logchisq_loglik(last_y, regime_mu) once
-     *       last_y is stored in RBPF_KSC struct for true observation likelihoods.
-     */
+     * P(y | regime k) using regime center h = μ_vol[k] */
     double log_liks[SPRT_MAX_REGIMES];
+    double y_obs = (double)rbpf->last_y;
+
     for (int r = 0; r < n_regimes; r++)
     {
-        /* Use weighted log-likelihood from regime posterior
-         * Floor to prevent log(0) */
-        double p_r = (double)out->regime_probs[r];
-        if (p_r < 1e-10)
-            p_r = 1e-10;
-        log_liks[r] = log(p_r);
+        double h_regime = (double)rbpf->params[r].mu_vol;
+        log_liks[r] = sprt_logchisq_loglik(y_obs, h_regime);
     }
 
     /* Update SPRT module - handles pairwise tests and regime switching */

@@ -154,11 +154,13 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->use_silverman_bandwidth = 1;
     rbpf->last_silverman_bandwidth = RBPF_REAL(0.0);
 
-    /* Regime diversity */
-    rbpf->min_particles_per_regime = n / (4 * n_regimes);
-    if (rbpf->min_particles_per_regime < 2)
-        rbpf->min_particles_per_regime = 2;
-    rbpf->regime_mutation_prob = RBPF_REAL(0.02);
+    /* Regime diversity - "Pilot Light" safety net
+     * Prevents P(regime=k) = 0 (absorbing state).
+     * Primary regime switching handled by BOCPD + SPRT,
+     * but we keep 1-2 particles per regime as mathematical insurance.
+     * Cost: negligible (2 particles out of 1000 = 0.2% noise). */
+    rbpf->min_particles_per_regime = 2;
+    rbpf->regime_mutation_prob = RBPF_REAL(0.001); /* 0.1% */
 
     /* Detection state */
     rbpf->detection.vol_ema_short = RBPF_REAL(0.01);
@@ -329,11 +331,21 @@ void rbpf_ksc_set_regularization(RBPF_KSC *rbpf, rbpf_real_t h_mu, rbpf_real_t h
 
 void rbpf_ksc_set_regime_diversity(RBPF_KSC *rbpf, int min_per_regime, rbpf_real_t mutation_prob)
 {
-    rbpf->min_particles_per_regime = min_per_regime;
+    if (!rbpf)
+        return;
+
+    /* Clamp to reasonable bounds */
+    if (min_per_regime < 0)
+        min_per_regime = 0;
+    if (min_per_regime > rbpf->n_particles / 4)
+        min_per_regime = rbpf->n_particles / 4;
+
     if (mutation_prob < RBPF_REAL(0.0))
         mutation_prob = RBPF_REAL(0.0);
-    if (mutation_prob > RBPF_REAL(0.2))
-        mutation_prob = RBPF_REAL(0.2);
+    if (mutation_prob > RBPF_REAL(0.05)) /* Cap at 5% - was 20%, now stricter */
+        mutation_prob = RBPF_REAL(0.05);
+
+    rbpf->min_particles_per_regime = min_per_regime;
     rbpf->regime_mutation_prob = mutation_prob;
 }
 
@@ -522,6 +534,9 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
     rbpf->detection.vol_ema_long = rbpf_exp(mu0);
     rbpf->detection.prev_regime = 0;
     rbpf->detection.cooldown = 0;
+
+    /* Initialize last_y for SPRT (neutral observation at initial vol) */
+    rbpf->last_y = RBPF_REAL(2.0) * mu0;
 
     /* Reset SPRT module */
     rbpf_ksc_reset_sprt(rbpf);

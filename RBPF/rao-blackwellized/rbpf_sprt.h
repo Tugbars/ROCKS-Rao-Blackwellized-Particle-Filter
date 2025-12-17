@@ -40,20 +40,6 @@
  *          → Good for IMM hypothesis switching
  *
  * Recommended: Use BOCPD for shock detection, SPRT for regime labeling.
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * MULTI-REGIME EXTENSION
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * For K regimes, maintain K(K-1)/2 pairwise SPRT tests:
- *   - Calm vs Trend
- *   - Calm vs Crisis
- *   - Trend vs Crisis
- *
- * Or use "One vs Rest" approach with K tests:
- *   - Is it Calm? (Calm vs {Trend, Crisis})
- *   - Is it Trend? (Trend vs {Calm, Crisis})
- *   - Is it Crisis? (Crisis vs {Calm, Trend})
  */
 
 #ifndef RBPF_SPRT_H
@@ -112,8 +98,6 @@ void sprt_binary_init(SPRT_Binary *sprt, double alpha, double beta);
 
 /**
  * @brief Reset SPRT after a decision
- *
- * Call this after SPRT_ACCEPT_H0 or SPRT_ACCEPT_H1 to start new test.
  */
 void sprt_binary_reset(SPRT_Binary *sprt);
 
@@ -124,11 +108,6 @@ void sprt_binary_reset(SPRT_Binary *sprt);
  * @param ll_h1  Log-likelihood under H₁ (alternative)
  * @param ll_h0  Log-likelihood under H₀ (null)
  * @return       Decision: CONTINUE, ACCEPT_H0, or ACCEPT_H1
- *
- * The caller computes log-likelihoods based on their model.
- * For regime detection, this might be:
- *   ll_h1 = log P(y_t | Crisis model)
- *   ll_h0 = log P(y_t | Calm model)
  */
 SPRT_Decision sprt_binary_update(SPRT_Binary *sprt, double ll_h1, double ll_h0);
 
@@ -138,10 +117,7 @@ SPRT_Decision sprt_binary_update(SPRT_Binary *sprt, double ll_h1, double ll_h0);
 double sprt_binary_get_ratio(const SPRT_Binary *sprt);
 
 /**
- * @brief Get normalized evidence (0 to 1 scale for visualization)
- *
- * Maps Λ from [threshold_low, threshold_high] to [0, 1]
- * Values outside range clamp to 0 or 1.
+ * @brief Get normalized evidence (0 to 1 scale)
  */
 double sprt_binary_get_evidence(const SPRT_Binary *sprt);
 
@@ -153,9 +129,6 @@ double sprt_binary_get_evidence(const SPRT_Binary *sprt);
 
 /**
  * @brief Multi-regime SPRT using pairwise tests
- *
- * For K regimes, maintains K(K-1)/2 pairwise SPRT detectors.
- * Decision rule: Switch to regime j if all tests involving j favor j.
  */
 typedef struct {
     int n_regimes;
@@ -178,12 +151,6 @@ typedef struct {
 
 /**
  * @brief Initialize multi-regime SPRT
- *
- * @param sprt         Detector state
- * @param n_regimes    Number of regimes (2-8)
- * @param alpha        Type I error rate
- * @param beta         Type II error rate
- * @param min_dwell    Minimum ticks in regime before switch allowed
  */
 void sprt_multi_init(SPRT_Multi *sprt, int n_regimes,
                      double alpha, double beta, int min_dwell);
@@ -194,58 +161,58 @@ void sprt_multi_init(SPRT_Multi *sprt, int n_regimes,
  * @param sprt         Detector state
  * @param log_liks     Log-likelihoods under each regime [n_regimes]
  * @return             New regime index (may be same as current)
- *
- * Internally updates all pairwise tests and determines if regime should switch.
  */
 int sprt_multi_update(SPRT_Multi *sprt, const double *log_liks);
 
 /**
- * @brief Get evidence for each regime (for visualization/debugging)
- *
- * @param sprt         Detector state
- * @param evidence     Output array [n_regimes], values in [0, 1]
+ * @brief Get evidence for each regime
  */
 void sprt_multi_get_evidence(const SPRT_Multi *sprt, double *evidence);
 
 /**
- * @brief Force regime (external override)
- *
- * Use when shock detector (BOCPD) fires - force SPRT to a specific regime.
+ * @brief Force regime (external override, e.g., from BOCPD shock)
  */
 void sprt_multi_force_regime(SPRT_Multi *sprt, int regime);
 
 /*═══════════════════════════════════════════════════════════════════════════
  * LIKELIHOOD HELPERS
- *
- * Common likelihood functions for regime comparison.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 /**
  * @brief Gaussian log-likelihood
- *
- * log P(y | μ, σ²) = -0.5 * [log(2πσ²) + (y-μ)²/σ²]
  */
 double sprt_gaussian_loglik(double y, double mu, double var);
 
 /**
  * @brief Student-t log-likelihood
- *
- * log P(y | μ, σ², ν) = log Γ((ν+1)/2) - log Γ(ν/2) - 0.5*log(νπσ²)
- *                       - ((ν+1)/2) * log(1 + (y-μ)²/(νσ²))
  */
 double sprt_student_t_loglik(double y, double mu, double var, double nu);
 
 /**
- * @brief Log-chi-squared log-likelihood (KSC observation model)
- *
- * For y = log(r²) where r ~ N(0, exp(h)):
- * Uses 10-component Gaussian mixture approximation.
+ * @brief Log-chi-squared log-likelihood (KSC/OCSN observation model)
  *
  * @param y_log_sq   Observed log(return²)
  * @param h          Log-volatility state
- * @return           Log-likelihood
+ * @return           Log-likelihood P(y | h)
  */
 double sprt_logchisq_loglik(double y_log_sq, double h);
+
+/**
+ * @brief Compute per-regime log-likelihoods for SPRT
+ *
+ * @param y_log_sq      Observed log(return²)
+ * @param regime_mu     Array of regime log-vol means [n_regimes]
+ * @param regime_sigma  Array of regime vol-of-vol [n_regimes] (unused)
+ * @param regime_nu     Array of regime Student-t ν [n_regimes] (unused)
+ * @param n_regimes     Number of regimes
+ * @param log_liks      Output log-likelihoods [n_regimes]
+ */
+void sprt_compute_regime_logliks(double y_log_sq,
+                                  const double *regime_mu,
+                                  const double *regime_sigma,
+                                  const double *regime_nu,
+                                  int n_regimes,
+                                  double *log_liks);
 
 #ifdef __cplusplus
 }

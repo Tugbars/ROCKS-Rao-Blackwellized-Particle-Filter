@@ -436,7 +436,18 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
             var[i] = RBPF_REAL(1e-6);
     }
 
-    /* Regime diversity preservation */
+    /* Regime diversity - "Pilot Light" safety net
+     *
+     * Prevents P(regime=k) = 0 which is an absorbing state in Bayes' rule.
+     * Primary regime switching is handled by BOCPD + SPRT ("afterburner"),
+     * but we keep 1-2 particles per regime as mathematical insurance.
+     *
+     * Settings (neutered):
+     *   min_particles_per_regime = 2   (just prevent log(0))
+     *   regime_mutation_prob = 0.001   (0.1% - barely noticeable)
+     *
+     * Cost: ~2 particles out of 1000 = negligible noise floor.
+     */
     if (rbpf->regime_mutation_prob > RBPF_REAL(0.0))
     {
         int n_regimes = rbpf->n_regimes;
@@ -454,10 +465,12 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
         {
             int r = regime[i];
 
+            /* Only mutate from over-represented regimes */
             if (regime_count[r] > min_count * 2)
             {
                 if (rbpf_pcg32_uniform(rng_mut) < rbpf->regime_mutation_prob)
                 {
+                    /* Find under-represented regime */
                     for (int r_new = 0; r_new < n_regimes; r_new++)
                     {
                         if (regime_count[r_new] < min_count)
@@ -466,6 +479,7 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
                             regime_count[r_new]++;
                             regime[i] = r_new;
 
+                            /* Blend state toward new regime center */
                             rbpf_real_t mu_new = rbpf->params[r_new].mu_vol;
                             mu[i] = RBPF_REAL(0.7) * mu[i] + RBPF_REAL(0.3) * mu_new;
                             break;
@@ -526,6 +540,9 @@ void rbpf_ksc_step(RBPF_KSC *rbpf, rbpf_real_t obs, RBPF_KSC_Output *output)
 #else
     marginal_lik = rbpf_ksc_update(rbpf, y);
 #endif
+
+    /* Store observation for SPRT likelihood computation */
+    rbpf->last_y = y;
 
     /* 4. Compute outputs (before resample) */
     rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
