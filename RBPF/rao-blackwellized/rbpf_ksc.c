@@ -385,11 +385,14 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
 
     if (rbpf->use_silverman_bandwidth && rbpf->silverman_scratch != NULL)
     {
+        /* NOTE: Use mu_tmp (old data before swap) to match original behavior.
+         * After pointer swap, rbpf->mu_tmp holds the pre-resampled distribution
+         * which has more diversity for bandwidth estimation. */
 #ifndef RBPF_USE_DOUBLE
-        h_mu = rbpf_silverman_bandwidth_f(rbpf->mu, n, rbpf->silverman_scratch);
+        h_mu = rbpf_silverman_bandwidth_f(rbpf->mu_tmp, n, rbpf->silverman_scratch);
 #else
         h_mu = (rbpf_real_t)rbpf_silverman_bandwidth(
-            (const double *)rbpf->mu, n, (double *)rbpf->silverman_scratch);
+            (const double *)rbpf->mu_tmp, n, (double *)rbpf->silverman_scratch);
 #endif
 
         if (h_mu < RBPF_REAL(0.001))
