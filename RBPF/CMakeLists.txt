@@ -53,7 +53,8 @@ if(RBPF_ENABLE_STORVIK)
         hawkes/hawkes_intensity.c
         
         # MMPF (Multi-Model Particle Filter) - Institutional Grade
-        mmpf/mmpf_rocks.c
+        mmpf/mmpf_core.c
+        mmpf/mmpf_api.c
         mmpf/mmpf_entropy.c
         mmpf/mmpf_online_em.c
     )
@@ -297,7 +298,6 @@ if(RBPF_ENABLE_STORVIK)
         hawkes/hawkes_intensity.h
         pmmh/pmmh_mkl.h
         duration_tracker/duration_tracker_fast.h
-        mmpf/mmpf_rocks.h
         mmpf/mmpf_internal.h
         mmpf/mmpf_entropy.h
         mmpf/mmpf_online_em.h
