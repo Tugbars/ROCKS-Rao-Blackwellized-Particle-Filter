@@ -14,6 +14,7 @@
 
 #include "rbpf_ksc.h"
 #include "rbpf_sprt.h"
+#include "rbpf_dirichlet_transition.h"
 #include <string.h>
 #include <math.h>
 #include <mkl_vml.h>
@@ -29,6 +30,45 @@
 /*─────────────────────────────────────────────────────────────────────────────
  * COMPUTE OUTPUTS
  *───────────────────────────────────────────────────────────────────────────*/
+
+ /**
+ * @brief Rebuild transition LUT from Dirichlet posterior
+ * 
+ * The RBPF uses a uint8_t[regime][1024] LUT for fast transition sampling.
+ * This function rebuilds it from the current Dirichlet posterior.
+ */
+static void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
+{
+    const int n_regimes = rbpf->n_regimes;
+    const DirichletTransition *dt = &rbpf->trans_prior;
+    
+    for (int r = 0; r < n_regimes; r++)
+    {
+        /* Build cumulative distribution */
+        float cumsum[RBPF_MAX_REGIMES];
+        cumsum[0] = dt->prob[r][0];
+        for (int j = 1; j < n_regimes; j++)
+        {
+            cumsum[j] = cumsum[j - 1] + dt->prob[r][j];
+        }
+        
+        /* Fill LUT: for each u ∈ [0, 1024), find smallest j where cumsum[j] > u/1024 */
+        for (int i = 0; i < 1024; i++)
+        {
+            float u = (float)i / 1024.0f;
+            int next = n_regimes - 1;
+            for (int j = 0; j < n_regimes - 1; j++)
+            {
+                if (u < cumsum[j])
+                {
+                    next = j;
+                    break;
+                }
+            }
+            rbpf->trans_lut[r][i] = (uint8_t)next;
+        }
+    }
+}
 
 void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
                               RBPF_KSC_Output *out)
@@ -129,11 +169,13 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     out->dominant_regime = dom;
 
     /*========================================================================
-     * SPRT REGIME DETECTION (using dedicated module)
+     * SPRT REGIME DETECTION + DIRICHLET TRANSITION LEARNING
      *
      * Computes per-regime observation log-likelihoods P(y | regime_k)
      * using the OCSN (2007) log-χ² mixture model, then delegates to
      * sprt_multi_update() for pairwise hypothesis testing.
+     *
+     * If learning enabled, updates Dirichlet prior on regime changes.
      *======================================================================*/
 
     RBPF_Detection *det = &rbpf->detection;
@@ -149,15 +191,34 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
         log_liks[r] = sprt_logchisq_loglik(y_obs, h_regime);
     }
 
+    /* Save current regime before update */
+    int old_sprt_regime = det->stable_regime;
+
     /* Update SPRT module - handles pairwise tests and regime switching */
     int sprt_regime = sprt_multi_update(&rbpf->sprt, log_liks);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * DIRICHLET TRANSITION LEARNING
+     * 
+     * Learn from SPRT-confirmed regime changes.
+     * This is the ONLY place where we update the transition prior.
+     * The prior encodes geometry (nearby regimes more likely) and
+     * adapts based on observed market dynamics.
+     * ═══════════════════════════════════════════════════════════════════════*/
+    if (rbpf->trans_prior_enabled && sprt_regime != old_sprt_regime)
+    {
+        /* SPRT confirmed a regime change - learn from it */
+        dirichlet_transition_update(&rbpf->trans_prior, old_sprt_regime, sprt_regime);
+        
+        /* Rebuild the LUT so future transitions use learned probabilities */
+        rbpf_rebuild_trans_lut_from_dirichlet(rbpf);
+    }
 
     out->smoothed_regime = sprt_regime;
     det->stable_regime = sprt_regime;
 
     /* Copy SPRT evidence to output for diagnostics */
     sprt_multi_get_evidence(&rbpf->sprt, out->sprt_evidence);
-
     /*========================================================================
      * SELF-AWARE SIGNALS
      *======================================================================*/

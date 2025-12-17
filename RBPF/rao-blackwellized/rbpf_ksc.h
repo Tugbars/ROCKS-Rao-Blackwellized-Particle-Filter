@@ -80,7 +80,7 @@
  *═══════════════════════════════════════════════════════════════════════════*/
 
 #include "bocpd.h"
-
+#include "rbpf_dirichlet_transition.h"
 #include "rbpf_sprt.h"
 #include <mkl.h>
 #include <mkl_vsl.h>
@@ -775,6 +775,9 @@ typedef float rbpf_real_t;
         /** Cooldown counter: ticks until next BOCPD trigger allowed */
         int bocpd_cooldown;
 
+        DirichletTransition trans_prior; /**< Dirichlet posterior over transitions */
+        int trans_prior_enabled;         /**< 0 = use fixed matrix, 1 = learn online */
+
     } RBPF_KSC;
 
     /**
@@ -862,6 +865,11 @@ typedef float rbpf_real_t;
         /** BOCPD's P(changepoint) = P(r < 5)
          *  High values (>0.5) suggest regime instability */
         rbpf_real_t bocpd_p_changepoint;
+
+        /* Transition learning diagnostics (optional) */
+        int trans_learning_active;                /**< 1 if Dirichlet learning is enabled */
+        int trans_learned_this_tick;              /**< 1 if a transition was learned this tick */
+        float trans_stickiness[RBPF_MAX_REGIMES]; /**< Current P(stay in regime r) */
 
     } RBPF_KSC_Output;
 
@@ -1488,6 +1496,45 @@ typedef float rbpf_real_t;
      * @return      1 if BOCPD is attached, 0 otherwise
      */
     int rbpf_ksc_bocpd_attached(const RBPF_KSC *rbpf);
+
+    /**
+     * @brief Enable/disable online transition matrix learning
+     *
+     * When enabled, the transition matrix is learned from SPRT-confirmed
+     * regime changes using a Discounted Dirichlet prior.
+     *
+     * @param rbpf    RBPF instance
+     * @param enable  1 = learn online, 0 = use fixed matrix
+     */
+    void rbpf_ksc_enable_transition_learning(RBPF_KSC *rbpf, int enable);
+
+    /**
+     * @brief Configure Dirichlet transition learning parameters
+     *
+     * @param rbpf            RBPF instance
+     * @param stickiness      Prior strength for self-transitions (default: 30.0)
+     * @param distance_scale  Scale for geometry-aware prior (default: 1.0)
+     * @param gamma           Forgetting factor (default: 0.999, ~1000 tick memory)
+     */
+    void rbpf_ksc_set_transition_learning_params(RBPF_KSC *rbpf,
+                                                 float stickiness,
+                                                 float distance_scale,
+                                                 float gamma);
+
+    /**
+     * @brief Get current learned transition probability
+     *
+     * @param rbpf  RBPF instance
+     * @param from  Source regime
+     * @param to    Destination regime
+     * @return      Current transition probability P(to | from)
+     */
+    float rbpf_ksc_get_transition_prob(const RBPF_KSC *rbpf, int from, int to);
+
+    /**
+     * @brief Print Dirichlet transition learning diagnostics
+     */
+    void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf);
 
 #ifdef __cplusplus
 }

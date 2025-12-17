@@ -16,6 +16,7 @@
 
 #include "rbpf_ksc.h"
 #include "rbpf_sprt.h"
+#include "rbpf_dirichlet_transition.h"
 #include "bocpd.h"
 #include <stdlib.h>
 #include <string.h>
@@ -171,6 +172,32 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
 
     /* SPRT regime detection - use dedicated module */
     sprt_multi_init(&rbpf->sprt, n_regimes, 0.01, 0.01, 3);
+     
+     /* Dirichlet transition learning - disabled by default
+     * 
+     * Initialize with geometry-aware prior based on regime distances.
+     * The prior encodes: "nearby regimes are more likely transitions"
+     * Learning happens when SPRT confirms regime changes.
+     */
+    {
+        float mu_vol_init[RBPF_MAX_REGIMES];
+        for (int r = 0; r < n_regimes; r++)
+        {
+            mu_vol_init[r] = (float)rbpf->params[r].mu_vol;
+        }
+        
+        dirichlet_transition_init_geometric(
+            &rbpf->trans_prior,
+            n_regimes,
+            mu_vol_init,
+            30.0f,   /* stickiness: moderate */
+            1.0f,    /* distance_scale: 1 log-vol unit */
+            0.999f   /* gamma: ~1000 tick memory */
+        );
+    }
+    rbpf->trans_prior_enabled = 0;  /* Off by default - use fixed matrix */
+
+
     rbpf->detection.stable_regime = 0;
 
     /* BOCPD changepoint detection - disabled by default
@@ -632,6 +659,132 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
 #endif
 }
 
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * DIRICHLET TRANSITION LEARNING CONFIGURATION
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+void rbpf_ksc_enable_transition_learning(RBPF_KSC *rbpf, int enable)
+{
+    if (!rbpf)
+        return;
+    
+    rbpf->trans_prior_enabled = enable;
+    
+    if (enable)
+    {
+        /* Sync Dirichlet prior to current transition LUT */
+        /* This ensures continuity if switching mid-run */
+        printf("  Transition learning ENABLED (Discounted Dirichlet, γ=%.4f)\n",
+               rbpf->trans_prior.gamma);
+    }
+}
+
+void rbpf_ksc_set_transition_learning_params(RBPF_KSC *rbpf,
+                                              float stickiness,
+                                              float distance_scale,
+                                              float gamma)
+{
+    if (!rbpf)
+        return;
+    
+    /* Clamp parameters to reasonable ranges */
+    if (stickiness < 1.0f) stickiness = 1.0f;
+    if (stickiness > 1000.0f) stickiness = 1000.0f;
+    
+    if (distance_scale < 0.1f) distance_scale = 0.1f;
+    if (distance_scale > 10.0f) distance_scale = 10.0f;
+    
+    if (gamma < 0.9f) gamma = 0.9f;
+    if (gamma > 0.9999f) gamma = 0.9999f;
+    
+    /* Re-initialize with new parameters */
+    float mu_vol_init[RBPF_MAX_REGIMES];
+    for (int r = 0; r < rbpf->n_regimes; r++)
+    {
+        mu_vol_init[r] = (float)rbpf->params[r].mu_vol;
+    }
+    
+    dirichlet_transition_init_geometric(
+        &rbpf->trans_prior,
+        rbpf->n_regimes,
+        mu_vol_init,
+        stickiness,
+        distance_scale,
+        gamma
+    );
+}
+
+float rbpf_ksc_get_transition_prob(const RBPF_KSC *rbpf, int from, int to)
+{
+    if (!rbpf)
+        return 0.0f;
+    if (from < 0 || from >= rbpf->n_regimes)
+        return 0.0f;
+    if (to < 0 || to >= rbpf->n_regimes)
+        return 0.0f;
+    
+    if (rbpf->trans_prior_enabled)
+    {
+        return dirichlet_transition_prob(&rbpf->trans_prior, from, to);
+    }
+    else
+    {
+        /* Return from fixed LUT (approximate - LUT is discretized) */
+        /* Count how many LUT entries map to 'to' */
+        int count = 0;
+        for (int i = 0; i < 1024; i++)
+        {
+            if (rbpf->trans_lut[from][i] == (uint8_t)to)
+                count++;
+        }
+        return (float)count / 1024.0f;
+    }
+}
+
+void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf)
+{
+    if (!rbpf)
+        return;
+    
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  Transition Learning Status\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  Enabled: %s\n", rbpf->trans_prior_enabled ? "YES" : "NO");
+    
+    if (rbpf->trans_prior_enabled)
+    {
+        dirichlet_transition_print(&rbpf->trans_prior);
+    }
+    else
+    {
+        printf("  Using fixed transition matrix (call enable_transition_learning to learn)\n");
+        printf("\n  Current fixed transition probabilities:\n");
+        printf("       ");
+        for (int j = 0; j < rbpf->n_regimes; j++)
+            printf("    R%d   ", j);
+        printf("\n");
+        
+        for (int i = 0; i < rbpf->n_regimes; i++)
+        {
+            printf("  R%d: ", i);
+            for (int j = 0; j < rbpf->n_regimes; j++)
+            {
+                float p = rbpf_ksc_get_transition_prob(rbpf, i, j);
+                if (i == j)
+                    printf(" [%5.1f%%]", p * 100.0f);
+                else
+                    printf("  %5.1f%% ", p * 100.0f);
+            }
+            printf("\n");
+        }
+    }
+    printf("═══════════════════════════════════════════════════════════════\n");
+}
+
+
+
 /*─────────────────────────────────────────────────────────────────────────────
  * WARMUP
  *───────────────────────────────────────────────────────────────────────────*/
@@ -702,6 +855,18 @@ void rbpf_ksc_print_config(const RBPF_KSC *rbpf)
         const RBPF_RegimeParams *p = &rbpf->params[r];
         printf("  %-8d %8.4f %8.4f %8.4f\n",
                r, p->theta, p->mu_vol, p->sigma_vol);
+    }
+
+    printf("\n  Transition Learning:\n");
+    printf("    Enabled:     %s\n", rbpf->trans_prior_enabled ? "YES" : "NO");
+    if (rbpf->trans_prior_enabled)
+    {
+        DirichletTransitionStats stats = dirichlet_transition_stats(&rbpf->trans_prior);
+        printf("    γ (decay):   %.4f (~%.0f tick memory)\n", 
+               rbpf->trans_prior.gamma,
+               1.0f / (1.0f - rbpf->trans_prior.gamma));
+        printf("    Avg sticky:  %.1f%%\n", stats.avg_stickiness * 100.0f);
+        printf("    Transitions: %d observed\n", stats.total_transitions);
     }
 }
 

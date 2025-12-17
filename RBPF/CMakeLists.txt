@@ -330,6 +330,7 @@ if(RBPF_ENABLE_STORVIK)
         storvik/rbpf_param_learn.h
         tuner/rbpf_tuner.h
         preprocess/rbpf_preprocess.h
+        rbpf_dirichlet_transition.h
         hawkes/hawkes_intensity.h
         pmmh/pmmh_mkl.h
         duration_tracker/duration_tracker_fast.h
