@@ -3,12 +3,40 @@
 # Robust real-time stochastic volatility tracking for high-frequency trading
 #───────────────────────────────────────────────────────────────────────────────
 
+cmake_minimum_required(VERSION 3.16)
+
+#───────────────────────────────────────────────────────────────────────────────
 # Options
+#───────────────────────────────────────────────────────────────────────────────
+
 option(RBPF_USE_DOUBLE "Use double precision (slower but more accurate)" OFF)
 option(RBPF_BUILD_BENCH "Build benchmark executable" ON)
 option(RBPF_BUILD_TESTS "Build test executables" ON)
 option(RBPF_ENABLE_STORVIK "Enable Sleeping Storvik parameter learning" ON)
 option(MMPF_ENABLE_MCMC "Enable MCMC particle teleportation" ON)
+
+#───────────────────────────────────────────────────────────────────────────────
+# BOCPD Library (required for regime detection)
+#
+# Architecture: "Pilot Light + Afterburner"
+#   - Pilot Light (mutation): Prevents P(regime=k)=0 absorbing states
+#   - Afterburner (BOCPD): Event-driven regime switching on vol structure change
+#───────────────────────────────────────────────────────────────────────────────
+
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c)
+    message(FATAL_ERROR "BOCPD not found at ../RBPF-BOCPD/bocpd.c - BOCPD is required for ROCKS")
+endif()
+
+add_library(bocpd STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c
+)
+
+target_include_directories(bocpd PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
+)
+
+target_compile_options(bocpd PRIVATE ${COMMON_FLAGS})
+target_compile_definitions(bocpd PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
 # ROCKS Core Library
@@ -21,12 +49,9 @@ set(ROCKS_SOURCES
     rao-blackwellized/rbpf_ksc_output.c
     rao-blackwellized/rbpf_ksc_student_t.c
     
-    # Adaptive components (Silverman bandwidth, SPRT detection)
-    rao-blackwellized/rbpf_silverman.c
-    rao-blackwellized/rbpf_sprt.c
-    
-    # DISABLED: APF needs Liu-West removal
-    # apf/rbpf_apf.c
+    # Adaptive components
+    rao-blackwellized/rbpf_silverman.c   # Silverman bandwidth for regularization
+    rao-blackwellized/rbpf_sprt.c        # SPRT regime detection
 )
 
 # Add Storvik parameter learning and related modules if enabled
@@ -47,9 +72,6 @@ if(RBPF_ENABLE_STORVIK)
         
         # Preprocessor
         preprocess/rbpf_preprocess.c
-        
-        # Watchdog (not yet integrated)
-        # watchdog/rbpf_watchdog.c
         
         # Hawkes intensity
         hawkes/hawkes_intensity.c
@@ -80,16 +102,17 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/ocsn
         ${CMAKE_CURRENT_SOURCE_DIR}/tuner
         ${CMAKE_CURRENT_SOURCE_DIR}/preprocess
-        # ${CMAKE_CURRENT_SOURCE_DIR}/watchdog  # Not yet integrated
         ${CMAKE_CURRENT_SOURCE_DIR}/hawkes
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
+        ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
 )
 
 target_link_libraries(rocks 
     PUBLIC 
         MKL::MKL
+        bocpd
 )
 
 target_compile_options(rocks PRIVATE ${COMMON_FLAGS})
@@ -111,31 +134,13 @@ endif()
 add_library(rbpf_ksc ALIAS rocks)
 
 #───────────────────────────────────────────────────────────────────────────────
-# BOCPD Library (sibling directory)
-#───────────────────────────────────────────────────────────────────────────────
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c)
-    add_library(bocpd STATIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c
-    )
-    target_include_directories(bocpd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD)
-    target_compile_options(bocpd PRIVATE ${COMMON_FLAGS})
-    target_compile_definitions(bocpd PRIVATE ${COMMON_DEFS})
-endif()
-
-#───────────────────────────────────────────────────────────────────────────────
 # Test Executables
 #───────────────────────────────────────────────────────────────────────────────
 
 if(RBPF_BUILD_TESTS)
 
     #───────────────────────────────────────────────────────────────────────────
-    # DISABLED: RBPF-level tests (API changes in rbpf_ksc.c)
-    # Re-enable after updating test code to new API
-    #───────────────────────────────────────────────────────────────────────────
-
-    #───────────────────────────────────────────────────────────────────────────
-    # ENABLED: MMPF-level tests
+    # MMPF-level tests
     #───────────────────────────────────────────────────────────────────────────
 
     # MMPF correctness tests
@@ -169,7 +174,7 @@ if(RBPF_BUILD_TESTS)
     endif()
 
     # BOCPD standalone test
-    if(TARGET bocpd AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c)
         add_executable(test_bocpd
             ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c
         )
@@ -177,24 +182,19 @@ if(RBPF_BUILD_TESTS)
         if(NOT WIN32)
             target_link_libraries(test_bocpd PRIVATE m)
         endif()
-        target_include_directories(test_bocpd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD)
         target_compile_options(test_bocpd PRIVATE ${COMMON_FLAGS})
         target_compile_definitions(test_bocpd PRIVATE ${COMMON_DEFS})
     endif()
 
     # BOCPD + MMPF integration test
-    if(TARGET bocpd AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_mmpf.c)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_mmpf.c)
         add_executable(test_bocpd_mmpf
             ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_mmpf.c
         )
-        target_link_libraries(test_bocpd_mmpf PRIVATE rocks bocpd)
+        target_link_libraries(test_bocpd_mmpf PRIVATE rocks)
         if(NOT WIN32)
             target_link_libraries(test_bocpd_mmpf PRIVATE m)
         endif()
-        target_include_directories(test_bocpd_mmpf PRIVATE 
-            ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
-            ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
-        )
         target_compile_options(test_bocpd_mmpf PRIVATE ${COMMON_FLAGS})
         target_compile_definitions(test_bocpd_mmpf PRIVATE ${COMMON_DEFS})
     endif()
@@ -239,9 +239,6 @@ endif()
 #───────────────────────────────────────────────────────────────────────────────
 
 if(RBPF_BUILD_BENCH)
-    # DISABLED: KSC benchmark (API changes in rbpf_ksc.c)
-    # rbpf_ksc_bench.c
-
     # PMMH benchmark
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/bench_pmmh_mkl.c)
         add_executable(bench_pmmh_mkl
@@ -277,7 +274,7 @@ endif()
 # Installation
 #───────────────────────────────────────────────────────────────────────────────
 
-install(TARGETS rocks
+install(TARGETS rocks bocpd
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
 )
@@ -288,6 +285,7 @@ set(ROCKS_HEADERS
     rao-blackwellized/rbpf_ksc.h
     rao-blackwellized/rbpf_silverman.h
     rao-blackwellized/rbpf_sprt.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.h
 )
 
 # Storvik and related headers

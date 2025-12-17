@@ -16,6 +16,7 @@
 
 #include "rbpf_ksc.h"
 #include "rbpf_sprt.h"
+#include "bocpd.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -171,6 +172,15 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     /* SPRT regime detection - use dedicated module */
     sprt_multi_init(&rbpf->sprt, n_regimes, 0.01, 0.01, 3);
     rbpf->detection.stable_regime = 0;
+
+    /* BOCPD changepoint detection - disabled by default
+     * Call rbpf_ksc_attach_bocpd() to enable */
+    rbpf->bocpd = NULL;
+    rbpf->bocpd_delta = NULL;
+    rbpf->bocpd_hazard = NULL;
+    rbpf->bocpd_threshold = 3.0;     /* z-score threshold for detection */
+    rbpf->bocpd_decay = 0.995;       /* Decay for delta detector */
+    rbpf->bocpd_learn_window = 1000; /* Window for hazard learning */
 
     /* Fixed-lag smoothing */
     rbpf->smooth_lag = 0;
@@ -399,6 +409,64 @@ void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime)
     /* Use SPRT module's force function */
     sprt_multi_force_regime(&rbpf->sprt, regime);
     rbpf->detection.stable_regime = regime;
+}
+
+/*─────────────────────────────────────────────────────────────────────────────
+ * BOCPD CHANGEPOINT DETECTION INTEGRATION
+ *
+ * BOCPD ("Afterburner") provides event-driven regime switching.
+ * Complements the pilot light mutation for robust regime tracking.
+ *───────────────────────────────────────────────────────────────────────────*/
+
+void rbpf_ksc_attach_bocpd(RBPF_KSC *rbpf,
+                           bocpd_t *bocpd,
+                           bocpd_delta_detector_t *delta,
+                           bocpd_hazard_t *hazard)
+{
+    if (!rbpf)
+        return;
+
+    rbpf->bocpd = bocpd;
+    rbpf->bocpd_delta = delta;
+    rbpf->bocpd_hazard = hazard;
+}
+
+void rbpf_ksc_detach_bocpd(RBPF_KSC *rbpf)
+{
+    if (!rbpf)
+        return;
+
+    rbpf->bocpd = NULL;
+    rbpf->bocpd_delta = NULL;
+    rbpf->bocpd_hazard = NULL;
+}
+
+void rbpf_ksc_set_bocpd_params(RBPF_KSC *rbpf,
+                               double z_threshold,
+                               double decay,
+                               size_t learn_window)
+{
+    if (!rbpf)
+        return;
+
+    if (z_threshold < 1.0)
+        z_threshold = 1.0;
+    if (z_threshold > 10.0)
+        z_threshold = 10.0;
+
+    if (decay < 0.9)
+        decay = 0.9;
+    if (decay > 0.9999)
+        decay = 0.9999;
+
+    rbpf->bocpd_threshold = z_threshold;
+    rbpf->bocpd_decay = decay;
+    rbpf->bocpd_learn_window = learn_window;
+}
+
+int rbpf_ksc_bocpd_attached(const RBPF_KSC *rbpf)
+{
+    return (rbpf && rbpf->bocpd != NULL && rbpf->bocpd_delta != NULL);
 }
 
 void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag)
