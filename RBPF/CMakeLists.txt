@@ -17,6 +17,8 @@ option(MMPF_ENABLE_MCMC "Enable MCMC particle teleportation" ON)
 set(ROCKS_SOURCES
     # Core Rao-Blackwellized particle filter
     rao-blackwellized/rbpf_ksc.c
+    rao-blackwellized/rbpf_ksc_init.c
+    rao-blackwellized/rbpf_ksc_output.c
     rao-blackwellized/rbpf_ksc_student_t.c
     
     # Adaptive components (Silverman bandwidth, SPRT detection)
