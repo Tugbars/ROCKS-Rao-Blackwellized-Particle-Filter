@@ -445,6 +445,11 @@ static int rbpf_regime_to_hypothesis(int regime)
 static void run_single_rbpf(SyntheticData *data, TickRecord *records,
                             double *total_time, double *max_latency)
 {
+
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  RBPF with Dirichlet Transition Learning Example\n");
+    printf("═══════════════════════════════════════════════════════════════\n\n");
+
     const int N_PARTICLES = 512;
     const int N_REGIMES = 4;
 
@@ -475,6 +480,20 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
         0.012f, 0.036f, 0.920f, 0.032f,
         0.004f, 0.020f, 0.056f, 0.920f};
     rbpf_ext_build_transition_lut(ext, trans);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * ENABLE DIRICHLET TRANSITION LEARNING
+     *
+     * IMPORTANT: Call set_transition_learning_params() to re-initialize
+     * the geometry-aware prior with the CORRECT mu_vol values.
+     * ═══════════════════════════════════════════════════════════════════════*/
+    /*
+    rbpf_ksc_set_transition_learning_params(ext->rbpf,
+                                            30.0f,   // stickiness 
+                                            1.0f,    // distance_scale 
+                                            0.999f); // gamma 
+    rbpf_ksc_enable_transition_learning(ext->rbpf, 1);
+    */
 
     /* Forgetting λ per regime */
     param_learn_set_regime_forgetting(&ext->storvik, 0, 0.9990f);
