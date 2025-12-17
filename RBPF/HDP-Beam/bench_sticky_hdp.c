@@ -431,6 +431,107 @@ static void bench_detailed(int T, int K_max, int n_sweeps)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * BLOCKED GIBBS BENCHMARK
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+static void bench_blocked_gibbs(int T, int K_max, int n_sweeps)
+{
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    printf("  BLOCKED GIBBS (FFBS) BENCHMARK: T=%d, K_max=%d, n_sweeps=%d\n", T, K_max, n_sweeps);
+    printf("═══════════════════════════════════════════════════════════════════════════════\n\n");
+
+    /* Generate data */
+    int n_regimes = 4;
+    SyntheticData *data = generate_synthetic_data(T, n_regimes, 42);
+    if (!data)
+    {
+        printf("  ERROR: Failed to generate data\n");
+        return;
+    }
+
+    /* Create HDP */
+    StickyHDP *hdp = sticky_hdp_create(K_max, T + 100);
+    if (!hdp)
+    {
+        fprintf(stderr, "  ERROR: Failed to create HDP\n");
+        free_synthetic_data(data);
+        return;
+    }
+
+    sticky_hdp_set_concentration(hdp, 1.0, 1.0);
+    sticky_hdp_set_stickiness(hdp, 50.0);
+
+    /* Initialize with known regimes */
+    double sigma_vol[HDP_MAX_STATES];
+    for (int k = 0; k < n_regimes; k++)
+        sigma_vol[k] = 0.2;
+    sticky_hdp_init_regimes(hdp, n_regimes, data->mu_vol, sigma_vol, NULL);
+    sticky_hdp_set_observations(hdp, data->y, T);
+
+    /* Warmup */
+    for (int i = 0; i < 3; i++)
+    {
+        sticky_hdp_blocked_gibbs_single(hdp, 50);
+    }
+
+    /* Benchmark different block sizes */
+    int block_sizes[] = {25, 50, 100, T};
+    int n_sizes = sizeof(block_sizes) / sizeof(block_sizes[0]);
+
+    printf("  %-12s %12s %12s %12s\n", "Block Size", "Mean (μs)", "vs Beam", "Speedup");
+    printf("  ────────────────────────────────────────────────────────────────────────────\n");
+
+    /* First measure beam sampling baseline */
+    double beam_total = 0.0;
+    for (int i = 0; i < n_sweeps; i++)
+    {
+        double t0 = get_time_us();
+        sticky_hdp_beam_sweep_single(hdp);
+        beam_total += get_time_us() - t0;
+    }
+    double beam_mean = beam_total / n_sweeps;
+    printf("  %-12s %10.1f μs %12s %12s\n", "Beam", beam_mean, "baseline", "1.00×");
+
+    /* Now measure blocked Gibbs with different block sizes */
+    for (int si = 0; si < n_sizes; si++)
+    {
+        int bs = block_sizes[si];
+
+        double total = 0.0;
+        for (int i = 0; i < n_sweeps; i++)
+        {
+            double t0 = get_time_us();
+            sticky_hdp_blocked_gibbs_single(hdp, bs);
+            total += get_time_us() - t0;
+        }
+        double mean = total / n_sweeps;
+        double speedup = beam_mean / mean;
+
+        char bs_str[32];
+        if (bs == T)
+        {
+            snprintf(bs_str, sizeof(bs_str), "Full (%d)", bs);
+        }
+        else
+        {
+            snprintf(bs_str, sizeof(bs_str), "%d", bs);
+        }
+
+        printf("  %-12s %10.1f μs %+10.1f%% %10.2f×\n",
+               bs_str, mean, 100.0 * (beam_mean - mean) / beam_mean, speedup);
+    }
+
+    printf("\n");
+    printf("  NOTE: Blocked Gibbs typically needs 2-3 sweeps vs 10 for beam sampling\n");
+    printf("        to achieve equivalent posterior quality.\n");
+    printf("\n");
+
+    sticky_hdp_destroy(hdp);
+    free_synthetic_data(data);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * ADAPTIVE SWEEP BENCHMARK
  *═══════════════════════════════════════════════════════════════════════════════*/
 
@@ -589,6 +690,9 @@ int main(int argc, char **argv)
 
     /* Run scaling benchmark */
     bench_scaling();
+
+    /* Run blocked Gibbs benchmark */
+    bench_blocked_gibbs(T, K_max, n_sweeps);
 
     /* Run adaptive sweep benchmark */
     bench_adaptive_sweep(T, K_max);
