@@ -17,7 +17,7 @@ This filter achieves the **information-theoretic limit** for real-time volatilit
 | **Hypothesis Accuracy** | 64.5% | 3-regime classification |
 | **Median Latency** | 40 μs | HFT-ready |
 
-**Why this matters**: The RMSE cannot be reduced further without either (1) adding latency via smoothing, or (2) observing additional information beyond single returns. This is not a limitation of the algorithm—it is the physics of the problem.
+**Why this matters**: The RMSE cannot be reduced further without either (1) adding latency via smoothing, or (2) observing additional information beyond single returns. This is not a limitation of the algorithm: it is the physics of the problem.
 
 <img width="3919" height="2544" alt="rbpf_fig5_summary_dashboard" src="https://github.com/user-attachments/assets/bfa9d19c-d75d-4d64-a8d2-bb509f1b0537" />
 
