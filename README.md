@@ -191,46 +191,6 @@ Production configuration: **512 particles, 40 μs median latency**
 
 ---
 
-## The Bayesian Cramér-Rao Bound
-
-For filtering problems, the **Bayesian Cramér-Rao bound** (also called the Posterior Cramér-Rao bound) states:
-
-$$\text{MSE} \geq \mathbb{E}[\text{Var}(\theta | y_{1:t})]$$
-
-This filter achieves this bound because:
-
-1. **Rao-Blackwellization** eliminates sampling error in the continuous state
-2. **Sufficient particles** (512) ensure negligible Monte Carlo error in discrete state
-3. **Exact Kalman updates** within each regime
-4. **Proper posterior collapse** via GPB1
-
-The RMSE of 0.46 is not a number to improve—it is **the answer**.
-
----
-
-## What This Means for Trading
-
-### You Cannot Beat This Filter's Vol Estimate
-
-Any other filter—particle, Kalman, variational, neural—will achieve the same RMSE or worse, given the same information.
-
-### You CAN Improve Regime Detection
-
-The 64.5% hypothesis accuracy has room to grow:
-- MMPF with multiple hypotheses
-- BOCPD for structural breaks
-- Tuning for your specific asset class
-
-### The Trading Edge
-
-The value is not in "better RMSE" but in:
-1. **Speed**: 40 μs lets you react before others
-2. **Robustness**: 15σ outliers don't break the filter
-3. **Regime awareness**: Position sizing adapts to market state
-4. **Calibrated uncertainty**: ±2σ bands are meaningful
-
----
-
 ## Quick Start
 
 ```c
