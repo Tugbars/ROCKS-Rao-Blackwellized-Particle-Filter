@@ -159,8 +159,14 @@ extern "C"
          * Posterior Statistics (computed on demand or cached)
          *───────────────────────────────────────────────────────────────────────────*/
 
-        /** Posterior mean: E[π_ij] = α̃_ij / α̃_i0 */
+        /** Posterior mean (arithmetic): E[π_ij] = α̃_ij / α̃_i0 */
         double mean[ONLINE_VI_MAX_REGIMES][ONLINE_VI_MAX_REGIMES];
+
+        /** Posterior log-mean: E[log π_ij] = ψ(α̃_ij) - ψ(α̃_i0) */
+        double log_mean[ONLINE_VI_MAX_REGIMES][ONLINE_VI_MAX_REGIMES];
+
+        /** Posterior geometric mean: exp(E[log π_ij]) - CORRECT for VI updates */
+        double geom_mean[ONLINE_VI_MAX_REGIMES][ONLINE_VI_MAX_REGIMES];
 
         /** Posterior variance: Var[π_ij] */
         double var[ONLINE_VI_MAX_REGIMES][ONLINE_VI_MAX_REGIMES];
@@ -381,14 +387,40 @@ extern "C"
      *═══════════════════════════════════════════════════════════════════════════════*/
 
     /**
-     * @brief Get posterior mean transition matrix
+     * @brief Get posterior mean transition matrix (arithmetic mean)
      *
      * E[π_ij] = α̃_ij / Σ_k α̃_ik
+     *
+     * NOTE: For VI updates, use online_vi_get_geom_mean() instead.
+     * Arithmetic mean is provided for RBPF prediction step.
      *
      * @param vi     Online VI structure
      * @param trans  Output: [K × K] row-major transition matrix
      */
     void online_vi_get_mean(OnlineVI *vi, double *trans);
+
+    /**
+     * @brief Get posterior geometric mean transition matrix
+     *
+     * exp(E[log π_ij]) = exp(ψ(α̃_ij) - ψ(α̃_i0))
+     *
+     * This is the CORRECT quantity for variational inference.
+     * Use for computing responsibilities and ELBO.
+     *
+     * @param vi     Online VI structure
+     * @param trans  Output: [K × K] row-major transition matrix
+     */
+    void online_vi_get_geom_mean(OnlineVI *vi, double *trans);
+
+    /**
+     * @brief Get log-mean matrix
+     *
+     * E[log π_ij] = ψ(α̃_ij) - ψ(α̃_i0)
+     *
+     * @param vi       Online VI structure
+     * @param log_trans Output: [K × K] row-major log-transition matrix
+     */
+    void online_vi_get_log_mean(OnlineVI *vi, double *log_trans);
 
     /**
      * @brief Get posterior variance matrix
@@ -549,6 +581,29 @@ extern "C"
      * @param ess   Output: [K] effective sample sizes
      */
     void online_vi_get_row_ess(const OnlineVI *vi, double *ess);
+
+    /**
+     * @brief Compute KL divergence between VI posterior and external matrix
+     *
+     * KL(VI || external) - measures drift between Online VI and PG posterior.
+     * Use for monitoring numerical divergence.
+     *
+     * @param vi          Online VI structure
+     * @param ext_trans   External transition matrix [K × K] (e.g., from PG)
+     * @return            KL divergence (nats), -1 on error
+     */
+    double online_vi_kl_from_external(OnlineVI *vi, const double *ext_trans);
+
+    /**
+     * @brief Compute responsiveness of VI to recent updates
+     *
+     * Measures how much the posterior has changed recently.
+     * Low responsiveness indicates stiffening (ρ too small).
+     *
+     * @param vi    Online VI structure
+     * @return      Responsiveness measure (higher = more responsive)
+     */
+    double online_vi_get_responsiveness(const OnlineVI *vi);
 
     /*═══════════════════════════════════════════════════════════════════════════════
      * INTEGRATION WITH HDP-BEAM

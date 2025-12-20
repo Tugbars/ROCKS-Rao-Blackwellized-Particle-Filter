@@ -117,7 +117,7 @@ static double dirichlet_kl(const double *alpha, const double *beta, int K)
 }
 
 /**
- * Recompute cached statistics (mean, variance, entropy)
+ * Recompute cached statistics (mean, variance, entropy, geometric mean)
  */
 static void recompute_stats(OnlineVI *vi)
 {
@@ -139,15 +139,30 @@ static void recompute_stats(OnlineVI *vi)
         }
         vi->alpha_sum[i] = alpha_0;
 
-        /* Mean and variance */
+        /* Precompute digamma of row sum for geometric mean */
+        double psi_alpha_0 = digamma(alpha_0);
+
+        /* Mean, variance, and geometric mean */
         double alpha_0_sq = alpha_0 * alpha_0;
         double denom = alpha_0_sq * (alpha_0 + 1.0);
 
         for (int j = 0; j < K; j++)
         {
             double a_ij = vi->alpha[i][j];
+
+            /* Arithmetic mean: E[π_ij] = α_ij / α_0 */
             vi->mean[i][j] = a_ij / alpha_0;
+
+            /* Variance */
             vi->var[i][j] = a_ij * (alpha_0 - a_ij) / denom;
+
+            /* Log-mean: E[log π_ij] = ψ(α_ij) - ψ(α_0)
+             * This is the CORRECT quantity for variational inference */
+            vi->log_mean[i][j] = digamma(a_ij) - psi_alpha_0;
+
+            /* Geometric mean: exp(E[log π_ij])
+             * Use this for computing ξ responsibilities */
+            vi->geom_mean[i][j] = exp(vi->log_mean[i][j]);
         }
 
         /* Per-row entropy */
@@ -396,20 +411,24 @@ void online_vi_update(OnlineVI *vi,
     /*───────────────────────────────────────────────────────────────────────────
      * Compute ξ_ij = P(s_{t-1}=i, s_t=j | y_{1:t})
      *
-     * ξ̃_ij = p_{t-1}(i) × π_ij × ℓ_t(j)
+     * ξ̃_ij = p_{t-1}(i) × exp(E[log π_ij]) × ℓ_t(j)
      * ξ_ij = ξ̃_ij / Z
+     *
+     * NOTE: We use geom_mean = exp(E[log π_ij]) which is the CORRECT
+     * quantity for variational inference, not arithmetic mean E[π_ij].
      *───────────────────────────────────────────────────────────────────────────*/
     double xi[ONLINE_VI_MAX_REGIMES][ONLINE_VI_MAX_REGIMES];
     double Z = 0.0;
 
-    /* Ensure we have current mean transition matrix */
+    /* Ensure we have current geometric mean transition matrix */
     recompute_stats(vi);
 
     for (int i = 0; i < K; i++)
     {
         for (int j = 0; j < K; j++)
         {
-            double xi_ij = vi->prev_probs[i] * vi->mean[i][j] * regime_liks[j];
+            /* Use GEOMETRIC mean, not arithmetic mean */
+            double xi_ij = vi->prev_probs[i] * vi->geom_mean[i][j] * regime_liks[j];
             xi[i][j] = xi_ij;
             Z += xi_ij;
         }
@@ -576,6 +595,40 @@ void online_vi_get_mean(OnlineVI *vi, double *trans)
         for (int j = 0; j < K; j++)
         {
             trans[i * K + j] = vi->mean[i][j];
+        }
+    }
+}
+
+void online_vi_get_geom_mean(OnlineVI *vi, double *trans)
+{
+    if (!vi || !trans)
+        return;
+
+    recompute_stats(vi);
+
+    const int K = vi->K;
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            trans[i * K + j] = vi->geom_mean[i][j];
+        }
+    }
+}
+
+void online_vi_get_log_mean(OnlineVI *vi, double *log_trans)
+{
+    if (!vi || !log_trans)
+        return;
+
+    recompute_stats(vi);
+
+    const int K = vi->K;
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            log_trans[i * K + j] = vi->log_mean[i][j];
         }
     }
 }
@@ -842,6 +895,58 @@ void online_vi_get_row_ess(const OnlineVI *vi, double *ess)
         }
         ess[i] = maxd(0.0, alpha_0 - prior_0);
     }
+}
+
+double online_vi_kl_from_external(OnlineVI *vi, const double *ext_trans)
+{
+    if (!vi || !ext_trans)
+        return -1.0;
+
+    recompute_stats(vi);
+
+    const int K = vi->K;
+    double kl = 0.0;
+
+    /* KL(VI || external) = Σ_ij VI_mean[i][j] * log(VI_mean[i][j] / ext[i][j]) */
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            double p = vi->mean[i][j];
+            double q = ext_trans[i * K + j];
+
+            /* Clamp to avoid log(0) */
+            p = maxd(p, VI_EPS);
+            q = maxd(q, VI_EPS);
+
+            kl += p * log(p / q);
+        }
+    }
+
+    return maxd(0.0, kl); /* Ensure non-negative (numerical) */
+}
+
+double online_vi_get_responsiveness(const OnlineVI *vi)
+{
+    if (!vi)
+        return 0.0;
+
+    const int K = vi->K;
+
+    /* Compute total change in last_xi from uniform
+     * Higher = more responsive to recent data */
+    double deviation = 0.0;
+    double uniform = 1.0 / (K * K);
+
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            deviation += fabs(vi->last_xi[i][j] - uniform);
+        }
+    }
+
+    return deviation;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
