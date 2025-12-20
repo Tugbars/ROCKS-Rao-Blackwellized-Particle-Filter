@@ -20,12 +20,13 @@
 #include <stdbool.h>
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * CONFIGURATION
- *═══════════════════════════════════════════════════════════════════════════════*/
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * CONFIGURATION
+     *═══════════════════════════════════════════════════════════════════════════════*/
 
 #ifndef PGAS_MKL_MAX_PARTICLES
 #define PGAS_MKL_MAX_PARTICLES 256
@@ -39,7 +40,7 @@ extern "C" {
 #define PGAS_MKL_MAX_REGIMES 8
 #endif
 
-#define PGAS_MKL_ALIGN 64   /**< AVX-512 / cache line alignment */
+#define PGAS_MKL_ALIGN 64 /**< AVX-512 / cache line alignment */
 
 /**
  * Pad N to multiple of 16 for optimal SIMD (eliminates tail masking)
@@ -48,213 +49,217 @@ extern "C" {
 #define PGAS_MKL_SIMD_WIDTH 16
 #define PGAS_MKL_PAD_N(n) (((n) + PGAS_MKL_SIMD_WIDTH - 1) & ~(PGAS_MKL_SIMD_WIDTH - 1))
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * DATA STRUCTURES
- *═══════════════════════════════════════════════════════════════════════════════*/
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * DATA STRUCTURES
+     *═══════════════════════════════════════════════════════════════════════════════*/
 
-/**
- * MKL RNG stream wrapper
- */
-typedef struct {
-    void *stream;           /**< VSLStreamStatePtr */
-    int brng;               /**< Basic RNG type (MT19937, SFMT, etc.) */
-} MKLRngStream;
+    /**
+     * MKL RNG stream wrapper
+     */
+    typedef struct
+    {
+        void *stream; /**< VSLStreamStatePtr */
+        int brng;     /**< Basic RNG type (MT19937, SFMT, etc.) */
+    } MKLRngStream;
 
-/**
- * Model parameters
- */
-typedef struct {
-    int K;
-    float trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
-    float log_trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
-    float mu_vol[PGAS_MKL_MAX_REGIMES];
-    float sigma_vol[PGAS_MKL_MAX_REGIMES];
-    float phi;
-    float sigma_h;
-    float inv_sigma_h_sq;
-} PGASMKLModel;
+    /**
+     * Model parameters
+     */
+    typedef struct
+    {
+        int K;
+        float trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
+        float log_trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
+        float mu_vol[PGAS_MKL_MAX_REGIMES];
+        float sigma_vol[PGAS_MKL_MAX_REGIMES];
+        float phi;
+        float sigma_h;
+        float inv_sigma_h_sq;
+    } PGASMKLModel;
 
-/**
- * SoA particle storage with MKL-friendly alignment
- */
-typedef struct {
-    int N;                  /**< Particle count (user-specified) */
-    int N_padded;           /**< Padded to multiple of 16 for SIMD */
-    int T;                  /**< Time steps */
-    int K;                  /**< Regime count */
-    
-    /* SoA arrays: contiguous [T * N_padded] with 64-byte alignment */
-    int *regimes;           /**< [T × N_padded] */
-    float *h;               /**< [T × N_padded] */
-    float *weights;         /**< [T × N_padded] normalized */
-    float *log_weights;     /**< [T × N_padded] */
-    int *ancestors;         /**< [T × N_padded] */
-    int *smoothed;          /**< [T × N_padded] PARIS output */
-    
-    /* Observations */
-    float *observations;    /**< [T] */
-    
-    /* Reference trajectory (for CSMC) */
-    int *ref_regimes;       /**< [T] */
-    float *ref_h;           /**< [T] */
-    int *ref_ancestors;     /**< [T] */
-    int ref_idx;            /**< Which particle is reference */
-    
-    /* Model */
-    PGASMKLModel model;
-    
-    /* MKL RNG - main stream */
-    MKLRngStream rng;
-    
-    /* Per-thread RNG streams for PARIS (avoid vslNewStream in hot path) */
-    #define PGAS_MKL_MAX_THREADS 32
-    void *thread_rng_streams[PGAS_MKL_MAX_THREADS];
-    int n_thread_streams;
-    
-    /* Workspace buffers (pre-allocated, N_padded size for SIMD) */
-    float *ws_log_bw;       /**< [N_padded] backward log weights */
-    float *ws_bw;           /**< [N_padded] backward weights */
-    float *ws_uniform;      /**< [N_padded] uniform random numbers */
-    float *ws_normal;       /**< [N_padded] normal random numbers */
-    int *ws_indices;        /**< [N_padded] sampled indices */
-    float *ws_cumsum;       /**< [N_padded] cumulative sum for sampling */
-    
-    /* Diagnostics */
-    int ancestor_proposals;
-    int ancestor_accepts;
-    float acceptance_rate;
-    int total_sweeps;
-    int current_sweep;
-    
-} PGASMKLState;
+    /**
+     * SoA particle storage with MKL-friendly alignment
+     */
+    typedef struct
+    {
+        int N;        /**< Particle count (user-specified) */
+        int N_padded; /**< Padded to multiple of 16 for SIMD */
+        int T;        /**< Time steps */
+        int K;        /**< Regime count */
 
-/**
- * Lifeboat packet output
- */
-typedef struct {
-    int K;
-    int N;
-    int T;
-    float trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
-    float mu_vol[PGAS_MKL_MAX_REGIMES];
-    float sigma_vol[PGAS_MKL_MAX_REGIMES];
-    float phi;
-    float sigma_h;
-    
-    int *final_regimes;     /**< [N] at time T-1 */
-    float *final_h;         /**< [N] at time T-1 */
-    float *final_weights;   /**< [N] uniform after smoothing */
-    
-    float ancestor_acceptance;
-    int sweeps_used;
-    double total_time_us;
-} LifeboatPacketMKL;
+        /* SoA arrays: contiguous [T * N_padded] with 64-byte alignment */
+        int *regimes;       /**< [T × N_padded] */
+        float *h;           /**< [T × N_padded] */
+        float *weights;     /**< [T × N_padded] normalized */
+        float *log_weights; /**< [T × N_padded] */
+        int *ancestors;     /**< [T × N_padded] */
+        int *smoothed;      /**< [T × N_padded] PARIS output */
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * INITIALIZATION
- *═══════════════════════════════════════════════════════════════════════════════*/
+        /* Observations */
+        float *observations; /**< [T] */
 
-/**
- * @brief Allocate and initialize MKL PGAS state
- * @param N     Particle count
- * @param T     Max time steps
- * @param K     Regime count
- * @param seed  RNG seed
- * @return      Allocated state (call pgas_mkl_free to release)
- */
-PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed);
+        /* Reference trajectory (for CSMC) */
+        int *ref_regimes;   /**< [T] */
+        float *ref_h;       /**< [T] */
+        int *ref_ancestors; /**< [T] */
+        int ref_idx;        /**< Which particle is reference */
 
-/**
- * @brief Free MKL PGAS state
- */
-void pgas_mkl_free(PGASMKLState *state);
+        /* Model */
+        PGASMKLModel model;
 
-/**
- * @brief Set model parameters
- */
-void pgas_mkl_set_model(PGASMKLState *state,
-                        const double *trans,
-                        const double *mu_vol,
-                        const double *sigma_vol,
-                        double phi,
-                        double sigma_h);
+        /* MKL RNG - main stream */
+        MKLRngStream rng;
 
-/**
- * @brief Set reference trajectory
- */
-void pgas_mkl_set_reference(PGASMKLState *state,
-                            const int *regimes,
-                            const double *h,
-                            int T);
+/* Per-thread RNG streams for PARIS (avoid vslNewStream in hot path) */
+#define PGAS_MKL_MAX_THREADS 32
+        void *thread_rng_streams[PGAS_MKL_MAX_THREADS];
+        int n_thread_streams;
 
-/**
- * @brief Load observations
- */
-void pgas_mkl_load_observations(PGASMKLState *state,
-                                const double *observations,
+        /* Workspace buffers (pre-allocated, N_padded size for SIMD) */
+        float *ws_log_bw;  /**< [N_padded] backward log weights */
+        float *ws_bw;      /**< [N_padded] backward weights */
+        float *ws_uniform; /**< [N_padded] uniform random numbers */
+        float *ws_normal;  /**< [N_padded] normal random numbers */
+        int *ws_indices;   /**< [N_padded] sampled indices */
+        float *ws_cumsum;  /**< [N_padded] cumulative sum for sampling */
+
+        /* Diagnostics */
+        int ancestor_proposals;
+        int ancestor_accepts;
+        float acceptance_rate;
+        int total_sweeps;
+        int current_sweep;
+
+    } PGASMKLState;
+
+    /**
+     * Lifeboat packet output
+     */
+    typedef struct
+    {
+        int K;
+        int N;
+        int T;
+        float trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
+        float mu_vol[PGAS_MKL_MAX_REGIMES];
+        float sigma_vol[PGAS_MKL_MAX_REGIMES];
+        float phi;
+        float sigma_h;
+
+        int *final_regimes;   /**< [N] at time T-1 */
+        float *final_h;       /**< [N] at time T-1 */
+        float *final_weights; /**< [N] uniform after smoothing */
+
+        float ancestor_acceptance;
+        int sweeps_used;
+        double total_time_us;
+    } LifeboatPacketMKL;
+
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * INITIALIZATION
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @brief Allocate and initialize MKL PGAS state
+     * @param N     Particle count
+     * @param T     Max time steps
+     * @param K     Regime count
+     * @param seed  RNG seed
+     * @return      Allocated state (call pgas_mkl_free to release)
+     */
+    PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed);
+
+    /**
+     * @brief Free MKL PGAS state
+     */
+    void pgas_mkl_free(PGASMKLState *state);
+
+    /**
+     * @brief Set model parameters
+     */
+    void pgas_mkl_set_model(PGASMKLState *state,
+                            const double *trans,
+                            const double *mu_vol,
+                            const double *sigma_vol,
+                            double phi,
+                            double sigma_h);
+
+    /**
+     * @brief Set reference trajectory
+     */
+    void pgas_mkl_set_reference(PGASMKLState *state,
+                                const int *regimes,
+                                const double *h,
                                 int T);
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * PGAS OPERATIONS
- *═══════════════════════════════════════════════════════════════════════════════*/
+    /**
+     * @brief Load observations
+     */
+    void pgas_mkl_load_observations(PGASMKLState *state,
+                                    const double *observations,
+                                    int T);
 
-/**
- * @brief Run one CSMC sweep with MKL acceleration
- * @return Ancestor acceptance rate
- */
-float pgas_mkl_csmc_sweep(PGASMKLState *state);
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * PGAS OPERATIONS
+     *═══════════════════════════════════════════════════════════════════════════════*/
 
-/**
- * @brief Run adaptive PGAS (min 3, max 10 sweeps)
- * @return 0=success, 1=still_mixing, 2=failed
- */
-int pgas_mkl_run_adaptive(PGASMKLState *state);
+    /**
+     * @brief Run one CSMC sweep with MKL acceleration
+     * @return Ancestor acceptance rate
+     */
+    float pgas_mkl_csmc_sweep(PGASMKLState *state);
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * PARIS OPERATIONS
- *═══════════════════════════════════════════════════════════════════════════════*/
+    /**
+     * @brief Run adaptive PGAS (min 3, max 10 sweeps)
+     * @return 0=success, 1=still_mixing, 2=failed
+     */
+    int pgas_mkl_run_adaptive(PGASMKLState *state);
 
-/**
- * @brief Run MKL-accelerated PARIS backward smoothing
- *
- * Uses:
- *   - vsExp for batch exponential
- *   - VSL RNG for sampling
- *   - OpenMP for particle parallelism
- */
-void paris_mkl_backward_smooth(PGASMKLState *state);
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * PARIS OPERATIONS (integrated with PGAS state)
+     *═══════════════════════════════════════════════════════════════════════════════*/
 
-/**
- * @brief Get smoothed particles at time t
- */
-void paris_mkl_get_smoothed(const PGASMKLState *state,
-                            int t,
-                            int *regimes,
-                            float *h);
+    /**
+     * @brief Run MKL-accelerated PARIS backward smoothing on PGAS state
+     *
+     * Uses:
+     *   - vsExp for batch exponential
+     *   - VSL RNG for sampling
+     *   - OpenMP for particle parallelism
+     */
+    void pgas_paris_backward_smooth(PGASMKLState *state);
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * LIFEBOAT
- *═══════════════════════════════════════════════════════════════════════════════*/
+    /**
+     * @brief Get smoothed particles at time t from PGAS state
+     */
+    void pgas_paris_get_smoothed(const PGASMKLState *state,
+                                 int t,
+                                 int *regimes,
+                                 float *h);
 
-/**
- * @brief Generate Lifeboat packet from PGAS+PARIS output
- */
-void pgas_mkl_generate_lifeboat(const PGASMKLState *state,
-                                LifeboatPacketMKL *packet);
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * LIFEBOAT
+     *═══════════════════════════════════════════════════════════════════════════════*/
 
-/**
- * @brief Validate Lifeboat packet
- */
-bool lifeboat_mkl_validate(const LifeboatPacketMKL *packet);
+    /**
+     * @brief Generate Lifeboat packet from PGAS+PARIS output
+     */
+    void pgas_mkl_generate_lifeboat(const PGASMKLState *state,
+                                    LifeboatPacketMKL *packet);
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * DIAGNOSTICS
- *═══════════════════════════════════════════════════════════════════════════════*/
+    /**
+     * @brief Validate Lifeboat packet
+     */
+    bool lifeboat_mkl_validate(const LifeboatPacketMKL *packet);
 
-float pgas_mkl_get_acceptance_rate(const PGASMKLState *state);
-int pgas_mkl_get_sweep_count(const PGASMKLState *state);
-float pgas_mkl_get_ess(const PGASMKLState *state, int t);
-void pgas_mkl_print_diagnostics(const PGASMKLState *state);
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * DIAGNOSTICS
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    float pgas_mkl_get_acceptance_rate(const PGASMKLState *state);
+    int pgas_mkl_get_sweep_count(const PGASMKLState *state);
+    float pgas_mkl_get_ess(const PGASMKLState *state, int t);
+    void pgas_mkl_print_diagnostics(const PGASMKLState *state);
 
 #ifdef __cplusplus
 }
