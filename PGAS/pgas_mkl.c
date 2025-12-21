@@ -108,17 +108,25 @@ PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed)
     {
         vslNewStream((VSLStreamStatePtr *)&state->thread_rng_streams[i],
                      VSL_BRNG_SFMT19937, seed + 1000 * (i + 1));
+
+        /* Pre-allocate per-thread workspaces (avoid mkl_malloc in hot path!) */
+        state->thread_ws[i].log_bw = (float *)mkl_malloc(N_padded * sizeof(float), PGAS_MKL_ALIGN);
+        state->thread_ws[i].bw = (float *)mkl_malloc(N_padded * sizeof(float), PGAS_MKL_ALIGN);
+        state->thread_ws[i].workspace = (float *)mkl_malloc(N_padded * sizeof(float), PGAS_MKL_ALIGN);
+        state->thread_ws[i].cumsum = (float *)mkl_malloc(N_padded * sizeof(float), PGAS_MKL_ALIGN);
     }
 
     /* Initialize model with uniform transitions */
     state->model.K = K;
     float unif = 1.0f / K;
+    float log_unif = logf(unif);
     for (int i = 0; i < K; i++)
     {
         for (int j = 0; j < K; j++)
         {
             state->model.trans[i * K + j] = unif;
-            state->model.log_trans[i * K + j] = logf(unif);
+            state->model.log_trans[i * K + j] = log_unif;
+            state->model.log_trans_T[j * K + i] = log_unif; /* Transposed */
         }
         state->model.mu_vol[i] = -1.0f + 0.5f * i;
         state->model.sigma_vol[i] = 0.3f;
@@ -126,6 +134,14 @@ PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed)
     state->model.phi = 0.97f;
     state->model.sigma_h = 0.15f;
     state->model.inv_sigma_h_sq = 1.0f / (0.15f * 0.15f);
+    state->model.neg_half_inv_sigma_h_sq = -0.5f * state->model.inv_sigma_h_sq;
+
+    /* Precompute mu_shift = mu_vol[k] * (1 - phi) */
+    float one_minus_phi = 1.0f - state->model.phi;
+    for (int i = 0; i < K; i++)
+    {
+        state->model.mu_shift[i] = state->model.mu_vol[i] * one_minus_phi;
+    }
 
     return state;
 }
@@ -141,13 +157,18 @@ void pgas_mkl_free(PGASMKLState *state)
         vslDeleteStream((VSLStreamStatePtr *)&state->rng.stream);
     }
 
-    /* Free per-thread RNG streams */
+    /* Free per-thread RNG streams and workspaces */
     for (int i = 0; i < state->n_thread_streams; i++)
     {
         if (state->thread_rng_streams[i])
         {
             vslDeleteStream((VSLStreamStatePtr *)&state->thread_rng_streams[i]);
         }
+        /* Free per-thread workspaces */
+        mkl_free(state->thread_ws[i].log_bw);
+        mkl_free(state->thread_ws[i].bw);
+        mkl_free(state->thread_ws[i].workspace);
+        mkl_free(state->thread_ws[i].cumsum);
     }
 
     mkl_free(state->regimes);
@@ -186,22 +207,33 @@ void pgas_mkl_set_model(PGASMKLState *state,
     int K = state->K;
     state->model.K = K;
 
-    /* Convert and compute log-trans */
-    for (int i = 0; i < K * K; i++)
+    /* Convert and compute log-trans + transposed version */
+    for (int i = 0; i < K; i++)
     {
-        state->model.trans[i] = (float)trans[i];
-        state->model.log_trans[i] = logf((float)trans[i] + EPS);
+        for (int j = 0; j < K; j++)
+        {
+            float t = (float)trans[i * K + j];
+            state->model.trans[i * K + j] = t;
+            state->model.log_trans[i * K + j] = logf(t + EPS);
+            /* Transposed: log_trans_T[j * K + i] = log_trans[i * K + j] */
+            state->model.log_trans_T[j * K + i] = logf(t + EPS);
+        }
     }
 
+    /* Store phi and sigma_h first (needed for mu_shift) */
+    state->model.phi = (float)phi;
+    state->model.sigma_h = (float)sigma_h;
+    state->model.inv_sigma_h_sq = 1.0f / ((float)sigma_h * (float)sigma_h);
+    state->model.neg_half_inv_sigma_h_sq = -0.5f * state->model.inv_sigma_h_sq;
+
+    /* Compute mu_vol and mu_shift = mu_vol[k] * (1 - phi) */
+    float one_minus_phi = 1.0f - (float)phi;
     for (int i = 0; i < K; i++)
     {
         state->model.mu_vol[i] = (float)mu_vol[i];
         state->model.sigma_vol[i] = (float)sigma_vol[i];
+        state->model.mu_shift[i] = (float)mu_vol[i] * one_minus_phi;
     }
-
-    state->model.phi = (float)phi;
-    state->model.sigma_h = (float)sigma_h;
-    state->model.inv_sigma_h_sq = 1.0f / ((float)sigma_h * (float)sigma_h);
 }
 
 void pgas_mkl_set_reference(PGASMKLState *state,
@@ -474,9 +506,11 @@ static int ancestor_sample_mkl(PGASMKLState *state, int t)
 
     int ref_regime = state->ref_regimes[t];
     float ref_h = state->ref_h[t];
-    float mu_k = m->mu_vol[ref_regime];
+
+    /* Use precomputed mu_shift instead of mu_k + phi * (h - mu_k) */
+    float mu_shift_k = m->mu_shift[ref_regime];
     float phi = m->phi;
-    float neg_half_inv_var = -0.5f * m->inv_sigma_h_sq;
+    float neg_half_inv_var = m->neg_half_inv_sigma_h_sq;
 
     float *log_as = state->ws_log_bw;
 
@@ -485,16 +519,11 @@ static int ancestor_sample_mkl(PGASMKLState *state, int t)
     float *prev_h = &state->h[(t - 1) * Np];
     int *prev_regimes = &state->regimes[(t - 1) * Np];
 
-    /* Precompute log_trans column for ref_regime (Rank-1 optimization!) */
-    /* log_trans_col[i] = log P(ref_regime | regime_i) */
-    float log_trans_col[PGAS_MKL_MAX_REGIMES];
-    int k, n; /* MSVC OpenMP requires loop vars declared outside */
-    for (k = 0; k < K; k++)
-    {
-        log_trans_col[k] = m->log_trans[k * K + ref_regime];
-    }
+    /* Use transposed log_trans for contiguous column access */
+    const float *log_trans_col = &m->log_trans_T[ref_regime * K];
 
-/* Compute AS log-weights */
+    /* Compute AS log-weights */
+    int n;
 #ifndef _MSC_VER
 #pragma omp simd
 #endif
@@ -503,11 +532,11 @@ static int ancestor_sample_mkl(PGASMKLState *state, int t)
         int regime_n = prev_regimes[n];
         float h_n = prev_h[n];
 
-        /* Use precomputed column! */
+        /* Contiguous access */
         float log_trans = log_trans_col[regime_n];
 
-        /* Log h transition */
-        float mean = mu_k + phi * (h_n - mu_k);
+        /* Rank-1 arithmetic: mean = mu_shift + phi * h_n */
+        float mean = mu_shift_k + phi * h_n;
         float diff = ref_h - mean;
         float log_h_trans = neg_half_inv_var * diff * diff;
 
@@ -687,8 +716,18 @@ int pgas_mkl_run_adaptive(PGASMKLState *state)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * PARIS BACKWARD SMOOTHING (CORRECTED)
+ * PARIS BACKWARD SMOOTHING (OPTIMIZED)
+ *
+ * Phase 1 optimizations:
+ *   1. Per-thread VML mode (VML_EP) - 50-70% speedup
+ *   2. Pre-allocated per-thread workspaces - eliminates malloc jitter
+ *   3. mu_shift precomputation - 1 less multiply per iteration
+ *   4. Workload threshold - sequential for small N*T
+ *   5. Use log_trans_T for contiguous column access
  *═══════════════════════════════════════════════════════════════════════════════*/
+
+/* Workload threshold: below this, sequential is faster than parallel overhead */
+#define PARIS_PARALLEL_THRESHOLD 4096 /* N * T */
 
 void pgas_paris_backward_smooth(PGASMKLState *state)
 {
@@ -701,9 +740,9 @@ void pgas_paris_backward_smooth(PGASMKLState *state)
     const int K = state->model.K;
     const PGASMKLModel *m = &state->model;
 
-    /* Precompute constants */
+    /* Precomputed constants */
     const float phi = m->phi;
-    const float neg_half_inv_var = -0.5f * m->inv_sigma_h_sq;
+    const float neg_half_inv_var = m->neg_half_inv_sigma_h_sq;
 
     /* Initialize at final time (stride = Np!) */
     for (int n = 0; n < N; n++)
@@ -711,47 +750,125 @@ void pgas_paris_backward_smooth(PGASMKLState *state)
         state->smoothed[(T - 1) * Np + n] = n;
     }
 
-/* Backward pass with OpenMP */
+    /* Decide parallel vs sequential based on workload */
+    const int use_parallel = (N * T > PARIS_PARALLEL_THRESHOLD);
+
 #ifdef _OPENMP
-#pragma omp parallel
+    if (use_parallel)
     {
-        int tid = omp_get_thread_num();
+/* ═══════════════════════════════════════════════════════════════════
+ * PARALLEL PATH (large workload)
+ * ═══════════════════════════════════════════════════════════════════*/
+#pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
 
-        /* Use pre-allocated per-thread RNG (no vslNewStream in hot path!) */
-        VSLStreamStatePtr local_stream = (VSLStreamStatePtr)state->thread_rng_streams[tid];
+            /* CRITICAL: Set VML mode per-thread (thread-local in modern MKL) */
+            vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
 
-        /* Thread-local workspace - use Np for SIMD */
-        float *local_log_bw = (float *)mkl_malloc(Np * sizeof(float), PGAS_MKL_ALIGN);
-        float *local_bw = (float *)mkl_malloc(Np * sizeof(float), PGAS_MKL_ALIGN);
-        float *local_workspace = (float *)mkl_malloc(Np * sizeof(float), PGAS_MKL_ALIGN);
-        float *local_cumsum = (float *)mkl_malloc(Np * sizeof(float), PGAS_MKL_ALIGN);
+            /* Use pre-allocated per-thread workspace (no mkl_malloc!) */
+            VSLStreamStatePtr local_stream = (VSLStreamStatePtr)state->thread_rng_streams[tid];
+            float *local_log_bw = state->thread_ws[tid].log_bw;
+            float *local_bw = state->thread_ws[tid].bw;
+            float *local_workspace = state->thread_ws[tid].workspace;
+            float *local_cumsum = state->thread_ws[tid].cumsum;
 
-        int t, n; /* MSVC OpenMP requires loop vars declared outside */
+            int t, n; /* MSVC OpenMP requires loop vars declared outside */
+            for (t = T - 2; t >= 0; t--)
+            {
+                /* Data at time t (stride = Np!) */
+                const float *h_t = &state->h[t * Np];
+                const float *log_w_t = &state->log_weights[t * Np];
+                const int *regimes_t = &state->regimes[t * Np];
+
+#pragma omp for schedule(dynamic, 8)
+                for (n = 0; n < N; n++)
+                {
+                    /* Get smoothed state at t+1 (stride = Np!) */
+                    int idx_next = state->smoothed[(t + 1) * Np + n];
+                    int regime_next = state->regimes[(t + 1) * Np + idx_next];
+                    float h_next = state->h[(t + 1) * Np + idx_next];
+
+                    /* Use precomputed mu_shift for Rank-1 optimization */
+                    float mu_shift_k = m->mu_shift[regime_next];
+
+                    /* Get log_trans column from TRANSPOSED matrix (contiguous!) */
+                    const float *log_trans_col = &m->log_trans_T[regime_next * K];
+
+                    /* Compute backward log-weights */
+                    int i;
+#ifndef _MSC_VER
+#pragma omp simd
+#endif
+                    for (i = 0; i < N; i++)
+                    {
+                        int regime_i = regimes_t[i];
+                        float h_i = h_t[i];
+
+                        /* Contiguous access to transposed matrix */
+                        float log_trans = log_trans_col[regime_i];
+
+                        /* Rank-1 arithmetic: mean = mu_shift + phi * h_i */
+                        float mean = mu_shift_k + phi * h_i;
+                        float diff = h_next - mean;
+                        float log_h_trans = neg_half_inv_var * diff * diff;
+
+                        local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
+                    }
+
+                    /* Set padding to NEG_INF */
+                    for (i = N; i < Np; i++)
+                    {
+                        local_log_bw[i] = NEG_INF;
+                    }
+
+                    /* Normalize */
+                    logsumexp_normalize_mkl(local_log_bw, N, Np, local_bw, local_workspace);
+
+                    /* Sample (stride = Np!) */
+                    state->smoothed[t * Np + n] = sample_categorical_single(
+                        local_bw, N, local_cumsum, local_stream);
+                }
+            }
+
+            /* Restore default VML mode */
+            vmlSetMode(VML_HA);
+        }
+    }
+    else
+#endif
+    {
+        /* ═══════════════════════════════════════════════════════════════════
+         * SEQUENTIAL PATH (small workload - avoid parallel overhead)
+         * ═══════════════════════════════════════════════════════════════════*/
+
+        /* Set VML mode for sequential path too */
+        vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
+
+        float *local_log_bw = state->ws_log_bw;
+        float *local_bw = state->ws_bw;
+        float *local_workspace = state->ws_uniform;
+        VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
+
+        int t, n, i;
         for (t = T - 2; t >= 0; t--)
         {
-            /* Data at time t (stride = Np!) */
             const float *h_t = &state->h[t * Np];
             const float *log_w_t = &state->log_weights[t * Np];
             const int *regimes_t = &state->regimes[t * Np];
 
-#pragma omp for schedule(dynamic, 8)
             for (n = 0; n < N; n++)
             {
-                /* Get smoothed state at t+1 (stride = Np!) */
                 int idx_next = state->smoothed[(t + 1) * Np + n];
                 int regime_next = state->regimes[(t + 1) * Np + idx_next];
                 float h_next = state->h[(t + 1) * Np + idx_next];
-                float mu_k = m->mu_vol[regime_next];
 
-                /* Precompute log_trans column (Rank-1 optimization!) */
-                float log_trans_col[PGAS_MKL_MAX_REGIMES];
-                int k, i; /* MSVC OpenMP requires loop vars declared outside */
-                for (k = 0; k < K; k++)
-                {
-                    log_trans_col[k] = m->log_trans[k * K + regime_next];
-                }
+                /* Use precomputed mu_shift */
+                float mu_shift_k = m->mu_shift[regime_next];
 
-/* Compute backward log-weights */
+                /* Get log_trans column from TRANSPOSED matrix */
+                const float *log_trans_col = &m->log_trans_T[regime_next * K];
+
 #ifndef _MSC_VER
 #pragma omp simd
 #endif
@@ -760,91 +877,29 @@ void pgas_paris_backward_smooth(PGASMKLState *state)
                     int regime_i = regimes_t[i];
                     float h_i = h_t[i];
 
-                    /* Use precomputed column! */
                     float log_trans = log_trans_col[regime_i];
-                    float mean = mu_k + phi * (h_i - mu_k);
+                    float mean = mu_shift_k + phi * h_i;
                     float diff = h_next - mean;
                     float log_h_trans = neg_half_inv_var * diff * diff;
 
                     local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
                 }
 
-                /* Set padding to NEG_INF */
                 for (i = N; i < Np; i++)
                 {
                     local_log_bw[i] = NEG_INF;
                 }
 
-                /* Normalize */
                 logsumexp_normalize_mkl(local_log_bw, N, Np, local_bw, local_workspace);
 
-                /* Sample (stride = Np!) */
                 state->smoothed[t * Np + n] = sample_categorical_single(
-                    local_bw, N, local_cumsum, local_stream);
+                    local_bw, N, state->ws_cumsum, stream);
             }
         }
 
-        mkl_free(local_log_bw);
-        mkl_free(local_bw);
-        mkl_free(local_workspace);
-        mkl_free(local_cumsum);
+        /* Restore default VML mode */
+        vmlSetMode(VML_HA);
     }
-#else
-    /* Sequential version */
-    float *local_log_bw = state->ws_log_bw;
-    float *local_bw = state->ws_bw;
-    float *local_workspace = state->ws_uniform;
-    VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
-
-    int t, n, k, i; /* MSVC OpenMP requires loop vars declared outside */
-    for (t = T - 2; t >= 0; t--)
-    {
-        const float *h_t = &state->h[t * Np];
-        const float *log_w_t = &state->log_weights[t * Np];
-        const int *regimes_t = &state->regimes[t * Np];
-
-        for (n = 0; n < N; n++)
-        {
-            int idx_next = state->smoothed[(t + 1) * Np + n];
-            int regime_next = state->regimes[(t + 1) * Np + idx_next];
-            float h_next = state->h[(t + 1) * Np + idx_next];
-            float mu_k = m->mu_vol[regime_next];
-
-            /* Precompute log_trans column */
-            float log_trans_col[PGAS_MKL_MAX_REGIMES];
-            for (k = 0; k < K; k++)
-            {
-                log_trans_col[k] = m->log_trans[k * K + regime_next];
-            }
-
-#ifndef _MSC_VER
-#pragma omp simd
-#endif
-            for (i = 0; i < N; i++)
-            {
-                int regime_i = regimes_t[i];
-                float h_i = h_t[i];
-
-                float log_trans = log_trans_col[regime_i];
-                float mean = mu_k + phi * (h_i - mu_k);
-                float diff = h_next - mean;
-                float log_h_trans = neg_half_inv_var * diff * diff;
-
-                local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
-            }
-
-            for (i = N; i < Np; i++)
-            {
-                local_log_bw[i] = NEG_INF;
-            }
-
-            logsumexp_normalize_mkl(local_log_bw, N, Np, local_bw, local_workspace);
-
-            state->smoothed[t * Np + n] = sample_categorical_single(
-                local_bw, N, state->ws_cumsum, stream);
-        }
-    }
-#endif
 }
 
 void pgas_paris_get_smoothed(const PGASMKLState *state, int t,

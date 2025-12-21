@@ -70,12 +70,27 @@ extern "C"
         int K;
         float trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
         float log_trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
+        float log_trans_T[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES]; /**< Transposed for column access */
         float mu_vol[PGAS_MKL_MAX_REGIMES];
         float sigma_vol[PGAS_MKL_MAX_REGIMES];
+        float mu_shift[PGAS_MKL_MAX_REGIMES]; /**< mu_vol[k] * (1 - phi) for Rank-1 optimization */
         float phi;
         float sigma_h;
         float inv_sigma_h_sq;
+        float neg_half_inv_sigma_h_sq; /**< -0.5 / sigma_h² precomputed */
     } PGASMKLModel;
+
+    /**
+     * Per-thread workspace for PARIS backward pass
+     * Pre-allocated to avoid mkl_malloc in hot path
+     */
+    typedef struct
+    {
+        float *log_bw;    /**< [N_padded] backward log weights */
+        float *bw;        /**< [N_padded] backward weights */
+        float *workspace; /**< [N_padded] scratch space */
+        float *cumsum;    /**< [N_padded] cumulative sum */
+    } PGASThreadWorkspace;
 
     /**
      * SoA particle storage with MKL-friendly alignment
@@ -111,9 +126,12 @@ extern "C"
         MKLRngStream rng;
 
 /* Per-thread RNG streams for PARIS (avoid vslNewStream in hot path) */
-#define PGAS_MKL_MAX_THREADS 32
+#define PGAS_MKL_MAX_THREADS 64
         void *thread_rng_streams[PGAS_MKL_MAX_THREADS];
         int n_thread_streams;
+
+        /* Per-thread workspaces for PARIS (avoid mkl_malloc in hot path) */
+        PGASThreadWorkspace thread_ws[PGAS_MKL_MAX_THREADS];
 
         /* Workspace buffers (pre-allocated, N_padded size for SIMD) */
         float *ws_log_bw;  /**< [N_padded] backward log weights */
