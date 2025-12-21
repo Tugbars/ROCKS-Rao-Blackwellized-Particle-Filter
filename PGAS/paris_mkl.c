@@ -43,6 +43,146 @@
 #define EPS 1e-10f
 #define NEG_INF (-HUGE_VALF)
 
+/* Temporal tiling: process in blocks to fit L2 cache (~256KB)
+ * For N=128, each timestep uses ~3KB (h, log_w, regimes)
+ * 64 timesteps × 3KB = 192KB fits comfortably in L2 */
+#define PARIS_TILE_SIZE 64
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * AVX2 OPTIMIZED INNER KERNEL
+ * - Vectorized gather for transition lookups
+ * - 4x unrolling for ILP saturation (32 particles per iteration)
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+#if defined(__AVX2__) || defined(_MSC_VER)
+
+/**
+ * Compute backward log-weights using AVX2 gather + unrolled FMA
+ * Processes 8 particles per vector, 4 vectors per unroll = 32 particles
+ */
+static inline void compute_log_bw_avx2(
+    float *restrict local_log_bw,
+    const float *restrict h_t,
+    const float *restrict log_w_t,
+    const int *restrict regimes_t,
+    const float *restrict log_trans_col,
+    float mu_shift, float phi, float h_next, float neg_half_inv_var,
+    int N, int Np)
+{
+    const __m256 v_mu_shift = _mm256_set1_ps(mu_shift);
+    const __m256 v_phi = _mm256_set1_ps(phi);
+    const __m256 v_h_next = _mm256_set1_ps(h_next);
+    const __m256 v_neg_half = _mm256_set1_ps(neg_half_inv_var);
+
+    int i = 0;
+
+    /* Main loop: 32 particles per iteration (4 × 8-wide vectors) */
+    for (; i + 31 < N; i += 32)
+    {
+        /* Load 4 blocks of 8 regime indices */
+        __m256i v_reg0 = _mm256_loadu_si256((const __m256i *)&regimes_t[i]);
+        __m256i v_reg1 = _mm256_loadu_si256((const __m256i *)&regimes_t[i + 8]);
+        __m256i v_reg2 = _mm256_loadu_si256((const __m256i *)&regimes_t[i + 16]);
+        __m256i v_reg3 = _mm256_loadu_si256((const __m256i *)&regimes_t[i + 24]);
+
+        /* Gather transition probabilities (scale=4 for sizeof(float)) */
+        __m256 v_lt0 = _mm256_i32gather_ps(log_trans_col, v_reg0, 4);
+        __m256 v_lt1 = _mm256_i32gather_ps(log_trans_col, v_reg1, 4);
+        __m256 v_lt2 = _mm256_i32gather_ps(log_trans_col, v_reg2, 4);
+        __m256 v_lt3 = _mm256_i32gather_ps(log_trans_col, v_reg3, 4);
+
+        /* Load h values */
+        __m256 v_h0 = _mm256_loadu_ps(&h_t[i]);
+        __m256 v_h1 = _mm256_loadu_ps(&h_t[i + 8]);
+        __m256 v_h2 = _mm256_loadu_ps(&h_t[i + 16]);
+        __m256 v_h3 = _mm256_loadu_ps(&h_t[i + 24]);
+
+        /* Load log_w values */
+        __m256 v_lw0 = _mm256_loadu_ps(&log_w_t[i]);
+        __m256 v_lw1 = _mm256_loadu_ps(&log_w_t[i + 8]);
+        __m256 v_lw2 = _mm256_loadu_ps(&log_w_t[i + 16]);
+        __m256 v_lw3 = _mm256_loadu_ps(&log_w_t[i + 24]);
+
+        /* Compute mean = mu_shift + phi * h (FMA for ILP) */
+        __m256 v_mean0 = _mm256_fmadd_ps(v_phi, v_h0, v_mu_shift);
+        __m256 v_mean1 = _mm256_fmadd_ps(v_phi, v_h1, v_mu_shift);
+        __m256 v_mean2 = _mm256_fmadd_ps(v_phi, v_h2, v_mu_shift);
+        __m256 v_mean3 = _mm256_fmadd_ps(v_phi, v_h3, v_mu_shift);
+
+        /* Compute diff = h_next - mean */
+        __m256 v_diff0 = _mm256_sub_ps(v_h_next, v_mean0);
+        __m256 v_diff1 = _mm256_sub_ps(v_h_next, v_mean1);
+        __m256 v_diff2 = _mm256_sub_ps(v_h_next, v_mean2);
+        __m256 v_diff3 = _mm256_sub_ps(v_h_next, v_mean3);
+
+        /* Compute log_h_trans = neg_half_inv_var * diff * diff */
+        __m256 v_d2_0 = _mm256_mul_ps(v_diff0, v_diff0);
+        __m256 v_d2_1 = _mm256_mul_ps(v_diff1, v_diff1);
+        __m256 v_d2_2 = _mm256_mul_ps(v_diff2, v_diff2);
+        __m256 v_d2_3 = _mm256_mul_ps(v_diff3, v_diff3);
+
+        __m256 v_lht0 = _mm256_mul_ps(v_neg_half, v_d2_0);
+        __m256 v_lht1 = _mm256_mul_ps(v_neg_half, v_d2_1);
+        __m256 v_lht2 = _mm256_mul_ps(v_neg_half, v_d2_2);
+        __m256 v_lht3 = _mm256_mul_ps(v_neg_half, v_d2_3);
+
+        /* Compute result = log_w + log_trans + log_h_trans */
+        __m256 v_sum0 = _mm256_add_ps(v_lw0, v_lt0);
+        __m256 v_sum1 = _mm256_add_ps(v_lw1, v_lt1);
+        __m256 v_sum2 = _mm256_add_ps(v_lw2, v_lt2);
+        __m256 v_sum3 = _mm256_add_ps(v_lw3, v_lt3);
+
+        v_sum0 = _mm256_add_ps(v_sum0, v_lht0);
+        v_sum1 = _mm256_add_ps(v_sum1, v_lht1);
+        v_sum2 = _mm256_add_ps(v_sum2, v_lht2);
+        v_sum3 = _mm256_add_ps(v_sum3, v_lht3);
+
+        /* Store results */
+        _mm256_storeu_ps(&local_log_bw[i], v_sum0);
+        _mm256_storeu_ps(&local_log_bw[i + 8], v_sum1);
+        _mm256_storeu_ps(&local_log_bw[i + 16], v_sum2);
+        _mm256_storeu_ps(&local_log_bw[i + 24], v_sum3);
+    }
+
+    /* Tail: 8 particles per iteration */
+    for (; i + 7 < N; i += 8)
+    {
+        __m256i v_reg = _mm256_loadu_si256((const __m256i *)&regimes_t[i]);
+        __m256 v_lt = _mm256_i32gather_ps(log_trans_col, v_reg, 4);
+        __m256 v_h = _mm256_loadu_ps(&h_t[i]);
+        __m256 v_lw = _mm256_loadu_ps(&log_w_t[i]);
+
+        __m256 v_mean = _mm256_fmadd_ps(v_phi, v_h, v_mu_shift);
+        __m256 v_diff = _mm256_sub_ps(v_h_next, v_mean);
+        __m256 v_d2 = _mm256_mul_ps(v_diff, v_diff);
+        __m256 v_lht = _mm256_mul_ps(v_neg_half, v_d2);
+
+        __m256 v_sum = _mm256_add_ps(v_lw, v_lt);
+        v_sum = _mm256_add_ps(v_sum, v_lht);
+
+        _mm256_storeu_ps(&local_log_bw[i], v_sum);
+    }
+
+    /* Scalar tail */
+    for (; i < N; i++)
+    {
+        int regime_i = regimes_t[i];
+        float log_trans = log_trans_col[regime_i];
+        float mean = mu_shift + phi * h_t[i];
+        float diff = h_next - mean;
+        float log_h_trans = neg_half_inv_var * diff * diff;
+        local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
+    }
+
+    /* Padding */
+    for (; i < Np; i++)
+    {
+        local_log_bw[i] = NEG_INF;
+    }
+}
+
+#endif /* __AVX2__ */
+
 /*═══════════════════════════════════════════════════════════════════════════════
  * ALLOCATION
  *═══════════════════════════════════════════════════════════════════════════════*/
@@ -402,6 +542,14 @@ static void logsumexp_normalize(const float *log_w, int N, int Np,
  * BACKWARD SMOOTHING
  *═══════════════════════════════════════════════════════════════════════════════*/
 
+/* Threshold for switching between small/large optimization paths
+ * Small path: Skip VML mode switch, simpler loops (less overhead)
+ * Large path: Full optimizations (VML_EP, prefetch, etc.)
+ *
+ * Tuned for HFT SV-HMM: Typical T=128-200, N=64-128, K=4
+ */
+#define PARIS_SMALL_WORKLOAD_THRESHOLD 8192 /* T*N < 8192 → small path */
+
 void paris_mkl_backward_smooth(PARISMKLState *state)
 {
     if (!state || state->T < 2)
@@ -412,22 +560,13 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
     const int T = state->T;
     const int K = state->model.K;
     const PARISMKLModel *m = &state->model;
+    const size_t workload = (size_t)T * N;
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * OPTIMIZATION 1: VML Enhanced Performance mode
-     * Particle weights don't need full precision - EP gives ~15% speedup
-     * ═══════════════════════════════════════════════════════════════════════*/
-    vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
-
-    /* Precompute constants */
+    /* Precompute constants (both paths) */
     const float phi = m->phi;
     const float neg_half_inv_var = -0.5f * m->inv_sigma_h_sq;
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * OPTIMIZATION 2: Pre-transpose log_trans for contiguous column access
-     * log_trans_T[j * K + i] = log_trans[i * K + j]
-     * Now columns are contiguous rows
-     * ═══════════════════════════════════════════════════════════════════════*/
+    /* Pre-transpose log_trans (cheap, always beneficial) */
     float log_trans_T[PARIS_MKL_MAX_REGIMES * PARIS_MKL_MAX_REGIMES];
     for (int i = 0; i < K; i++)
     {
@@ -443,113 +582,138 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
         state->smoothed[(T - 1) * Np + n] = n;
     }
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * PATH SELECTION: Small vs Large workload
+     * ═══════════════════════════════════════════════════════════════════════*/
+    const int use_large_path = (workload >= PARIS_SMALL_WORKLOAD_THRESHOLD);
+
 #ifdef _OPENMP
     /* ═══════════════════════════════════════════════════════════════════════
-     * PARALLEL BACKWARD PASS - Fully Optimized
-     * - Pre-allocated workspaces (no malloc in hot path)
-     * - VML_EP mode
-     * - Pre-transposed transition matrix
-     * - Software prefetching
-     * - 128-byte padding prevents false sharing
+     * PARALLEL BACKWARD PASS
      * ═══════════════════════════════════════════════════════════════════════*/
 
 #pragma omp parallel
     {
         int tid = omp_get_thread_num();
-
-        /* Use pre-allocated per-thread RNG */
         VSLStreamStatePtr local_stream = (VSLStreamStatePtr)state->thread_rng_streams[tid];
 
-        /* OPTIMIZATION 3: Use pre-allocated workspaces (no mkl_malloc in hot path)
-         * Each thread has its own slice with 128-byte padding to prevent false sharing */
+        /* VML Enhanced Performance mode - set per-thread (thread-local in modern MKL)
+         * Only for large workloads; mode switch has fixed overhead (~1µs) */
+        if (use_large_path)
+        {
+            vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
+        }
+
+        /* Use pre-allocated workspaces */
         float *thread_base = &state->thread_ws[tid * state->thread_ws_stride];
         float *local_log_bw = thread_base;
         float *local_bw = thread_base + Np;
         float *local_workspace = thread_base + 2 * Np;
-        float *local_cumsum = thread_base + 3 * Np; /* unused but kept for API */
+        float *local_cumsum = thread_base + 3 * Np;
 
         int t, n; /* MSVC OpenMP requires loop vars declared outside */
-        for (t = T - 2; t >= 0; t--)
-        {
-            /* Data at time t (stride = Np) */
-            const float *h_t = &state->h[t * Np];
-            const float *log_w_t = &state->log_weights[t * Np];
-            const int *regimes_t = &state->regimes[t * Np];
 
-/* OPTIMIZATION 4: Software prefetch for backward access pattern
- * Hardware prefetcher expects forward access; help it with t-1 data */
+        /* ═══════════════════════════════════════════════════════════════════
+         * TEMPORAL TILING: Process in blocks to maximize L2 cache reuse
+         * For N=128, each timestep uses ~3KB. 64 timesteps = 192KB (fits L2)
+         * ═══════════════════════════════════════════════════════════════════*/
+        int tile_size = (use_large_path && T > PARIS_TILE_SIZE) ? PARIS_TILE_SIZE : T;
+
+        for (int tile_end = T - 2; tile_end >= 0; tile_end -= tile_size)
+        {
+            int tile_start = (tile_end - tile_size + 1 > 0) ? (tile_end - tile_size + 1) : 0;
+
+/* Prefetch entire tile into L2 */
 #pragma omp single nowait
             {
-                if (t > 0)
+                if (use_large_path && tile_start > 0)
                 {
-                    _mm_prefetch((const char *)&state->h[(t - 1) * Np], _MM_HINT_T1);
-                    _mm_prefetch((const char *)&state->log_weights[(t - 1) * Np], _MM_HINT_T1);
-                    _mm_prefetch((const char *)&state->regimes[(t - 1) * Np], _MM_HINT_T1);
+                    int prefetch_end = (tile_start - 1 > tile_start - tile_size) ? (tile_start - tile_size) : 0;
+                    for (int pt = tile_start - 1; pt >= prefetch_end && pt >= 0; pt--)
+                    {
+                        _mm_prefetch((const char *)&state->h[pt * Np], _MM_HINT_T1);
+                        _mm_prefetch((const char *)&state->log_weights[pt * Np], _MM_HINT_T1);
+                    }
                 }
             }
+
+            for (t = tile_end; t >= tile_start; t--)
+            {
+                const float *h_t = &state->h[t * Np];
+                const float *log_w_t = &state->log_weights[t * Np];
+                const int *regimes_t = &state->regimes[t * Np];
 
 #pragma omp for schedule(dynamic, 8)
-            for (n = 0; n < N; n++)
-            {
-                /* Get smoothed state at t+1 */
-                int idx_next = state->smoothed[(t + 1) * Np + n];
-                int regime_next = state->regimes[(t + 1) * Np + idx_next];
-                float h_next = state->h[(t + 1) * Np + idx_next];
-                float mu_shift = m->mu_shifts[regime_next];
+                for (n = 0; n < N; n++)
+                {
+                    int idx_next = state->smoothed[(t + 1) * Np + n];
+                    int regime_next = state->regimes[(t + 1) * Np + idx_next];
+                    float h_next = state->h[(t + 1) * Np + idx_next];
+                    float mu_shift = m->mu_shifts[regime_next];
+                    const float *log_trans_col = &log_trans_T[regime_next * K];
 
-                /* OPTIMIZATION 5: Contiguous column access via transposed matrix
-                 * log_trans_T[regime_next * K + k] = P(regime_next | k) */
-                const float *log_trans_col = &log_trans_T[regime_next * K];
-
-                int i; /* MSVC OpenMP requires loop var declared outside */
-
-/* Compute backward log-weights */
-#ifndef _MSC_VER
-#pragma omp simd
+#if defined(__AVX2__) || defined(_MSC_VER)
+                    /* Use AVX2 optimized kernel with gather + unrolling */
+                    compute_log_bw_avx2(local_log_bw, h_t, log_w_t, regimes_t,
+                                        log_trans_col, mu_shift, phi, h_next,
+                                        neg_half_inv_var, N, Np);
+#else
+                    /* Scalar fallback */
+                    int i;
+                    for (i = 0; i < N; i++)
+                    {
+                        int regime_i = regimes_t[i];
+                        float log_trans = log_trans_col[regime_i];
+                        float mean = mu_shift + phi * h_t[i];
+                        float diff = h_next - mean;
+                        float log_h_trans = neg_half_inv_var * diff * diff;
+                        local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
+                    }
+                    for (i = N; i < Np; i++)
+                    {
+                        local_log_bw[i] = NEG_INF;
+                    }
 #endif
-                for (i = 0; i < N; i++)
-                {
-                    int regime_i = regimes_t[i];
-                    float log_trans = log_trans_col[regime_i];
-                    float mean = mu_shift + phi * h_t[i];
-                    float diff = h_next - mean;
-                    float log_h_trans = neg_half_inv_var * diff * diff;
-                    local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
-                }
 
-                /* Padding to -inf */
-                for (i = N; i < Np; i++)
-                {
-                    local_log_bw[i] = NEG_INF;
+                    logsumexp_normalize(local_log_bw, N, Np, local_bw, local_workspace);
+                    state->smoothed[t * Np + n] = sample_categorical(local_bw, N, local_cumsum, local_stream);
                 }
-
-                /* Normalize and sample (SIMD CDF scan) */
-                logsumexp_normalize(local_log_bw, N, Np, local_bw, local_workspace);
-                state->smoothed[t * Np + n] = sample_categorical(local_bw, N, local_cumsum, local_stream);
             }
         }
-        /* No mkl_free needed - workspaces are pre-allocated */
+
+        /* Restore default VML mode per-thread */
+        if (use_large_path)
+        {
+            vmlSetMode(VML_HA);
+        }
     }
 
 #else
     /* ═══════════════════════════════════════════════════════════════════════
-     * SEQUENTIAL BACKWARD PASS - Optimized
+     * SEQUENTIAL BACKWARD PASS
      * ═══════════════════════════════════════════════════════════════════════*/
+
+    /* VML Enhanced Performance mode for large workloads */
+    if (use_large_path)
+    {
+        vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
+    }
+
     VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng_stream;
     float *local_log_bw = state->ws_log_bw;
     float *local_bw = state->ws_bw;
     float *local_workspace = state->ws_workspace;
     float *local_cumsum = state->ws_cumsum;
 
-    int t, n, i; /* MSVC OpenMP requires loop vars declared outside */
+    int t, n; /* MSVC requires loop vars declared outside */
     for (t = T - 2; t >= 0; t--)
     {
         const float *h_t = &state->h[t * Np];
         const float *log_w_t = &state->log_weights[t * Np];
         const int *regimes_t = &state->regimes[t * Np];
 
-        /* Software prefetch for backward access */
-        if (t > 0)
+        /* Software prefetch - only for large workloads */
+        if (use_large_path && t > 0)
         {
             _mm_prefetch((const char *)&state->h[(t - 1) * Np], _MM_HINT_T1);
             _mm_prefetch((const char *)&state->log_weights[(t - 1) * Np], _MM_HINT_T1);
@@ -561,13 +725,14 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
             int regime_next = state->regimes[(t + 1) * Np + idx_next];
             float h_next = state->h[(t + 1) * Np + idx_next];
             float mu_shift = m->mu_shifts[regime_next];
-
-            /* Contiguous column from transposed matrix */
             const float *log_trans_col = &log_trans_T[regime_next * K];
 
-#ifndef _MSC_VER
-#pragma omp simd
-#endif
+#if defined(__AVX2__) || defined(_MSC_VER)
+            compute_log_bw_avx2(local_log_bw, h_t, log_w_t, regimes_t,
+                                log_trans_col, mu_shift, phi, h_next,
+                                neg_half_inv_var, N, Np);
+#else
+            int i;
             for (i = 0; i < N; i++)
             {
                 int regime_i = regimes_t[i];
@@ -577,20 +742,23 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
                 float log_h_trans = neg_half_inv_var * diff * diff;
                 local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
             }
-
             for (i = N; i < Np; i++)
             {
                 local_log_bw[i] = NEG_INF;
             }
+#endif
 
             logsumexp_normalize(local_log_bw, N, Np, local_bw, local_workspace);
             state->smoothed[t * Np + n] = sample_categorical(local_bw, N, local_cumsum, stream);
         }
     }
-#endif
 
     /* Restore default VML mode */
-    vmlSetMode(VML_HA);
+    if (use_large_path)
+    {
+        vmlSetMode(VML_HA);
+    }
+#endif
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════

@@ -501,15 +501,26 @@ static void benchmark_paris_mkl(void)
 #endif
 
     int configs[][3] = {
-        /* T, K, N */
-        {100, 4, 50},
-        {100, 4, 100},
-        {200, 4, 100},
-        {300, 4, 100},
-        {500, 4, 100},
-        {200, 4, 128},
-        {200, 8, 100},
-        {1000, 4, 100},
+        /* T, K, N - Ordered by workload size */
+        /* Small workloads (T*N < 8192) - use simple path */
+        {100, 4, 50}, /* 5000 - small path */
+        {128, 4, 64}, /* 8192 - RECOMMENDED HFT config (boundary) */
+
+        /* Medium workloads (T*N >= 8192) - use optimized path */
+        {100, 4, 100}, /* 10000 */
+        {200, 4, 64},  /* 12800 - alt HFT config */
+        {200, 4, 100}, /* 20000 - common benchmark */
+        {200, 4, 128}, /* 25600 */
+
+        /* Large workloads */
+        {300, 4, 100}, /* 30000 */
+        {500, 4, 100}, /* 50000 */
+
+        /* Multi-regime test */
+        {200, 8, 100}, /* 20000, K=8 */
+
+        /* Stress test */
+        {1000, 4, 100}, /* 100000 */
     };
     int n_configs = sizeof(configs) / sizeof(configs[0]);
 
@@ -581,7 +592,7 @@ int main(void)
 {
     /* Initialize MKL tuning: P-cores only (adjust for your CPU), verbose=1 */
     /* For i9-13900K: 8 P-cores. Set to 0 to use all threads. */
-    mkl_tuning_init(8, 1); /* 0 = auto, change to your P-core count */
+    mkl_tuning_init(0, 1); /* 0 = auto, change to your P-core count */
 
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
     printf("║                   PARIS-MKL TEST SUITE                                ║\n");

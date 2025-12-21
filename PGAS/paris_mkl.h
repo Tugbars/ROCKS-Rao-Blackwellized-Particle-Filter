@@ -50,6 +50,18 @@ extern "C"
 #define PARIS_MKL_SIMD_WIDTH 16 /**< Pad to multiple of 16 floats */
 
 /**
+ * Recommended parameters for HFT SV-HMM:
+ *   T (time):     128-200 ticks (recent history window)
+ *   N (particles): 64-128 (64 min for ESS, 128 for stability)
+ *   K (regimes):   4 (low/normal/high/extreme volatility)
+ *
+ * Powers of 2 recommended for optimal SIMD alignment.
+ */
+#define PARIS_MKL_RECOMMENDED_T 128
+#define PARIS_MKL_RECOMMENDED_N 64
+#define PARIS_MKL_RECOMMENDED_K 4
+
+/**
  * Pad N to multiple of 16 for optimal SIMD (eliminates tail masking)
  */
 #define PARIS_MKL_PAD_N(n) (((n) + PARIS_MKL_SIMD_WIDTH - 1) & ~(PARIS_MKL_SIMD_WIDTH - 1))
