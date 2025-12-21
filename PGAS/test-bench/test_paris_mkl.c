@@ -592,7 +592,8 @@ int main(void)
 {
     /* Initialize MKL tuning: P-cores only (adjust for your CPU), verbose=1 */
     /* For i9-13900K: 8 P-cores. Set to 0 to use all threads. */
-    mkl_tuning_init(0, 1); /* 0 = auto, change to your P-core count */
+    mkl_tuning_init(8, 1);  /* 8 P-cores, verbose */
+
 
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
     printf("║                   PARIS-MKL TEST SUITE                                ║\n");
@@ -619,7 +620,8 @@ int main(void)
     printf("\n✓ All correctness tests passed!\n");
 
     benchmark_paris_mkl();
-
+    
+    mkl_tuning_cleanup();
     printf("\n✓ Benchmark complete!\n");
     return 0;
 }
