@@ -17,6 +17,19 @@ cmake_minimum_required(VERSION 3.16)
 find_package(Threads REQUIRED)
 
 #───────────────────────────────────────────────────────────────────────────────
+# MSVC-specific: Add /openmp:experimental for SIMD support
+#───────────────────────────────────────────────────────────────────────────────
+
+if(MSVC)
+    set(PGAS_COMPILE_FLAGS 
+        ${COMMON_FLAGS}
+        /openmp:experimental
+    )
+else()
+    set(PGAS_COMPILE_FLAGS ${COMMON_FLAGS})
+endif()
+
+#───────────────────────────────────────────────────────────────────────────────
 # PGAS-MKL Library
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -33,7 +46,7 @@ target_link_libraries(pgas_mkl
         MKL::MKL
 )
 
-target_compile_options(pgas_mkl PRIVATE ${COMMON_FLAGS})
+target_compile_options(pgas_mkl PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(pgas_mkl PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -53,7 +66,7 @@ target_link_libraries(paris_mkl
         MKL::MKL
 )
 
-target_compile_options(paris_mkl PRIVATE ${COMMON_FLAGS})
+target_compile_options(paris_mkl PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(paris_mkl PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
