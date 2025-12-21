@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
+#include <inttypes.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -989,16 +990,16 @@ void lifeboat_print_diagnostics(const LifeboatManager *mgr)
            mgr->config.enable_kl ? "ON" : "OFF", mgr->config.kl_threshold);
     printf("\nState:\n");
     printf("  Thread state:     %s (atomic)\n", state_str);
-    printf("  Current tick:     %lu\n", mgr->current_tick);
-    printf("  Last trigger:     %lu\n", mgr->last_trigger_tick);
-    printf("  Last injection:   %lu\n", mgr->last_injection_tick);
-    printf("  Snapshot range:   %lu - %lu\n", mgr->snapshot_start_tick, mgr->snapshot_end_tick);
+    printf("  Current tick:     %" PRIu64 "\n", mgr->current_tick);
+    printf("  Last trigger:     %" PRIu64 "\n", mgr->last_trigger_tick);
+    printf("  Last injection:   %" PRIu64 "\n", mgr->last_injection_tick);
+    printf("  Snapshot range:   %" PRIu64 " - %" PRIu64 "\n", mgr->snapshot_start_tick, mgr->snapshot_end_tick);
     printf("  Ready cloud:      %d\n", mgr->ready_cloud);
     printf("\nStatistics:\n");
-    printf("  Total triggers:   %lu\n", mgr->stats.total_triggers);
-    printf("  Total injections: %lu\n", mgr->stats.total_injections);
-    printf("  Failed runs:      %lu\n", mgr->stats.failed_runs);
-    printf("  By type:          periodic=%lu, ess=%lu, kl=%lu, manual=%lu\n",
+    printf("  Total triggers:   %" PRIu64 "\n", mgr->stats.total_triggers);
+    printf("  Total injections: %" PRIu64 "\n", mgr->stats.total_injections);
+    printf("  Failed runs:      %" PRIu64 "\n", mgr->stats.failed_runs);
+    printf("  By type:          periodic=%" PRIu64 ", ess=%" PRIu64 ", kl=%" PRIu64 ", manual=%" PRIu64 "\n",
            mgr->stats.periodic_triggers, mgr->stats.ess_triggers,
            mgr->stats.kl_triggers, mgr->stats.manual_triggers);
     printf("  Avg compute time: %.2f ms\n", mgr->stats.avg_compute_time_ms);

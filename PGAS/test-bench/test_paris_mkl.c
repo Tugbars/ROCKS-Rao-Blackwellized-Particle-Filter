@@ -575,8 +575,14 @@ static void benchmark_paris_mkl(void)
  * MAIN
  *═══════════════════════════════════════════════════════════════════════════════*/
 
+#include "mkl_tuning.h"
+
 int main(void)
 {
+    /* Initialize MKL tuning: P-cores only (adjust for your CPU), verbose=1 */
+    /* For i9-13900K: 8 P-cores. Set to 0 to use all threads. */
+    mkl_tuning_init(8, 1); /* 0 = auto, change to your P-core count */
+
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
     printf("║                   PARIS-MKL TEST SUITE                                ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n\n");
