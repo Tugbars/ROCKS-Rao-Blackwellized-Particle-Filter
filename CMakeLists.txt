@@ -1,5 +1,5 @@
 #───────────────────────────────────────────────────────────────────────────────
-# Rao-Blackwellized Particle Filter (RBPF)
+# Rao-Blackwellized Particle Filter (RBPF) + PGAS
 #
 # Standalone build for RBPF-KSC with Kim-Shephard-Chib observation model.
 # Optimized for HFT volatility tracking with sub-20μs latency.
@@ -13,6 +13,8 @@
 #   -DRBPF_USE_DOUBLE=ON     Use double precision (default: OFF for latency)
 #   -DRBPF_BUILD_BENCH=ON    Build benchmark executable (default: ON)
 #   -DRBPF_BUILD_TESTS=ON    Build scenario tests (default: ON)
+#   -DPGAS_BUILD_TESTS=ON    Build PGAS tests (default: ON)
+#   -DPGAS_BUILD_BENCH=ON    Build PGAS benchmarks (default: ON)
 #───────────────────────────────────────────────────────────────────────────────
 
 cmake_minimum_required(VERSION 3.16)
@@ -73,17 +75,21 @@ elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 
 #───────────────────────────────────────────────────────────────────────────────
-# Add RBPF Subdirectory
+# Add Subdirectories
 #───────────────────────────────────────────────────────────────────────────────
 
+# Core RBPF library (online filtering)
 add_subdirectory(RBPF)
+
+# PGAS + PARIS library (offline smoothing / lifeboat)
+add_subdirectory(PGAS)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
 #───────────────────────────────────────────────────────────────────────────────
 
 message(STATUS "")
-message(STATUS "=== RBPF Configuration ===")
+message(STATUS "=== RBPF + PGAS Configuration ===")
 message(STATUS "Build type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "Compiler:         ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
 message(STATUS "MKL threading:    ${MKL_THREADING}")
@@ -92,4 +98,8 @@ if(MSVC)
 else()
     message(STATUS "Platform:         Unix-like")
 endif()
+message(STATUS "")
+message(STATUS "Components:")
+message(STATUS "  RBPF (online):  rocks library")
+message(STATUS "  PGAS (offline): pgas_mkl, paris_mkl, lifeboat")
 message(STATUS "")
