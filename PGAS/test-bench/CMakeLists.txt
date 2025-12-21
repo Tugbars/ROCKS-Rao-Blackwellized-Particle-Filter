@@ -38,9 +38,9 @@ target_compile_definitions(test_lifeboat PRIVATE ${COMMON_DEFS})
 #───────────────────────────────────────────────────────────────────────────────
 
 # Full benchmark suite (PGAS + PARIS + Lifeboat)
-add_executable(bench_pgas_all
-    benchmark_all.c
-)
-target_link_libraries(bench_pgas_all PRIVATE pgas)
-target_compile_options(bench_pgas_all PRIVATE ${COMMON_FLAGS})
-target_compile_definitions(bench_pgas_all PRIVATE ${COMMON_DEFS})
+#add_executable(bench_pgas_all
+#    benchmark_all.c
+#)
+#target_link_libraries(bench_pgas_all PRIVATE pgas)
+#target_compile_options(bench_pgas_all PRIVATE ${COMMON_FLAGS})
+#target_compile_definitions(bench_pgas_all PRIVATE ${COMMON_DEFS})

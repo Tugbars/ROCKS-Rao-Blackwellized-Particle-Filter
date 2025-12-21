@@ -15,6 +15,7 @@
 
 #include "lifeboat.h"
 #include "pgas_mkl.h"
+#include <mkl.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,16 @@ static inline void lifeboat_cond_wait(lifeboat_cond_t *cond, lifeboat_mutex_t *m
 {
     SleepConditionVariableCS(cond, mtx, INFINITE);
 }
+static inline void lifeboat_thread_create(lifeboat_thread_t *thread,
+                                          DWORD(WINAPI *func)(void *), void *arg)
+{
+    *thread = CreateThread(NULL, 0, func, arg, 0, NULL);
+}
+static inline void lifeboat_thread_join(lifeboat_thread_t thread)
+{
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+}
 #else
 static inline void lifeboat_mutex_init(lifeboat_mutex_t *mtx)
 {
@@ -147,6 +158,15 @@ static inline void lifeboat_cond_signal(lifeboat_cond_t *cond)
 static inline void lifeboat_cond_wait(lifeboat_cond_t *cond, lifeboat_mutex_t *mtx)
 {
     pthread_cond_wait(cond, mtx);
+}
+static inline void lifeboat_thread_create(lifeboat_thread_t *thread,
+                                          void *(*func)(void *), void *arg)
+{
+    pthread_create(thread, NULL, func, arg);
+}
+static inline void lifeboat_thread_join(lifeboat_thread_t thread)
+{
+    pthread_join(thread, NULL);
 }
 #endif
 
@@ -194,7 +214,7 @@ static bool validate_trans_rows(const float *trans, int K)
  * WORKER THREAD
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-static void *lifeboat_worker_thread(void *arg)
+static LIFEBOAT_THREAD_RETURN lifeboat_worker_thread(void *arg)
 {
     LifeboatManager *mgr = (LifeboatManager *)arg;
 
@@ -204,15 +224,15 @@ static void *lifeboat_worker_thread(void *arg)
     while (1)
     {
         /* Wait for work or shutdown */
-        pthread_mutex_lock(&mgr->mutex);
+        lifeboat_mutex_lock(&mgr->mutex);
         while (get_thread_state(mgr) == LIFEBOAT_THREAD_IDLE && !mgr->shutdown_requested)
         {
-            pthread_cond_wait(&mgr->cond_start, &mgr->mutex);
+            lifeboat_cond_wait(&mgr->cond_start, &mgr->mutex);
         }
 
         if (mgr->shutdown_requested)
         {
-            pthread_mutex_unlock(&mgr->mutex);
+            lifeboat_mutex_unlock(&mgr->mutex);
             break;
         }
 
@@ -240,7 +260,7 @@ static void *lifeboat_worker_thread(void *arg)
         phi_f = mgr->clouds[0].phi;
         sigma_h_f = mgr->clouds[0].sigma_h;
 
-        pthread_mutex_unlock(&mgr->mutex);
+        lifeboat_mutex_unlock(&mgr->mutex);
 
         /* ═══════════════════════════════════════════════════════════════════
          * CONVERT TO DOUBLE (on pre-allocated buffers)
@@ -282,7 +302,7 @@ static void *lifeboat_worker_thread(void *arg)
         /* ═══════════════════════════════════════════════════════════════════
          * EXTRACT RESULTS (with lock)
          * ═══════════════════════════════════════════════════════════════════*/
-        pthread_mutex_lock(&mgr->mutex);
+        lifeboat_mutex_lock(&mgr->mutex);
 
         cloud->N = mgr->N;
         cloud->K = K;
@@ -342,12 +362,12 @@ static void *lifeboat_worker_thread(void *arg)
         mgr->active_cloud = 1 - cloud_idx;
         set_thread_state(mgr, LIFEBOAT_THREAD_READY);
 
-        pthread_cond_signal(&mgr->cond_done);
-        pthread_mutex_unlock(&mgr->mutex);
+        lifeboat_cond_signal(&mgr->cond_done);
+        lifeboat_mutex_unlock(&mgr->mutex);
     }
 
     pgas_mkl_free(pgas);
-    return NULL;
+    return LIFEBOAT_THREAD_RETURN_VALUE;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -377,17 +397,17 @@ LifeboatManager *lifeboat_create(int N, int K, int buffer_size, uint32_t seed)
     mgr->config.cooldown_ticks = 50;
 
     /* Allocate main thread buffers */
-    mgr->snapshot_obs = (float *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(float));
-    mgr->snapshot_ticks = (uint64_t *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(uint64_t));
-    mgr->ref_regimes = (int *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(int));
-    mgr->ref_h = (float *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(float));
+    mgr->snapshot_obs = (float *)mkl_malloc(buffer_size * sizeof(float), LIFEBOAT_ALIGN);
+    mgr->snapshot_ticks = (uint64_t *)mkl_malloc(buffer_size * sizeof(uint64_t), LIFEBOAT_ALIGN);
+    mgr->ref_regimes = (int *)mkl_malloc(buffer_size * sizeof(int), LIFEBOAT_ALIGN);
+    mgr->ref_h = (float *)mkl_malloc(buffer_size * sizeof(float), LIFEBOAT_ALIGN);
 
     /* Pre-allocate worker thread buffers (avoid malloc in hot path!) */
-    mgr->worker_obs = (float *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(float));
-    mgr->worker_obs_d = (double *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(double));
-    mgr->worker_ref_regimes = (int *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(int));
-    mgr->worker_ref_h = (float *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(float));
-    mgr->worker_ref_h_d = (double *)aligned_alloc(LIFEBOAT_ALIGN, buffer_size * sizeof(double));
+    mgr->worker_obs = (float *)mkl_malloc(buffer_size * sizeof(float), LIFEBOAT_ALIGN);
+    mgr->worker_obs_d = (double *)mkl_malloc(buffer_size * sizeof(double), LIFEBOAT_ALIGN);
+    mgr->worker_ref_regimes = (int *)mkl_malloc(buffer_size * sizeof(int), LIFEBOAT_ALIGN);
+    mgr->worker_ref_h = (float *)mkl_malloc(buffer_size * sizeof(float), LIFEBOAT_ALIGN);
+    mgr->worker_ref_h_d = (double *)mkl_malloc(buffer_size * sizeof(double), LIFEBOAT_ALIGN);
 
     /* Initialize clouds */
     for (int c = 0; c < 2; c++)
@@ -414,15 +434,15 @@ LifeboatManager *lifeboat_create(int N, int K, int buffer_size, uint32_t seed)
     mgr->ready_cloud = -1;
 
     /* Initialize synchronization */
-    pthread_mutex_init(&mgr->mutex, NULL);
-    pthread_cond_init(&mgr->cond_start, NULL);
-    pthread_cond_init(&mgr->cond_done, NULL);
+    lifeboat_mutex_init(&mgr->mutex);
+    lifeboat_cond_init(&mgr->cond_start);
+    lifeboat_cond_init(&mgr->cond_done);
 
     set_thread_state(mgr, LIFEBOAT_THREAD_IDLE);
     mgr->shutdown_requested = false;
 
     /* Spawn worker thread */
-    pthread_create(&mgr->worker_thread, NULL, lifeboat_worker_thread, mgr);
+    lifeboat_thread_create(&mgr->worker_thread, lifeboat_worker_thread, mgr);
 
     return mgr;
 }
@@ -433,26 +453,26 @@ void lifeboat_destroy(LifeboatManager *mgr)
         return;
 
     /* Signal shutdown */
-    pthread_mutex_lock(&mgr->mutex);
+    lifeboat_mutex_lock(&mgr->mutex);
     mgr->shutdown_requested = true;
-    pthread_cond_signal(&mgr->cond_start);
-    pthread_mutex_unlock(&mgr->mutex);
+    lifeboat_cond_signal(&mgr->cond_start);
+    lifeboat_mutex_unlock(&mgr->mutex);
 
-    pthread_join(mgr->worker_thread, NULL);
+    lifeboat_thread_join(mgr->worker_thread);
 
-    pthread_mutex_destroy(&mgr->mutex);
-    pthread_cond_destroy(&mgr->cond_start);
-    pthread_cond_destroy(&mgr->cond_done);
+    lifeboat_mutex_destroy(&mgr->mutex);
+    lifeboat_cond_destroy(&mgr->cond_start);
+    lifeboat_cond_destroy(&mgr->cond_done);
 
-    free(mgr->snapshot_obs);
-    free(mgr->snapshot_ticks);
-    free(mgr->ref_regimes);
-    free(mgr->ref_h);
-    free(mgr->worker_obs);
-    free(mgr->worker_obs_d);
-    free(mgr->worker_ref_regimes);
-    free(mgr->worker_ref_h);
-    free(mgr->worker_ref_h_d);
+    mkl_free(mgr->snapshot_obs);
+    mkl_free(mgr->snapshot_ticks);
+    mkl_free(mgr->ref_regimes);
+    mkl_free(mgr->ref_h);
+    mkl_free(mgr->worker_obs);
+    mkl_free(mgr->worker_obs_d);
+    mkl_free(mgr->worker_ref_regimes);
+    mkl_free(mgr->worker_ref_h);
+    mkl_free(mgr->worker_ref_h_d);
     free(mgr);
 }
 
@@ -460,9 +480,9 @@ void lifeboat_configure(LifeboatManager *mgr, const LifeboatConfig *config)
 {
     if (!mgr || !config)
         return;
-    pthread_mutex_lock(&mgr->mutex);
+    lifeboat_mutex_lock(&mgr->mutex);
     mgr->config = *config;
-    pthread_mutex_unlock(&mgr->mutex);
+    lifeboat_mutex_unlock(&mgr->mutex);
 }
 
 void lifeboat_set_model(LifeboatManager *mgr,
@@ -474,7 +494,7 @@ void lifeboat_set_model(LifeboatManager *mgr,
 {
     if (!mgr)
         return;
-    pthread_mutex_lock(&mgr->mutex);
+    lifeboat_mutex_lock(&mgr->mutex);
     for (int c = 0; c < 2; c++)
     {
         memcpy(mgr->clouds[c].trans, trans, mgr->K * mgr->K * sizeof(float));
@@ -483,7 +503,7 @@ void lifeboat_set_model(LifeboatManager *mgr,
         mgr->clouds[c].phi = phi;
         mgr->clouds[c].sigma_h = sigma_h;
     }
-    pthread_mutex_unlock(&mgr->mutex);
+    lifeboat_mutex_unlock(&mgr->mutex);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -579,11 +599,11 @@ bool lifeboat_start_run(LifeboatManager *mgr,
     if (!mgr || !observations || count < 2)
         return false;
 
-    pthread_mutex_lock(&mgr->mutex);
+    lifeboat_mutex_lock(&mgr->mutex);
 
     if (get_thread_state(mgr) == LIFEBOAT_THREAD_RUNNING)
     {
-        pthread_mutex_unlock(&mgr->mutex);
+        lifeboat_mutex_unlock(&mgr->mutex);
         return false;
     }
 
@@ -621,8 +641,8 @@ bool lifeboat_start_run(LifeboatManager *mgr,
     mgr->stats.total_triggers++;
     set_thread_state(mgr, LIFEBOAT_THREAD_RUNNING);
 
-    pthread_cond_signal(&mgr->cond_start);
-    pthread_mutex_unlock(&mgr->mutex);
+    lifeboat_cond_signal(&mgr->cond_start);
+    lifeboat_mutex_unlock(&mgr->mutex);
 
     return true;
 }
@@ -675,18 +695,18 @@ bool lifeboat_inject(LifeboatManager *mgr,
     if (!mgr || !rbpf_regimes || !rbpf_h || !rbpf_weights)
         return false;
 
-    pthread_mutex_lock(&mgr->mutex);
+    lifeboat_mutex_lock(&mgr->mutex);
 
     if (mgr->ready_cloud < 0)
     {
-        pthread_mutex_unlock(&mgr->mutex);
+        lifeboat_mutex_unlock(&mgr->mutex);
         return false;
     }
 
     const LifeboatCloud *cloud = &mgr->clouds[mgr->ready_cloud];
     if (!cloud->valid)
     {
-        pthread_mutex_unlock(&mgr->mutex);
+        lifeboat_mutex_unlock(&mgr->mutex);
         return false;
     }
 
@@ -785,7 +805,7 @@ bool lifeboat_inject(LifeboatManager *mgr,
     mgr->last_injection_tick = mgr->current_tick;
     mgr->stats.last_injection_tick = mgr->current_tick;
 
-    pthread_mutex_unlock(&mgr->mutex);
+    lifeboat_mutex_unlock(&mgr->mutex);
     return true;
 }
 
@@ -793,10 +813,10 @@ void lifeboat_consume_cloud(LifeboatManager *mgr)
 {
     if (!mgr)
         return;
-    pthread_mutex_lock(&mgr->mutex);
+    lifeboat_mutex_lock(&mgr->mutex);
     mgr->ready_cloud = -1;
     set_thread_state(mgr, LIFEBOAT_THREAD_IDLE);
-    pthread_mutex_unlock(&mgr->mutex);
+    lifeboat_mutex_unlock(&mgr->mutex);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -904,9 +924,9 @@ void lifeboat_reset_stats(LifeboatManager *mgr)
 {
     if (!mgr)
         return;
-    pthread_mutex_lock(&mgr->mutex);
+    lifeboat_mutex_lock(&mgr->mutex);
     memset(&mgr->stats, 0, sizeof(LifeboatStats));
-    pthread_mutex_unlock(&mgr->mutex);
+    lifeboat_mutex_unlock(&mgr->mutex);
 }
 
 void lifeboat_print_diagnostics(const LifeboatManager *mgr)
