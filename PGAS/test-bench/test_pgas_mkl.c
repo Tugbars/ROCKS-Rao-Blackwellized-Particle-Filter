@@ -433,7 +433,8 @@ static void benchmark_pgas_mkl(void)
 int main(void)
 {
     /* Initialize MKL tuning: P-cores only (adjust for your CPU), verbose=1 */
-    mkl_tuning_init(0, 1); /* 0 = auto, change to your P-core count */
+    mkl_tuning_init(8, 1);  /* 8 P-cores, verbose */
+ /* 0 = auto, change to your P-core count */
 
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
     printf("║                    PGAS-MKL TEST SUITE                                ║\n");
