@@ -184,6 +184,166 @@ static inline void compute_log_bw_avx2(
 #endif /* __AVX2__ */
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * AVX-512 OPTIMIZED INNER KERNEL (AMD EPYC Zen4+, Intel Skylake-X+)
+ * - 16 floats per vector (2x AVX2)
+ * - Faster gather (especially on Zen4)
+ * - 4x unrolling = 64 particles per iteration
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+
+/**
+ * Compute backward log-weights using AVX-512 gather + unrolled FMA
+ * Processes 16 particles per vector, 4 vectors per unroll = 64 particles
+ */
+static inline void compute_log_bw_avx512(
+    float *restrict local_log_bw,
+    const float *restrict h_t,
+    const float *restrict log_w_t,
+    const int *restrict regimes_t,
+    const float *restrict log_trans_col,
+    float mu_shift, float phi, float h_next, float neg_half_inv_var,
+    int N, int Np)
+{
+    const __m512 v_mu_shift = _mm512_set1_ps(mu_shift);
+    const __m512 v_phi = _mm512_set1_ps(phi);
+    const __m512 v_h_next = _mm512_set1_ps(h_next);
+    const __m512 v_neg_half = _mm512_set1_ps(neg_half_inv_var);
+    const __m512 v_neg_inf = _mm512_set1_ps(-HUGE_VALF);
+
+    int i = 0;
+
+    /* Main loop: 64 particles per iteration (4 × 16-wide vectors) */
+    for (; i + 63 < N; i += 64)
+    {
+        /* Load 4 blocks of 16 regime indices */
+        __m512i v_reg0 = _mm512_loadu_si512((const __m512i *)&regimes_t[i]);
+        __m512i v_reg1 = _mm512_loadu_si512((const __m512i *)&regimes_t[i + 16]);
+        __m512i v_reg2 = _mm512_loadu_si512((const __m512i *)&regimes_t[i + 32]);
+        __m512i v_reg3 = _mm512_loadu_si512((const __m512i *)&regimes_t[i + 48]);
+
+        /* Gather transition probabilities (scale=4 for sizeof(float))
+         * AVX-512 gather is significantly faster than AVX2, especially on Zen4 */
+        __m512 v_lt0 = _mm512_i32gather_ps(v_reg0, log_trans_col, 4);
+        __m512 v_lt1 = _mm512_i32gather_ps(v_reg1, log_trans_col, 4);
+        __m512 v_lt2 = _mm512_i32gather_ps(v_reg2, log_trans_col, 4);
+        __m512 v_lt3 = _mm512_i32gather_ps(v_reg3, log_trans_col, 4);
+
+        /* Load h values */
+        __m512 v_h0 = _mm512_loadu_ps(&h_t[i]);
+        __m512 v_h1 = _mm512_loadu_ps(&h_t[i + 16]);
+        __m512 v_h2 = _mm512_loadu_ps(&h_t[i + 32]);
+        __m512 v_h3 = _mm512_loadu_ps(&h_t[i + 48]);
+
+        /* Load log_w values */
+        __m512 v_lw0 = _mm512_loadu_ps(&log_w_t[i]);
+        __m512 v_lw1 = _mm512_loadu_ps(&log_w_t[i + 16]);
+        __m512 v_lw2 = _mm512_loadu_ps(&log_w_t[i + 32]);
+        __m512 v_lw3 = _mm512_loadu_ps(&log_w_t[i + 48]);
+
+        /* Compute mean = mu_shift + phi * h (FMA for ILP) */
+        __m512 v_mean0 = _mm512_fmadd_ps(v_phi, v_h0, v_mu_shift);
+        __m512 v_mean1 = _mm512_fmadd_ps(v_phi, v_h1, v_mu_shift);
+        __m512 v_mean2 = _mm512_fmadd_ps(v_phi, v_h2, v_mu_shift);
+        __m512 v_mean3 = _mm512_fmadd_ps(v_phi, v_h3, v_mu_shift);
+
+        /* Compute diff = h_next - mean */
+        __m512 v_diff0 = _mm512_sub_ps(v_h_next, v_mean0);
+        __m512 v_diff1 = _mm512_sub_ps(v_h_next, v_mean1);
+        __m512 v_diff2 = _mm512_sub_ps(v_h_next, v_mean2);
+        __m512 v_diff3 = _mm512_sub_ps(v_h_next, v_mean3);
+
+        /* Compute log_h_trans = neg_half_inv_var * diff * diff */
+        __m512 v_d2_0 = _mm512_mul_ps(v_diff0, v_diff0);
+        __m512 v_d2_1 = _mm512_mul_ps(v_diff1, v_diff1);
+        __m512 v_d2_2 = _mm512_mul_ps(v_diff2, v_diff2);
+        __m512 v_d2_3 = _mm512_mul_ps(v_diff3, v_diff3);
+
+        __m512 v_lht0 = _mm512_mul_ps(v_neg_half, v_d2_0);
+        __m512 v_lht1 = _mm512_mul_ps(v_neg_half, v_d2_1);
+        __m512 v_lht2 = _mm512_mul_ps(v_neg_half, v_d2_2);
+        __m512 v_lht3 = _mm512_mul_ps(v_neg_half, v_d2_3);
+
+        /* Compute result = log_w + log_trans + log_h_trans */
+        __m512 v_sum0 = _mm512_add_ps(v_lw0, v_lt0);
+        __m512 v_sum1 = _mm512_add_ps(v_lw1, v_lt1);
+        __m512 v_sum2 = _mm512_add_ps(v_lw2, v_lt2);
+        __m512 v_sum3 = _mm512_add_ps(v_lw3, v_lt3);
+
+        v_sum0 = _mm512_add_ps(v_sum0, v_lht0);
+        v_sum1 = _mm512_add_ps(v_sum1, v_lht1);
+        v_sum2 = _mm512_add_ps(v_sum2, v_lht2);
+        v_sum3 = _mm512_add_ps(v_sum3, v_lht3);
+
+        /* Store results */
+        _mm512_storeu_ps(&local_log_bw[i], v_sum0);
+        _mm512_storeu_ps(&local_log_bw[i + 16], v_sum1);
+        _mm512_storeu_ps(&local_log_bw[i + 32], v_sum2);
+        _mm512_storeu_ps(&local_log_bw[i + 48], v_sum3);
+    }
+
+    /* Tail: 16 particles per iteration */
+    for (; i + 15 < N; i += 16)
+    {
+        __m512i v_reg = _mm512_loadu_si512((const __m512i *)&regimes_t[i]);
+        __m512 v_lt = _mm512_i32gather_ps(v_reg, log_trans_col, 4);
+        __m512 v_h = _mm512_loadu_ps(&h_t[i]);
+        __m512 v_lw = _mm512_loadu_ps(&log_w_t[i]);
+
+        __m512 v_mean = _mm512_fmadd_ps(v_phi, v_h, v_mu_shift);
+        __m512 v_diff = _mm512_sub_ps(v_h_next, v_mean);
+        __m512 v_d2 = _mm512_mul_ps(v_diff, v_diff);
+        __m512 v_lht = _mm512_mul_ps(v_neg_half, v_d2);
+
+        __m512 v_sum = _mm512_add_ps(v_lw, v_lt);
+        v_sum = _mm512_add_ps(v_sum, v_lht);
+
+        _mm512_storeu_ps(&local_log_bw[i], v_sum);
+    }
+
+    /* Masked tail for remaining elements (AVX-512 mask registers) */
+    if (i < N)
+    {
+        __mmask16 mask = (__mmask16)((1u << (N - i)) - 1);
+
+        __m512i v_reg = _mm512_maskz_loadu_epi32(mask, &regimes_t[i]);
+        __m512 v_lt = _mm512_mask_i32gather_ps(_mm512_setzero_ps(), mask, v_reg, log_trans_col, 4);
+        __m512 v_h = _mm512_maskz_loadu_ps(mask, &h_t[i]);
+        __m512 v_lw = _mm512_maskz_loadu_ps(mask, &log_w_t[i]);
+
+        __m512 v_mean = _mm512_fmadd_ps(v_phi, v_h, v_mu_shift);
+        __m512 v_diff = _mm512_sub_ps(v_h_next, v_mean);
+        __m512 v_d2 = _mm512_mul_ps(v_diff, v_diff);
+        __m512 v_lht = _mm512_mul_ps(v_neg_half, v_d2);
+
+        __m512 v_sum = _mm512_add_ps(v_lw, v_lt);
+        v_sum = _mm512_add_ps(v_sum, v_lht);
+
+        _mm512_mask_storeu_ps(&local_log_bw[i], mask, v_sum);
+        i = N;
+    }
+
+    /* Padding with masked store */
+    if (i < Np)
+    {
+        int remaining = Np - i;
+        while (remaining >= 16)
+        {
+            _mm512_storeu_ps(&local_log_bw[i], v_neg_inf);
+            i += 16;
+            remaining -= 16;
+        }
+        if (remaining > 0)
+        {
+            __mmask16 mask = (__mmask16)((1u << remaining) - 1);
+            _mm512_mask_storeu_ps(&local_log_bw[i], mask, v_neg_inf);
+        }
+    }
+}
+
+#endif /* __AVX512F__ && __AVX512DQ__ */
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * ALLOCATION
  *═══════════════════════════════════════════════════════════════════════════════*/
 
@@ -652,8 +812,13 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
                     float mu_shift = m->mu_shifts[regime_next];
                     const float *log_trans_col = &log_trans_T[regime_next * K];
 
-#if defined(__AVX2__) || defined(_MSC_VER)
-                    /* Use AVX2 optimized kernel with gather + unrolling */
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+                    /* Use AVX-512 optimized kernel (64 particles/iter) */
+                    compute_log_bw_avx512(local_log_bw, h_t, log_w_t, regimes_t,
+                                          log_trans_col, mu_shift, phi, h_next,
+                                          neg_half_inv_var, N, Np);
+#elif defined(__AVX2__) || defined(_MSC_VER)
+                    /* Use AVX2 optimized kernel (32 particles/iter) */
                     compute_log_bw_avx2(local_log_bw, h_t, log_w_t, regimes_t,
                                         log_trans_col, mu_shift, phi, h_next,
                                         neg_half_inv_var, N, Np);
@@ -727,7 +892,11 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
             float mu_shift = m->mu_shifts[regime_next];
             const float *log_trans_col = &log_trans_T[regime_next * K];
 
-#if defined(__AVX2__) || defined(_MSC_VER)
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+            compute_log_bw_avx512(local_log_bw, h_t, log_w_t, regimes_t,
+                                  log_trans_col, mu_shift, phi, h_next,
+                                  neg_half_inv_var, N, Np);
+#elif defined(__AVX2__) || defined(_MSC_VER)
             compute_log_bw_avx2(local_log_bw, h_t, log_w_t, regimes_t,
                                 log_trans_col, mu_shift, phi, h_next,
                                 neg_half_inv_var, N, Np);
