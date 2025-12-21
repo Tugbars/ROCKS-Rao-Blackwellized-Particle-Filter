@@ -27,13 +27,73 @@
 #define RBPF_ENABLE_STUDENT_T 1
 #endif
 
+/*═══════════════════════════════════════════════════════════════════════════════
+ * TRANSITION LEARNING DESIGN NOTES
+ *
+ * WHY SOFT DIRICHLET WORKS (update on regime change only):
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The key insight is that transition learning should occur on RARE BUT
+ * INFORMATIVE events (SPRT-confirmed regime changes, ~0.1% of ticks), not
+ * every tick.
+ *
+ * Soft Dirichlet updates only when:
+ *   if (sprt_regime != old_sprt_regime)
+ *       dirichlet_transition_update(...)
+ *
+ * This works because regime changes are HIGH SIGNAL events that actually
+ * inform us about transition dynamics.
+ *
+ * WHY ONLINE VI (PER-TICK) FAILED:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Per-tick VI updates are dominated by STATUS QUO:
+ *   - 99%+ of ticks: particles stay in current regime
+ *   - VI computes ξ_ij ∝ P(s_{t-1}=i) × P(s_t=j|...) × likelihood
+ *   - Since most particles stay put, ξ_calm→calm ≈ 0.95
+ *   - VI learns "particles stay put" → increases α on diagonal
+ *   - Positive feedback → α grows unbounded → FOSSILIZATION
+ *   - Filter becomes stuck in dominant regime, ignores crises
+ *
+ * Even with:
+ *   - Heartbeat resets (only resets ρ, not accumulated α)
+ *   - Learning rate floors (α is still an ocean of counts)
+ *   - Surprise-modulated resets (adds MORE heuristics)
+ *
+ * The fundamental problem is architectural, not parametric.
+ *
+ * COMPARISON:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * | Approach              | Update Frequency    | Signal Quality | Result     |
+ * |-----------------------|---------------------|----------------|------------|
+ * | Soft Dirichlet        | On regime change    | High (rare)    | ✅ Works   |
+ * | Online VI (per-tick)  | Every tick          | Low (noise)    | ❌ Stuck   |
+ *
+ * WHEN ONLINE VI IS APPROPRIATE:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Online VI (online_vi_transition.c) is still useful as a RECEIVER of
+ * PGAS-learned Π via Lifeboat injection:
+ *
+ *   - Slow tick thread: PGAS learns true Π from batch data
+ *   - Lifeboat injects: online_vi_reset_from_hdp(vi, pgas_trans, confidence)
+ *   - VI provides: trans_var for Kelly sizing, row_entropy for PGAS triggers
+ *
+ * The online_vi_transition.c module is solid code. Just NEVER call
+ * online_vi_update() from the live tick path. Use it only to:
+ *   1. Receive PGAS injections (online_vi_reset_from_hdp)
+ *   2. Query uncertainty (online_vi_get_variance, online_vi_get_row_entropy)
+ *
+ * The LUT should be updated by:
+ *   - Soft Dirichlet on SPRT regime change (rare, informative)
+ *   - Lifeboat injection of PGAS-learned Π (slow tick, batch-learned)
+ *   - NEVER by per-tick VI updates
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
 /*─────────────────────────────────────────────────────────────────────────────
  * COMPUTE OUTPUTS
  *───────────────────────────────────────────────────────────────────────────*/
 
- /**
+/**
  * @brief Rebuild transition LUT from Dirichlet posterior
- * 
+ *
  * The RBPF uses a uint8_t[regime][1024] LUT for fast transition sampling.
  * This function rebuilds it from the current Dirichlet posterior.
  */
@@ -41,7 +101,7 @@ static void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
 {
     const int n_regimes = rbpf->n_regimes;
     const DirichletTransition *dt = &rbpf->trans_prior;
-    
+
     for (int r = 0; r < n_regimes; r++)
     {
         /* Build cumulative distribution */
@@ -51,7 +111,7 @@ static void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
         {
             cumsum[j] = cumsum[j - 1] + dt->prob[r][j];
         }
-        
+
         /* Fill LUT: for each u ∈ [0, 1024), find smallest j where cumsum[j] > u/1024 */
         for (int i = 0; i < 1024; i++)
         {
@@ -198,18 +258,22 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     int sprt_regime = sprt_multi_update(&rbpf->sprt, log_liks);
 
     /* ═══════════════════════════════════════════════════════════════════════
-     * DIRICHLET TRANSITION LEARNING
-     * 
-     * Learn from SPRT-confirmed regime changes.
+     * SOFT DIRICHLET TRANSITION LEARNING
+     *
+     * Learn from SPRT-confirmed regime changes ONLY.
      * This is the ONLY place where we update the transition prior.
      * The prior encodes geometry (nearby regimes more likely) and
      * adapts based on observed market dynamics.
+     *
+     * KEY INSIGHT: Updates on RARE BUT INFORMATIVE events (~0.1% of ticks).
+     * This is why Soft Dirichlet works while per-tick Online VI fails.
+     * See design notes at top of file for detailed explanation.
      * ═══════════════════════════════════════════════════════════════════════*/
     if (rbpf->trans_prior_enabled && sprt_regime != old_sprt_regime)
     {
         /* SPRT confirmed a regime change - learn from it */
         dirichlet_transition_update(&rbpf->trans_prior, old_sprt_regime, sprt_regime);
-        
+
         /* Rebuild the LUT so future transitions use learned probabilities */
         rbpf_rebuild_trans_lut_from_dirichlet(rbpf);
     }
@@ -219,6 +283,7 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
 
     /* Copy SPRT evidence to output for diagnostics */
     sprt_multi_get_evidence(&rbpf->sprt, out->sprt_evidence);
+
     /*========================================================================
      * SELF-AWARE SIGNALS
      *======================================================================*/
