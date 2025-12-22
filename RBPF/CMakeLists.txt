@@ -62,6 +62,9 @@ if(RBPF_ENABLE_STORVIK)
         # Storvik online parameter learning
         storvik/rbpf_param_learn.c
         storvik/rbpf_adaptive_forgetting.c
+        storvik/rbpf_fixed_lag_smoother.c 
+
+         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/paris_mkl.c
         
         # Robust OCSN likelihood
         ocsn/rbpf_ocsn_robust.c
@@ -116,6 +119,7 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
         ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam
         ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS 
 )
 
 target_link_libraries(rocks 
@@ -353,6 +357,7 @@ if(RBPF_ENABLE_STORVIK)
     list(APPEND ROCKS_HEADERS
         rbpf_ksc_param_integration.h
         storvik/rbpf_param_learn.h
+        storvik/rbpf_fixed_lag_smoother.h
         tuner/rbpf_tuner.h
         preprocess/rbpf_preprocess.h
         rbpf_dirichlet_transition.h
