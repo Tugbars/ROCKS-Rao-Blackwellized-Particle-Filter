@@ -1536,6 +1536,16 @@ typedef float rbpf_real_t;
      */
     void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf);
 
+    /**
+     * @brief Rebuild transition LUT from Dirichlet posterior
+     *
+     * The RBPF uses a uint8_t[regime][1024] LUT for fast transition sampling.
+     * This function rebuilds it from the current Dirichlet posterior.
+     *
+     * @param rbpf  The RBPF instance
+     */
+    void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf);
+
 #ifdef __cplusplus
 }
 #endif

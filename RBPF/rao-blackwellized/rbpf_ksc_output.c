@@ -1,12 +1,26 @@
 /**
  * @file rbpf_ksc_output.c
- * @brief RBPF-KSC Output Computation
+ * @brief RBPF-KSC Output Computation (Pure Math - No Policy)
  *
  * This file contains:
- *   - compute_outputs() with all detection logic
+ *   - compute_outputs() with raw signal computation
  *   - SPRT regime detection
  *   - Fixed-lag smoothing
  *   - Self-aware signals (surprise, entropy, vol ratio)
+ *
+ * ARCHITECTURE NOTE:
+ * ═══════════════════════════════════════════════════════════════════════════
+ * This layer is PURE MATH. It computes signals but does NOT make policy
+ * decisions about what constitutes a "regime change."
+ *
+ * Policy decisions (regime_changed, change_type) are made in the Extended
+ * layer (rbpf_ext_step) based on:
+ *   1. P² Circuit Breaker (tail event detection)
+ *   2. SPRT transitions (hypothesis testing)
+ *
+ * This separation allows the core to be reused across different applications
+ * without HFT-specific thresholds contaminating the math.
+ * ═══════════════════════════════════════════════════════════════════════════
  *
  * Hot path is in rbpf_ksc.c
  * Lifecycle functions are in rbpf_ksc_init.c
@@ -27,68 +41,10 @@
 #define RBPF_ENABLE_STUDENT_T 1
 #endif
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * TRANSITION LEARNING DESIGN NOTES
- *
- * WHY SOFT DIRICHLET WORKS (update on regime change only):
- * ─────────────────────────────────────────────────────────────────────────────
- * The key insight is that transition learning should occur on RARE BUT
- * INFORMATIVE events (SPRT-confirmed regime changes, ~0.1% of ticks), not
- * every tick.
- *
- * Soft Dirichlet updates only when:
- *   if (sprt_regime != old_sprt_regime)
- *       dirichlet_transition_update(...)
- *
- * This works because regime changes are HIGH SIGNAL events that actually
- * inform us about transition dynamics.
- *
- * WHY ONLINE VI (PER-TICK) FAILED:
- * ─────────────────────────────────────────────────────────────────────────────
- * Per-tick VI updates are dominated by STATUS QUO:
- *   - 99%+ of ticks: particles stay in current regime
- *   - VI computes ξ_ij ∝ P(s_{t-1}=i) × P(s_t=j|...) × likelihood
- *   - Since most particles stay put, ξ_calm→calm ≈ 0.95
- *   - VI learns "particles stay put" → increases α on diagonal
- *   - Positive feedback → α grows unbounded → FOSSILIZATION
- *   - Filter becomes stuck in dominant regime, ignores crises
- *
- * Even with:
- *   - Heartbeat resets (only resets ρ, not accumulated α)
- *   - Learning rate floors (α is still an ocean of counts)
- *   - Surprise-modulated resets (adds MORE heuristics)
- *
- * The fundamental problem is architectural, not parametric.
- *
- * COMPARISON:
- * ─────────────────────────────────────────────────────────────────────────────
- * | Approach              | Update Frequency    | Signal Quality | Result     |
- * |-----------------------|---------------------|----------------|------------|
- * | Soft Dirichlet        | On regime change    | High (rare)    | ✅ Works   |
- * | Online VI (per-tick)  | Every tick          | Low (noise)    | ❌ Stuck   |
- *
- * WHEN ONLINE VI IS APPROPRIATE:
- * ─────────────────────────────────────────────────────────────────────────────
- * Online VI (online_vi_transition.c) is still useful as a RECEIVER of
- * PGAS-learned Π via Lifeboat injection:
- *
- *   - Slow tick thread: PGAS learns true Π from batch data
- *   - Lifeboat injects: online_vi_reset_from_hdp(vi, pgas_trans, confidence)
- *   - VI provides: trans_var for Kelly sizing, row_entropy for PGAS triggers
- *
- * The online_vi_transition.c module is solid code. Just NEVER call
- * online_vi_update() from the live tick path. Use it only to:
- *   1. Receive PGAS injections (online_vi_reset_from_hdp)
- *   2. Query uncertainty (online_vi_get_variance, online_vi_get_row_entropy)
- *
- * The LUT should be updated by:
- *   - Soft Dirichlet on SPRT regime change (rare, informative)
- *   - Lifeboat injection of PGAS-learned Π (slow tick, batch-learned)
- *   - NEVER by per-tick VI updates
- *═══════════════════════════════════════════════════════════════════════════════*/
-
 /*─────────────────────────────────────────────────────────────────────────────
- * COMPUTE OUTPUTS
+ * REBUILD TRANSITION LUT FROM DIRICHLET
+ *
+ * Made non-static so Extended layer can call it after Dirichlet updates.
  *───────────────────────────────────────────────────────────────────────────*/
 
 /**
@@ -97,7 +53,7 @@
  * The RBPF uses a uint8_t[regime][1024] LUT for fast transition sampling.
  * This function rebuilds it from the current Dirichlet posterior.
  */
-static void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
+void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
 {
     const int n_regimes = rbpf->n_regimes;
     const DirichletTransition *dt = &rbpf->trans_prior;
@@ -129,6 +85,10 @@ static void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
         }
     }
 }
+
+/*─────────────────────────────────────────────────────────────────────────────
+ * COMPUTE OUTPUTS
+ *───────────────────────────────────────────────────────────────────────────*/
 
 void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
                               RBPF_KSC_Output *out)
@@ -229,13 +189,14 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     out->dominant_regime = dom;
 
     /*========================================================================
-     * SPRT REGIME DETECTION + DIRICHLET TRANSITION LEARNING
+     * SPRT REGIME DETECTION
      *
      * Computes per-regime observation log-likelihoods P(y | regime_k)
      * using the OCSN (2007) log-χ² mixture model, then delegates to
      * sprt_multi_update() for pairwise hypothesis testing.
      *
-     * If learning enabled, updates Dirichlet prior on regime changes.
+     * NOTE: Dirichlet transition learning is now handled by the Extended
+     * layer to maintain separation between math and policy.
      *======================================================================*/
 
     RBPF_Detection *det = &rbpf->detection;
@@ -251,32 +212,8 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
         log_liks[r] = sprt_logchisq_loglik(y_obs, h_regime);
     }
 
-    /* Save current regime before update */
-    int old_sprt_regime = det->stable_regime;
-
     /* Update SPRT module - handles pairwise tests and regime switching */
     int sprt_regime = sprt_multi_update(&rbpf->sprt, log_liks);
-
-    /* ═══════════════════════════════════════════════════════════════════════
-     * SOFT DIRICHLET TRANSITION LEARNING
-     *
-     * Learn from SPRT-confirmed regime changes ONLY.
-     * This is the ONLY place where we update the transition prior.
-     * The prior encodes geometry (nearby regimes more likely) and
-     * adapts based on observed market dynamics.
-     *
-     * KEY INSIGHT: Updates on RARE BUT INFORMATIVE events (~0.1% of ticks).
-     * This is why Soft Dirichlet works while per-tick Online VI fails.
-     * See design notes at top of file for detailed explanation.
-     * ═══════════════════════════════════════════════════════════════════════*/
-    if (rbpf->trans_prior_enabled && sprt_regime != old_sprt_regime)
-    {
-        /* SPRT confirmed a regime change - learn from it */
-        dirichlet_transition_update(&rbpf->trans_prior, old_sprt_regime, sprt_regime);
-
-        /* Rebuild the LUT so future transitions use learned probabilities */
-        rbpf_rebuild_trans_lut_from_dirichlet(rbpf);
-    }
 
     out->smoothed_regime = sprt_regime;
     det->stable_regime = sprt_regime;
@@ -303,40 +240,33 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     }
     out->regime_entropy = entropy;
 
-    /* Vol ratio (vs EMA) */
+    /* Vol ratio (vs EMA) - raw signal, no threshold */
     det->vol_ema_short = RBPF_REAL(0.1) * out->vol_mean + RBPF_REAL(0.9) * det->vol_ema_short;
     det->vol_ema_long = RBPF_REAL(0.01) * out->vol_mean + RBPF_REAL(0.99) * det->vol_ema_long;
     out->vol_ratio = det->vol_ema_short / (det->vol_ema_long + RBPF_REAL(1e-10));
 
     /*========================================================================
-     * REGIME CHANGE DETECTION
+     * REGIME CHANGE DETECTION - REMOVED
+     *
+     * Policy decisions are now made by the Extended layer based on:
+     *   1. P² Circuit Breaker (data-driven tail detection)
+     *   2. SPRT transitions (hypothesis testing)
+     *
+     * The fields out->regime_changed and out->change_type are set by
+     * rbpf_ext_step(), not here.
+     *
+     * This removes the hardcoded thresholds:
+     *   - vol_shock: 1.8x / 0.5x (asset-dependent, was a heuristic)
+     *   - surprised: 5.0 nats (arbitrary, now replaced by P²)
+     *   - structural: 0.7 probability (arbitrary)
+     *
+     * The Extended layer uses empirical (P²) and statistical (SPRT) methods
+     * instead of these magic numbers.
      *======================================================================*/
 
+    /* Initialize to zero - Extended layer will set these */
     out->regime_changed = 0;
     out->change_type = 0;
-
-    if (det->cooldown > 0)
-    {
-        det->cooldown--;
-    }
-    else
-    {
-        /* Structural: regime flipped with high confidence */
-        int structural = (dom != det->prev_regime) && (max_prob > RBPF_REAL(0.7));
-
-        /* Vol shock: >80% increase or >50% decrease */
-        int vol_shock = (out->vol_ratio > 1.8f) || (out->vol_ratio < RBPF_REAL(0.5));
-
-        /* Surprise: observation unlikely under model */
-        int surprised = (out->surprise > RBPF_REAL(5.0));
-
-        if (structural || vol_shock || surprised)
-        {
-            out->regime_changed = 1;
-            out->change_type = structural ? 1 : (vol_shock ? 2 : 3);
-            det->cooldown = 20;
-        }
-    }
 
     det->prev_regime = dom;
 

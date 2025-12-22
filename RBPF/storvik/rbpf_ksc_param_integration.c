@@ -19,6 +19,8 @@
 
 #include "rbpf_ksc_param_integration.h"
 #include "rbpf_fixed_lag_smoother.h"
+#include "rbpf_sprt.h"
+#include "rbpf_dirichlet_transition.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -419,6 +421,9 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     ext->last_outlier_fraction = RBPF_REAL(0.0);
     ext->structural_break_signaled = 0;
 
+    /* Policy engine state */
+    ext->prev_sprt_regime = 0;
+
     rbpf_adaptive_forgetting_init(&ext->adaptive_forgetting);
 
     return ext;
@@ -483,6 +488,8 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
     }
     ext->cooldown_remaining = 0;
 
+    /* Initialize policy engine state */
+    ext->prev_sprt_regime = 0; /* Start in regime 0 (typically calm) */
     ext->structural_break_signaled = 0;
 }
 
@@ -599,6 +606,86 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
             }
         }
         rbpf_adaptive_forgetting_update(ext, marginal_lik, dominant_regime);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * PHASE 5.5: POLICY ENGINE (Regime Change Detection)
+     *
+     * The Extended layer owns the decision logic. Core only computes signals.
+     *
+     * Two independent detectors:
+     *   1. P² Circuit Breaker: "Tail event - old world is dead"
+     *   2. SPRT Transition: "Statistically confirmed regime flip"
+     *
+     * P² fires on 99.9th percentile surprise (data-driven, no heuristics).
+     * SPRT fires on accumulated log-likelihood evidence.
+     *
+     * When P² fires, we synchronize SPRT with the particle filter's
+     * dominant regime to prevent "ghost evidence" fighting the new reality.
+     *
+     * NOTE: Must run AFTER adaptive forgetting (which sets P² flag for
+     * THIS tick) but BEFORE Storvik (which needs structural_break_signaled).
+     *═══════════════════════════════════════════════════════════════════════*/
+    {
+        int p2_tail_event = rbpf_ext_structural_break_detected(ext);
+        int sprt_flip = (output->smoothed_regime != ext->prev_sprt_regime);
+
+        if (p2_tail_event)
+        {
+            /*───────────────────────────────────────────────────────────────
+             * PATH 1: UNPRECEDENTED SURPRISE (Circuit Breaker)
+             *
+             * The P² algorithm says this tick is in the extreme tail.
+             * The old world model is dead. Full reset.
+             *───────────────────────────────────────────────────────────────*/
+            output->regime_changed = 1;
+            output->change_type = 1; /* Tail event */
+
+            /* Synchronize SPRT with reality:
+             * - Reset accumulated evidence (no "ghost" from old regime)
+             * - Force to particle filter's dominant regime
+             * - SPRT now validates the NEW regime instead of fighting it */
+            sprt_multi_force_regime(&rbpf->sprt, output->dominant_regime);
+
+            /* Signal smoother for emergency flush (if enabled) */
+            ext->structural_break_signaled = 1;
+
+            /* Update our tracking */
+            ext->prev_sprt_regime = output->dominant_regime;
+        }
+        else if (sprt_flip)
+        {
+            /*───────────────────────────────────────────────────────────────
+             * PATH 2: STATISTICAL TRANSITION (Drift/Regime Switch)
+             *
+             * SPRT has accumulated enough evidence to confirm a regime
+             * change. This is a "normal" transition - learn from it.
+             *───────────────────────────────────────────────────────────────*/
+            output->regime_changed = 1;
+            output->change_type = 2; /* SPRT transition */
+
+            /* Learn from this transition (Soft Dirichlet update) */
+            if (rbpf->trans_prior_enabled)
+            {
+                dirichlet_transition_update(&rbpf->trans_prior,
+                                            ext->prev_sprt_regime,
+                                            output->smoothed_regime);
+                rbpf_rebuild_trans_lut_from_dirichlet(rbpf);
+            }
+
+            /* Update tracking */
+            ext->prev_sprt_regime = output->smoothed_regime;
+        }
+        else
+        {
+            /*───────────────────────────────────────────────────────────────
+             * PATH 3: STEADY STATE
+             *
+             * Normal operation. No regime change detected.
+             *───────────────────────────────────────────────────────────────*/
+            output->regime_changed = 0;
+            output->change_type = 0;
+        }
     }
 
     /*═══════════════════════════════════════════════════════════════════════
