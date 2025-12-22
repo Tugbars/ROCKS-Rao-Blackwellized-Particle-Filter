@@ -64,13 +64,14 @@ if(RBPF_ENABLE_STORVIK)
         storvik/rbpf_adaptive_forgetting.c
         storvik/rbpf_fixed_lag_smoother.c 
 
+        storvik/rbpf_ksc_param_integration.c      # Core: lifecycle, step, config
+        storvik/rbpf_ext_hawkes.c                 # Hawkes + Robust OCSN + Presets
+        storvik/rbpf_ext_smoothed_storvik.c       # PARIS smoothed Storvik
+
          ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/paris_mkl.c
         
         # Robust OCSN likelihood
         ocsn/rbpf_ocsn_robust.c
-        
-        # Integration layer (rbpf_ext_* functions for MMPF)
-        rbpf_ksc_param_integration.c
         
         # Tuner
         tuner/rbpf_tuner.c
@@ -355,8 +356,10 @@ set(ROCKS_HEADERS
 # Storvik and related headers
 if(RBPF_ENABLE_STORVIK)
     list(APPEND ROCKS_HEADERS
-        rbpf_ksc_param_integration.h
+        storvik/rbpf_ksc_param_integration.h
         storvik/rbpf_param_learn.h
+        storvik/rbpf_adaptive_forgetting.h
+        storvik/p2_quantile.h
         storvik/rbpf_fixed_lag_smoother.h
         tuner/rbpf_tuner.h
         preprocess/rbpf_preprocess.h
