@@ -9,11 +9,16 @@
  *   - Global tick-skip for 90% duty cycle reduction
  *   - Aligned memory for AVX-512
  *
- * Adaptive Forgetting (NEW):
+ * Adaptive Forgetting:
  *   - Source: RiskMetrics (1996), West & Harrison (1997)
  *   - Prevents model fossilization by discounting sufficient statistics
  *   - N_eff ≈ 1/(1-λ) where λ is the discount factor
  *   - Regime-adaptive forgetting rates supported
+ *
+ * Smoothed-Only Architecture (NEW - Session 14):
+ *   - param_learn_reset_to_priors() for structural break handling
+ *   - λ derived from transition matrix (no magic numbers)
+ *   - Compatible with PARIS-smoothed Storvik updates
  *
  * Target: P99 < 25μs (down from 60μs)
  *
@@ -85,12 +90,12 @@ typedef PARAM_LEARN_REAL param_real;
 
     typedef struct
     {
-        param_real m;
-        param_real kappa;
-        param_real alpha;
-        param_real beta;
-        param_real phi;
-        param_real sigma_prior;
+        param_real m;           /* Prior mean for μ */
+        param_real kappa;       /* Prior precision for μ (pseudo-observations) */
+        param_real alpha;       /* Inverse-Gamma shape for σ² */
+        param_real beta;        /* Inverse-Gamma scale for σ² */
+        param_real phi;         /* AR(1) persistence (fixed, not learned) */
+        param_real sigma_prior; /* Prior guess for σ (for initialization) */
 
         /* Precomputed (avoid division on hot path) */
         param_real one_minus_phi;
@@ -105,7 +110,7 @@ typedef PARAM_LEARN_REAL param_real;
      * OPTIMIZATION: Instead of copying 7 arrays back after resampling,
      * write to inactive buffer and swap pointers.
      *
-     * Layout: array[particle_idx * n_regimes + regime_idx]
+     * Layout: array[regime_idx * n_particles + particle_idx]
      *═══════════════════════════════════════════════════════════════════════════*/
 
 /* Force inline for hot path */
@@ -240,13 +245,18 @@ typedef PARAM_LEARN_REAL param_real;
         param_real forgetting_alpha_floor; /* Min alpha to keep proper (default: 3.0) */
 
         /*─────────────────────────────────────────────────────────────────────────
-         * REGIME-ADAPTIVE FORGETTING (Optional)
+         * REGIME-ADAPTIVE FORGETTING
          *
          * Different decay rates per regime for asymmetric learning:
          *   R0 (calm):   High λ (slow forgetting) → trust historical params
          *   R3 (crisis): Low λ (fast forgetting) → adapt quickly
          *
          * Creates desirable behavior: stable in calm, adaptive in crisis.
+         *
+         * SESSION 14 UPDATE: Can now be derived from transition matrix:
+         *   λ_r = 1 - 1/(α × E[dwell_r])
+         *   E[dwell_r] = 1 / (1 - P_stay)
+         * See: rbpf_ext_compute_forgetting_from_transitions()
          *───────────────────────────────────────────────────────────────────────*/
         bool enable_regime_adaptive_forgetting;
         param_real forgetting_lambda_regime[PARAM_LEARN_MAX_REGIMES];
@@ -329,7 +339,9 @@ typedef PARAM_LEARN_REAL param_real;
         int ticks_since_full_update;
         bool force_next_update; /* Set by triggers to override skip */
 
-        /* Diagnostics */
+        /*─────────────────────────────────────────────────────────────────────────
+         * DIAGNOSTICS
+         *───────────────────────────────────────────────────────────────────────*/
         uint64_t total_stat_updates;
         uint64_t total_samples_drawn;
         uint64_t samples_skipped_load;
@@ -340,6 +352,14 @@ typedef PARAM_LEARN_REAL param_real;
         /* Forgetting diagnostics */
         uint64_t forgetting_floor_hits_kappa; /* Times kappa hit floor */
         uint64_t forgetting_floor_hits_alpha; /* Times alpha hit floor */
+
+        /*─────────────────────────────────────────────────────────────────────────
+         * RESET STATISTICS (Session 14 - Smoothed-Only Architecture)
+         *
+         * Tracks how often priors are reset due to structural breaks.
+         * High reset count may indicate model mismatch or extreme volatility.
+         *───────────────────────────────────────────────────────────────────────*/
+        uint64_t total_resets; /* reset_to_priors() calls */
 
     } ParamLearner;
 
@@ -476,6 +496,15 @@ typedef PARAM_LEARN_REAL param_real;
     void param_learn_set_regime_forgetting(ParamLearner *learner, int regime, param_real lambda);
 
     /**
+     * Get forgetting lambda for a regime
+     *
+     * @param learner  Parameter learner
+     * @param regime   Regime index
+     * @return         Lambda value, or 1.0 if forgetting disabled
+     */
+    param_real param_learn_get_regime_forgetting(const ParamLearner *learner, int regime);
+
+    /**
      * Get effective sample size for a regime
      *
      * N_eff ≈ 1/(1-λ) for exponential forgetting.
@@ -487,14 +516,41 @@ typedef PARAM_LEARN_REAL param_real;
      */
     param_real param_learn_get_effective_sample_size(const ParamLearner *learner, int regime);
 
-    /**
-     * Get forgetting lambda for a regime
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API: Reset to Priors (Session 14 - Smoothed-Only Architecture)
      *
-     * @param learner  Parameter learner
-     * @param regime   Regime index
-     * @return         Lambda value, or 1.0 if forgetting disabled
+     * Called during structural break (P² circuit breaker fires).
+     * Eliminates "arrogance" from old regime by resetting sufficient statistics
+     * to their prior values.
+     *
+     * After reset:
+     *   - m, κ, α, β return to prior values for all particles
+     *   - Posterior precision is minimal (maximally uncertain)
+     *   - Model ready to learn quickly from new regime
+     *
+     * The smoother will then warm-start with smoothed data from the buffer.
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Reset all sufficient statistics to prior values
+     *
+     * Use case: Structural break detected, old parameters are invalid.
+     * This eliminates the "arrogant" precision accumulated in the old regime.
+     *
+     * @param learner   Storvik learner handle
      */
-    param_real param_learn_get_forgetting_lambda(const ParamLearner *learner, int regime);
+    void param_learn_reset_to_priors(ParamLearner *learner);
+
+    /**
+     * Print reset and forgetting statistics
+     *
+     * Shows:
+     *   - Total reset_to_priors() calls
+     *   - Per-regime λ values and effective memory
+     *
+     * @param learner   Storvik learner handle
+     */
+    void param_learn_print_reset_stats(const ParamLearner *learner);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API: Diagnostics

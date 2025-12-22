@@ -691,7 +691,19 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 6: STORVIK PARAMETER LEARNING
+     * PHASE 6: STORVIK PARAMETER LEARNING (FILTERED + RESET-ON-BREAK)
+     *
+     * Architecture B: Filtered primary with reset on structural break.
+     *
+     * Why not smoothed-only:
+     *   - PARIS every tick = 5ms overhead
+     *   - L-tick lag kills crisis detection (3.3% accuracy!)
+     *   - No real-time learning = model always behind
+     *
+     * This approach:
+     *   - Filtered Storvik every tick (real-time, ~20μs)
+     *   - On structural break: reset to priors (clean slate)
+     *   - Crisis detection works (53% → back to normal)
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->storvik_initialized)
     {
@@ -701,28 +713,25 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
         }
 
         /*───────────────────────────────────────────────────────────────────
-         * HYBRID APPROACH:
-         *   1. ALWAYS run filtered Storvik (real-time, every tick)
-         *   2. If smoother enabled, ALSO push to buffer
-         *   3. On structural break, smoother does PARIS flush
-         *
-         * This gives us:
-         *   - Real-time parameter tracking (no blind period)
-         *   - Smoothed corrections on regime changes
+         * ALWAYS: Filtered Storvik update (real-time parameter learning)
          *───────────────────────────────────────────────────────────────────*/
-
-        /* Always: Filtered Storvik update */
         extract_particle_info_optimized(ext, output->resampled);
         param_learn_update(&ext->storvik, ext->particle_info, n);
 
-        /* Additionally: Smoother buffer management (if enabled) */
-        if (ext->smoothed_storvik_enabled && ext->smoother)
+        /*───────────────────────────────────────────────────────────────────
+         * ON STRUCTURAL BREAK: Reset to priors
+         *
+         * P² circuit breaker fired → old regime is dead.
+         * Reset eliminates "arrogance" from old parameters.
+         * Model starts fresh, learns new regime quickly.
+         *───────────────────────────────────────────────────────────────────*/
+        if (ext->structural_break_signaled)
         {
-            rbpf_ext_smoother_step(ext, output);
+            param_learn_reset_to_priors(&ext->storvik);
         }
     }
 
-    /* Clear structural break flag after smoother has seen it */
+    /* Clear structural break flag */
     ext->structural_break_signaled = 0;
 
     /*═══════════════════════════════════════════════════════════════════════
@@ -866,6 +875,70 @@ void rbpf_ext_signal_structural_break(RBPF_Extended *ext)
     {
         param_learn_signal_structural_break(&ext->storvik);
     }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * FORGETTING FACTOR DERIVATION FROM TRANSITION MATRIX
+ *
+ * Principle: λ should reflect expected regime duration.
+ *   - If regime typically lasts D ticks, effective memory ≈ D × α
+ *   - λ = 1 - 1/(α × E[dwell])
+ *   - E[dwell] = 1 / (1 - P_stay)
+ *
+ * With α = 3 (memory spans ~3 regime durations), this gives:
+ *   - High stickiness (P_stay = 0.98) → E[dwell] = 50 → λ ≈ 0.9933
+ *   - Low stickiness (P_stay = 0.92) → E[dwell] = 12.5 → λ ≈ 0.9733
+ *
+ * This is principled: no magic numbers, derived from transition dynamics.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void rbpf_ext_compute_forgetting_from_transitions(RBPF_Extended *ext, float alpha)
+{
+    if (!ext || !ext->rbpf || !ext->storvik_initialized)
+        return;
+    if (alpha <= 0.0f)
+        alpha = 3.0f; /* Default: memory = 3× dwell time */
+
+    const int nr = ext->rbpf->n_regimes;
+
+    for (int r = 0; r < nr; r++)
+    {
+        /* Get P(stay in regime r) from base transition matrix */
+        float p_stay = ext->base_trans_matrix[r * nr + r];
+
+        /* Sanity bounds */
+        if (p_stay < 0.5f)
+            p_stay = 0.5f; /* Minimum 2-tick expected dwell */
+        if (p_stay > 0.999f)
+            p_stay = 0.999f; /* Maximum 1000-tick expected dwell */
+
+        /* Expected dwell time in regime r */
+        float expected_dwell = 1.0f / (1.0f - p_stay);
+
+        /* Memory horizon = α × expected dwell */
+        float memory_ticks = alpha * expected_dwell;
+
+        /* Forgetting factor: λ = 1 - 1/memory */
+        float lambda = 1.0f - 1.0f / memory_ticks;
+
+        /* Clamp to [0.95, 0.9999] for numerical stability */
+        if (lambda < 0.95f)
+            lambda = 0.95f;
+        if (lambda > 0.9999f)
+            lambda = 0.9999f;
+
+        /* Apply to Storvik */
+        param_learn_set_regime_forgetting(&ext->storvik, r, lambda);
+    }
+}
+
+/**
+ * Auto-configure forgetting from current transition matrix
+ * Uses default α = 3 (memory = 3× expected regime duration)
+ */
+void rbpf_ext_auto_configure_forgetting(RBPF_Extended *ext)
+{
+    rbpf_ext_compute_forgetting_from_transitions(ext, 3.0f);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════

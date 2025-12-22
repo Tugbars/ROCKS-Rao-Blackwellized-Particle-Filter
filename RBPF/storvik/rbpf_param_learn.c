@@ -1516,3 +1516,169 @@ void param_learn_get_regime_summary(const ParamLearner *learner, int regime,
             *total_obs = obs;
     }
 }
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * RESET TO PRIORS (Session 14 - Smoothed-Only Architecture)
+ *
+ * Called during structural break (P² circuit breaker fires).
+ * Eliminates "arrogance" from old regime by resetting sufficient statistics
+ * to their prior values.
+ *
+ * After reset:
+ *   - m, κ, α, β return to prior values for all particles
+ *   - Posterior precision is minimal (maximally uncertain)
+ *   - Model ready to learn quickly from new regime
+ *
+ * The smoother will then warm-start with smoothed data from the buffer.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void param_learn_reset_to_priors(ParamLearner *learner)
+{
+    if (!learner) return;
+    
+    const int np = learner->n_particles;
+    const int nr = learner->n_regimes;
+    
+    StorvikSoA *soa = param_learn_get_active_soa(learner);
+    if (!soa) return;
+    
+    /*───────────────────────────────────────────────────────────────────────
+     * Reset sufficient statistics for all particles and regimes
+     *
+     * For each regime r:
+     *   - Reset (m, kappa, alpha, beta) to prior values
+     *   - Reset cached (mu, sigma) to prior means
+     *   - Clear observation counters
+     *───────────────────────────────────────────────────────────────────────*/
+    for (int r = 0; r < nr; r++) {
+        const RegimePrior *prior = &learner->priors[r];
+        
+        /* Prior sufficient statistics */
+        param_real m_0      = prior->m;
+        param_real kappa_0  = prior->kappa;
+        param_real alpha_0  = prior->alpha;
+        param_real beta_0   = prior->beta;
+        param_real sigma_0  = prior->sigma_prior;
+        param_real sigma2_0 = sigma_0 * sigma_0;
+        
+        for (int i = 0; i < np; i++) {
+            /* CORRECT INDEXING: particle_idx * n_regimes + regime */
+            int idx = i * nr + r;
+            
+            /* Reset sufficient statistics to priors */
+            soa->m[idx]     = m_0;
+            soa->kappa[idx] = kappa_0;
+            soa->alpha[idx] = alpha_0;
+            soa->beta[idx]  = beta_0;
+            
+            /* Reset cached parameter values to prior means */
+            soa->mu_cached[idx]     = m_0;
+            soa->sigma_cached[idx]  = sigma_0;
+            soa->sigma2_cached[idx] = sigma2_0;
+            
+            /* Reset counters */
+            soa->n_obs[idx] = 0;
+            soa->ticks_since_sample[idx] = 0;
+        }
+    }
+    
+    /* Clear structural break flag (we just handled it) */
+    learner->structural_break_flag = false;
+    
+    /* Increment reset counter for diagnostics */
+    learner->total_resets++;
+    
+    /* Force next update to run (don't skip after reset) */
+    learner->force_next_update = true;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * GET REGIME FORGETTING FACTOR (wrapper for existing function)
+ *
+ * This provides the API expected by smoothed-only architecture.
+ * Uses param_learn_get_forgetting_lambda() internally.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+param_real param_learn_get_regime_forgetting(const ParamLearner *learner, int regime)
+{
+    /* Use existing function */
+    return param_learn_get_forgetting_lambda(learner, regime);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * PRINT RESET STATISTICS
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void param_learn_print_reset_stats(const ParamLearner *learner)
+{
+    if (!learner) return;
+    
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  Storvik Reset Statistics\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  Total resets to priors: %llu\n", 
+           (unsigned long long)learner->total_resets);
+    printf("\n");
+    printf("  Per-regime forgetting factors:\n");
+    for (int r = 0; r < learner->n_regimes; r++) {
+        param_real lambda = param_learn_get_forgetting_lambda(learner, r);
+        param_real eff_memory = 1.0 / (1.0 - lambda + 1e-10);
+        printf("    Regime %d: λ = %.4f (effective memory: %.1f ticks)\n",
+               r, (double)lambda, (double)eff_memory);
+    }
+    printf("═══════════════════════════════════════════════════════════════\n");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
