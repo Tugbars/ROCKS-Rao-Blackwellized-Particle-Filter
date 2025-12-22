@@ -1134,10 +1134,10 @@ void rbpf_ext_enable_kl_tempering(RBPF_Extended *ext)
     /* Enable deferred weight mode on underlying RBPF */
     rbpf_ksc_set_deferred_weight_mode(ext->rbpf, 1);
 
-    /* Initialize KL state if not already done */
+    /* Re-initialize KL state if it exists */
     if (ext->kl_state)
     {
-        rbpf_kl_state_reset(ext->kl_state);
+        rbpf_kl_init(ext->kl_state, ext->rbpf->n_particles);
     }
 }
 
@@ -1175,7 +1175,7 @@ uint64_t rbpf_ext_get_zombie_resets(const RBPF_Extended *ext)
 {
     if (!ext || !ext->kl_state)
         return 0;
-    return ext->kl_state->zombie_reset_count;
+    return ext->kl_state->zombie_resets;
 }
 
 void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext)
@@ -1196,8 +1196,7 @@ void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext)
     {
         RBPF_KL_State *kl = ext->kl_state;
 
-        printf("  Particles:         %d\n", kl->n_particles);
-        printf("  KL ceiling:        %.4f nats (log N)\n", kl->max_kl);
+        printf("  KL ceiling:        %.4f nats (log N)\n", kl->kl_ceiling);
         printf("  Beta floor:        %.2f\n", kl->beta_floor);
         printf("\n");
         printf("  Last tick:\n");
@@ -1211,21 +1210,25 @@ void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext)
                kl->hard_clamp_count,
                kl->ticks_processed > 0 ? 100.0 * kl->hard_clamp_count / kl->ticks_processed : 0.0);
         printf("    Soft dampens:    %" PRIu64 " (%.3f%%)\n",
-               kl->soft_dampen_count,
-               kl->ticks_processed > 0 ? 100.0 * kl->soft_dampen_count / kl->ticks_processed : 0.0);
-        printf("    Zombie resets:   %" PRIu64 "\n", kl->zombie_reset_count);
+               kl->soft_damp_count,
+               kl->ticks_processed > 0 ? 100.0 * kl->soft_damp_count / kl->ticks_processed : 0.0);
+        printf("    Zombie resets:   %" PRIu64 "\n", kl->zombie_resets);
         printf("\n");
         printf("  Zombie state:\n");
         printf("    Consecutive low: %d / %d\n",
-               kl->consecutive_low_beta, kl->zombie_threshold);
+               kl->consecutive_damped_ticks, kl->max_damped_before_reset);
         printf("    Currently zombie: %s\n",
-               kl->consecutive_low_beta >= kl->zombie_threshold ? "YES" : "NO");
+               kl->consecutive_damped_ticks >= kl->max_damped_before_reset ? "YES" : "NO");
         printf("\n");
         printf("  P² Quantile (p95):\n");
-        printf("    Warmup:          %s (%" PRIu64 " / %d)\n",
+        printf("    Warmup:          %s (%" PRIu64 " ticks)\n",
                kl->warmup_complete ? "COMPLETE" : "IN PROGRESS",
-               kl->ticks_processed, kl->warmup_ticks);
+               kl->ticks_processed);
         printf("    Current p95:     %.4f nats\n", kl->kl_p95);
+        printf("\n");
+        printf("  Extremes:\n");
+        printf("    Min beta seen:   %.4f\n", kl->min_beta_seen);
+        printf("    Max KL seen:     %.4f nats\n", kl->max_kl_seen);
     }
     else if (!ext->kl_tempering_enabled)
     {
