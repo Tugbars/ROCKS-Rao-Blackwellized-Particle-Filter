@@ -15,6 +15,7 @@ option(RBPF_BUILD_TESTS "Build test executables" ON)
 option(RBPF_ENABLE_STORVIK "Enable Sleeping Storvik parameter learning" ON)
 option(MMPF_ENABLE_MCMC "Enable MCMC particle teleportation" ON)
 option(RBPF_ENABLE_HDP_BEAM "Enable Sticky HDP-HMM Beam Sampling" ON)
+option(RBPF_ENABLE_ONLINE_VI "Enable Online VI transition learning" ON)
 
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -50,10 +51,36 @@ set(ROCKS_SOURCES
     rao-blackwellized/rbpf_ksc_init.c
     rao-blackwellized/rbpf_ksc_output.c
     rao-blackwellized/rbpf_ksc_student_t.c
+    rao-blackwellized/rbpf_kl_tempering.c
     
     # Adaptive components
     rao-blackwellized/rbpf_silverman.c   # Silverman bandwidth for regularization
     rao-blackwellized/rbpf_sprt.c        # SPRT regime detection
+)
+
+#───────────────────────────────────────────────────────────────────────────────
+# Online VI Transition Learning
+#
+# Replaces discrete Dirichlet updates with per-tick variational inference.
+# Provides:
+#   - Var[π_ij] for Kelly sizing
+#   - Row entropy H[π_i] for PGAS triggers
+#   - Geometric mean for correct LUT generation
+#   - Skeptical safeguards (ρ floor, heartbeat reset, logsumexp stability)
+#───────────────────────────────────────────────────────────────────────────────
+
+if(RBPF_ENABLE_ONLINE_VI)
+    list(APPEND ROCKS_SOURCES
+        Online-VI/online_vi_transition.c
+    )
+endif()
+
+#───────────────────────────────────────────────────────────────────────────────
+# Soft Dirichlet Transition Learning (legacy, kept for testing/comparison)
+#───────────────────────────────────────────────────────────────────────────────
+
+list(APPEND ROCKS_SOURCES
+    soft_dirichlet/soft_dirichlet_transition.c
 )
 
 # Add Storvik parameter learning and related modules if enabled
@@ -68,7 +95,7 @@ if(RBPF_ENABLE_STORVIK)
         storvik/rbpf_ext_hawkes.c                 # Hawkes + Robust OCSN + Presets
         storvik/rbpf_ext_smoothed_storvik.c       # PARIS smoothed Storvik
 
-         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/paris_mkl.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/paris_mkl.c
         
         # Robust OCSN likelihood
         ocsn/rbpf_ocsn_robust.c
@@ -119,8 +146,10 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
         ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam
+        ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI
+        ${CMAKE_CURRENT_SOURCE_DIR}/soft_dirichlet
         ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
-        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS 
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS
 )
 
 target_link_libraries(rocks 
@@ -144,6 +173,10 @@ if(MMPF_ENABLE_MCMC)
     target_compile_definitions(rocks PUBLIC MMPF_ENABLE_MCMC=1)
 endif()
 
+if(RBPF_ENABLE_ONLINE_VI)
+    target_compile_definitions(rocks PUBLIC RBPF_ENABLE_ONLINE_VI=1)
+endif()
+
 # Alias for backward compatibility
 add_library(rbpf_ksc ALIAS rocks)
 
@@ -152,6 +185,19 @@ add_library(rbpf_ksc ALIAS rocks)
 #───────────────────────────────────────────────────────────────────────────────
 
 if(RBPF_BUILD_TESTS)
+
+    #───────────────────────────────────────────────────────────────────────────
+    # Online VI Tests (disabled - clock_gettime not available on Windows)
+    #───────────────────────────────────────────────────────────────────────────
+
+    # if(RBPF_ENABLE_ONLINE_VI AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI/test_vi_vs_dirichlet.c)
+    #     add_executable(test_vi_vs_dirichlet
+    #         ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI/test_vi_vs_dirichlet.c
+    #     )
+    #     target_link_libraries(test_vi_vs_dirichlet PRIVATE rocks)
+    #     target_compile_options(test_vi_vs_dirichlet PRIVATE ${COMMON_FLAGS})
+    #     target_compile_definitions(test_vi_vs_dirichlet PRIVATE ${COMMON_DEFS})
+    # endif()
 
     #───────────────────────────────────────────────────────────────────────────
     # MMPF-level tests
@@ -349,8 +395,21 @@ set(ROCKS_HEADERS
     rao-blackwellized/rbpf_ksc.h
     rao-blackwellized/rbpf_silverman.h
     rao-blackwellized/rbpf_sprt.h
+    rao-blackwellized/rbpf_kl_tempering.h
     rbpf_fisher_rao.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.h
+)
+
+# Online VI headers
+if(RBPF_ENABLE_ONLINE_VI)
+    list(APPEND ROCKS_HEADERS
+        Online-VI/online_vi_transition.h
+    )
+endif()
+
+# Soft Dirichlet headers (legacy, kept for testing)
+list(APPEND ROCKS_HEADERS
+    soft_dirichlet/soft_dirichlet_transition.h
 )
 
 # Storvik and related headers

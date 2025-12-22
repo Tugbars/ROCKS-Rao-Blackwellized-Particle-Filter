@@ -114,6 +114,17 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     /* Silverman bandwidth scratch buffer */
     rbpf->silverman_scratch = aligned_alloc_real(n);
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * KL TEMPERING BUFFER
+     *
+     * Stores log-likelihood increments for deferred weight application.
+     * When deferred_weight_mode=1, rbpf_ksc_update() stores increments here
+     * but does NOT apply them. The Extended layer then computes KL divergence
+     * and applies tempered weights: log_weight += β × log_lik_increment
+     *═══════════════════════════════════════════════════════════════════════*/
+    rbpf->log_lik_increment = aligned_alloc_real(n);
+    rbpf->deferred_weight_mode = 0; /* Default: immediate weight application */
+
     /* Check allocations */
     if (!rbpf->mu || !rbpf->var || !rbpf->regime || !rbpf->log_weight ||
         !rbpf->mu_tmp || !rbpf->var_tmp || !rbpf->regime_tmp ||
@@ -123,11 +134,14 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
         !rbpf->w_norm || !rbpf->cumsum || !rbpf->mu_accum || !rbpf->var_accum ||
         !rbpf->scratch1 || !rbpf->scratch2 || !rbpf->indices ||
         !rbpf->log_lik_buffer || !rbpf->max_log_lik || !rbpf->rng_gaussian ||
-        !rbpf->silverman_scratch)
+        !rbpf->silverman_scratch || !rbpf->log_lik_increment)
     {
         rbpf_ksc_destroy(rbpf);
         return NULL;
     }
+
+    /* Zero the KL tempering buffer */
+    memset(rbpf->log_lik_increment, 0, n * sizeof(rbpf_real_t));
 
     /* Initialize RNG */
     for (int t = 0; t < rbpf->n_threads; t++)
@@ -172,9 +186,9 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
 
     /* SPRT regime detection - use dedicated module */
     sprt_multi_init(&rbpf->sprt, n_regimes, 0.01, 0.01, 3);
-     
-     /* Dirichlet transition learning - disabled by default
-     * 
+
+    /* Dirichlet transition learning - disabled by default
+     *
      * Initialize with geometry-aware prior based on regime distances.
      * The prior encodes: "nearby regimes are more likely transitions"
      * Learning happens when SPRT confirms regime changes.
@@ -185,18 +199,17 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
         {
             mu_vol_init[r] = (float)rbpf->params[r].mu_vol;
         }
-        
+
         dirichlet_transition_init_geometric(
             &rbpf->trans_prior,
             n_regimes,
             mu_vol_init,
-            30.0f,   /* stickiness: moderate */
-            1.0f,    /* distance_scale: 1 log-vol unit */
-            0.999f   /* gamma: ~1000 tick memory */
+            30.0f, /* stickiness: moderate */
+            1.0f,  /* distance_scale: 1 log-vol unit */
+            0.999f /* gamma: ~1000 tick memory */
         );
     }
-    rbpf->trans_prior_enabled = 0;  /* Off by default - use fixed matrix */
-
+    rbpf->trans_prior_enabled = 0; /* Off by default - use fixed matrix */
 
     rbpf->detection.stable_regime = 0;
 
@@ -304,6 +317,9 @@ void rbpf_ksc_destroy(RBPF_KSC *rbpf)
     mkl_free(rbpf->max_log_lik);
     mkl_free(rbpf->rng_gaussian);
     mkl_free(rbpf->silverman_scratch);
+
+    /* KL tempering buffer */
+    mkl_free(rbpf->log_lik_increment);
 
     mkl_free(rbpf->particle_mu_vol);
     mkl_free(rbpf->particle_sigma_vol);
@@ -436,6 +452,42 @@ void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime)
     /* Use SPRT module's force function */
     sprt_multi_force_regime(&rbpf->sprt, regime);
     rbpf->detection.stable_regime = regime;
+}
+
+/*─────────────────────────────────────────────────────────────────────────────
+ * KL TEMPERING CONFIGURATION
+ *───────────────────────────────────────────────────────────────────────────*/
+
+void rbpf_ksc_set_deferred_weight_mode(RBPF_KSC *rbpf, int enable)
+{
+    if (!rbpf)
+        return;
+    rbpf->deferred_weight_mode = enable;
+}
+
+int rbpf_ksc_get_deferred_weight_mode(const RBPF_KSC *rbpf)
+{
+    return rbpf ? rbpf->deferred_weight_mode : 0;
+}
+
+rbpf_real_t *rbpf_ksc_get_log_lik_increment(RBPF_KSC *rbpf)
+{
+    return rbpf ? rbpf->log_lik_increment : NULL;
+}
+
+void rbpf_ksc_apply_weight_increments(RBPF_KSC *rbpf, rbpf_real_t beta)
+{
+    if (!rbpf)
+        return;
+
+    const int n = rbpf->n_particles;
+    rbpf_real_t *log_weight = rbpf->log_weight;
+    const rbpf_real_t *log_lik_inc = rbpf->log_lik_increment;
+
+    for (int i = 0; i < n; i++)
+    {
+        log_weight[i] += beta * log_lik_inc[i];
+    }
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -645,6 +697,9 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
         rbpf->smooth_history[i].valid = 0;
     }
 
+    /* Reset KL tempering buffer */
+    memset(rbpf->log_lik_increment, 0, n * sizeof(rbpf_real_t));
+
     /* Student-t initialization */
 #if RBPF_ENABLE_STUDENT_T
     if (rbpf->lambda != NULL)
@@ -659,7 +714,6 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
 #endif
 }
 
-
 /*═══════════════════════════════════════════════════════════════════════════════
  * DIRICHLET TRANSITION LEARNING CONFIGURATION
  *═══════════════════════════════════════════════════════════════════════════════*/
@@ -668,9 +722,9 @@ void rbpf_ksc_enable_transition_learning(RBPF_KSC *rbpf, int enable)
 {
     if (!rbpf)
         return;
-    
+
     rbpf->trans_prior_enabled = enable;
-    
+
     if (enable)
     {
         /* Sync Dirichlet prior to current transition LUT */
@@ -681,38 +735,43 @@ void rbpf_ksc_enable_transition_learning(RBPF_KSC *rbpf, int enable)
 }
 
 void rbpf_ksc_set_transition_learning_params(RBPF_KSC *rbpf,
-                                              float stickiness,
-                                              float distance_scale,
-                                              float gamma)
+                                             float stickiness,
+                                             float distance_scale,
+                                             float gamma)
 {
     if (!rbpf)
         return;
-    
+
     /* Clamp parameters to reasonable ranges */
-    if (stickiness < 1.0f) stickiness = 1.0f;
-    if (stickiness > 1000.0f) stickiness = 1000.0f;
-    
-    if (distance_scale < 0.1f) distance_scale = 0.1f;
-    if (distance_scale > 10.0f) distance_scale = 10.0f;
-    
-    if (gamma < 0.9f) gamma = 0.9f;
-    if (gamma > 0.9999f) gamma = 0.9999f;
-    
+    if (stickiness < 1.0f)
+        stickiness = 1.0f;
+    if (stickiness > 1000.0f)
+        stickiness = 1000.0f;
+
+    if (distance_scale < 0.1f)
+        distance_scale = 0.1f;
+    if (distance_scale > 10.0f)
+        distance_scale = 10.0f;
+
+    if (gamma < 0.9f)
+        gamma = 0.9f;
+    if (gamma > 0.9999f)
+        gamma = 0.9999f;
+
     /* Re-initialize with new parameters */
     float mu_vol_init[RBPF_MAX_REGIMES];
     for (int r = 0; r < rbpf->n_regimes; r++)
     {
         mu_vol_init[r] = (float)rbpf->params[r].mu_vol;
     }
-    
+
     dirichlet_transition_init_geometric(
         &rbpf->trans_prior,
         rbpf->n_regimes,
         mu_vol_init,
         stickiness,
         distance_scale,
-        gamma
-    );
+        gamma);
 }
 
 float rbpf_ksc_get_transition_prob(const RBPF_KSC *rbpf, int from, int to)
@@ -723,7 +782,7 @@ float rbpf_ksc_get_transition_prob(const RBPF_KSC *rbpf, int from, int to)
         return 0.0f;
     if (to < 0 || to >= rbpf->n_regimes)
         return 0.0f;
-    
+
     if (rbpf->trans_prior_enabled)
     {
         return dirichlet_transition_prob(&rbpf->trans_prior, from, to);
@@ -746,13 +805,13 @@ void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf)
 {
     if (!rbpf)
         return;
-    
+
     printf("\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     printf("  Transition Learning Status\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     printf("  Enabled: %s\n", rbpf->trans_prior_enabled ? "YES" : "NO");
-    
+
     if (rbpf->trans_prior_enabled)
     {
         dirichlet_transition_print(&rbpf->trans_prior);
@@ -765,7 +824,7 @@ void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf)
         for (int j = 0; j < rbpf->n_regimes; j++)
             printf("    R%d   ", j);
         printf("\n");
-        
+
         for (int i = 0; i < rbpf->n_regimes; i++)
         {
             printf("  R%d: ", i);
@@ -782,8 +841,6 @@ void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf)
     }
     printf("═══════════════════════════════════════════════════════════════\n");
 }
-
-
 
 /*─────────────────────────────────────────────────────────────────────────────
  * WARMUP
@@ -821,6 +878,10 @@ void rbpf_ksc_print_config(const RBPF_KSC *rbpf)
     printf("  Silverman:     %s (last h=%.4f)\n",
            rbpf->use_silverman_bandwidth ? "YES" : "NO",
            rbpf->last_silverman_bandwidth);
+
+    printf("\n  KL Tempering:\n");
+    printf("    Deferred weight mode: %s\n",
+           rbpf->deferred_weight_mode ? "ENABLED" : "DISABLED");
 
     printf("\n  Parameter Bounds:\n");
     printf("    μ_vol: [%.4f, %.4f]\n",
@@ -862,7 +923,7 @@ void rbpf_ksc_print_config(const RBPF_KSC *rbpf)
     if (rbpf->trans_prior_enabled)
     {
         DirichletTransitionStats stats = dirichlet_transition_stats(&rbpf->trans_prior);
-        printf("    γ (decay):   %.4f (~%.0f tick memory)\n", 
+        printf("    γ (decay):   %.4f (~%.0f tick memory)\n",
                rbpf->trans_prior.gamma,
                1.0f / (1.0f - rbpf->trans_prior.gamma));
         printf("    Avg sticky:  %.1f%%\n", stats.avg_stickiness * 100.0f);

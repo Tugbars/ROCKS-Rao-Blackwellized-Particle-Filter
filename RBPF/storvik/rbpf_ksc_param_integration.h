@@ -110,6 +110,12 @@ extern "C"
     struct RBPF_FixedLagSmoother;
 
     /*═══════════════════════════════════════════════════════════════════════════
+     * FORWARD DECLARATION (full struct in rbpf_kl_tempering.h)
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    struct RBPF_KL_State;
+
+    /*═══════════════════════════════════════════════════════════════════════════
      * ADAPTIVE SIGNAL SOURCE
      *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -264,6 +270,18 @@ extern "C"
          * Core layer (KSC) only computes raw signals; this layer interprets them.
          *───────────────────────────────────────────────────────────────────────*/
         int prev_sprt_regime; /* Previous SPRT-confirmed regime */
+
+        /*───────────────────────────────────────────────────────────────────────
+         * KL TEMPERING (Information-Geometric Weight Normalization)
+         *
+         * Prevents "numerical genocide" of particles by limiting how much
+         * a single observation can change the weight distribution.
+         *
+         * The KL divergence between proposed and current weights is clamped
+         * to log(N) nats - the "speed of light" for information flow.
+         *───────────────────────────────────────────────────────────────────────*/
+        struct RBPF_KL_State *kl_state; /* NULL when disabled */
+        int kl_tempering_enabled;       /* 1 = use KL tempering */
 
         /*───────────────────────────────────────────────────────────────────────
          * MISC STATE
@@ -507,6 +525,67 @@ extern "C"
                                      rbpf_real_t *current_lambda,
                                      rbpf_real_t *max_surprise);
     void rbpf_ext_print_adaptive_config(const RBPF_Extended *ext);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * SECTION 11: KL TEMPERING (rbpf_kl_tempering.c)
+     *
+     * Information-geometric weight normalization. Prevents "numerical genocide"
+     * of particles by clamping KL divergence to log(N) nats per tick.
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @brief Enable KL tempering
+     *
+     * When enabled, weight updates are tempered based on KL divergence
+     * to prevent particle collapse on extreme observations.
+     *
+     * @param ext   Extended RBPF instance
+     */
+    void rbpf_ext_enable_kl_tempering(RBPF_Extended *ext);
+
+    /**
+     * @brief Disable KL tempering (use standard weight updates)
+     */
+    void rbpf_ext_disable_kl_tempering(RBPF_Extended *ext);
+
+    /**
+     * @brief Check if KL tempering is enabled
+     */
+    int rbpf_ext_kl_tempering_enabled(const RBPF_Extended *ext);
+
+    /**
+     * @brief Get last tempering factor β
+     *
+     * @return β ∈ [0.1, 1.0], where 1.0 = full update, <1.0 = tempered
+     */
+    rbpf_real_t rbpf_ext_get_last_beta(const RBPF_Extended *ext);
+
+    /**
+     * @brief Get last KL divergence
+     *
+     * @return KL(proposed || old) in nats
+     */
+    rbpf_real_t rbpf_ext_get_last_kl(const RBPF_Extended *ext);
+
+    /**
+     * @brief Get KL ceiling (log N)
+     *
+     * @return Hard limit on per-tick information in nats
+     */
+    rbpf_real_t rbpf_ext_get_kl_ceiling(const RBPF_Extended *ext);
+
+    /**
+     * @brief Get zombie reset count
+     *
+     * Number of times particles were detected as "zombies" (sustained β < 0.5)
+     * and a forced reset was triggered.
+     */
+    uint64_t rbpf_ext_get_zombie_resets(const RBPF_Extended *ext);
+
+    /**
+     * @brief Print KL tempering diagnostics
+     */
+    void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext);
 
 #ifdef __cplusplus
 }

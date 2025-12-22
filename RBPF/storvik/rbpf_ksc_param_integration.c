@@ -21,6 +21,7 @@
 #include "rbpf_fixed_lag_smoother.h"
 #include "rbpf_sprt.h"
 #include "rbpf_dirichlet_transition.h"
+#include "rbpf_kl_tempering.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

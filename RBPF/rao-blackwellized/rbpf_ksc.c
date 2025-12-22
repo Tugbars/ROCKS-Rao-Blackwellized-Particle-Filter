@@ -18,6 +18,7 @@
  *   - PCG32 RNG (fast, good quality)
  *   - Transition LUT (no cumsum search)
  *   - Regularization after resample (prevents Kalman state degeneracy)
+ *   - KL tempering support (deferred weight mode)
  *
  * Latency target: <15μs for 1000 particles (Gaussian)
  *                 <20μs for 1000 particles (Student-t)
@@ -80,6 +81,51 @@ static const rbpf_real_t KSC_LOG_PROB[KSC_N_COMPONENTS] = {
     RBPF_REAL(-4.151), /* log(0.01575) */
     RBPF_REAL(-6.768)  /* log(0.00115) */
 };
+
+/*─────────────────────────────────────────────────────────────────────────────
+ * FISHER-RAO MUTATION (Optimized with Small-Angle Approximation)
+ *
+ * For particles being mutated to a new regime, we interpolate along the
+ * Fisher-Rao geodesic. When |Δμ| is small relative to σ, we use a faster
+ * linear/geometric approximation instead of the full trig computation.
+ *───────────────────────────────────────────────────────────────────────────*/
+
+static inline void fisher_rao_mutate_fast(
+    double mu_particle, double var_particle,
+    double mu_regime, double theta_regime, double sigma_regime,
+    double *mu_out, double *var_out)
+{
+    double sigma_particle = sqrt(var_particle);
+    double delta_mu = fabs(mu_regime - mu_particle);
+
+    /* Small-angle approximation threshold: geodesic is nearly vertical */
+    if (delta_mu < 0.1 * sigma_particle)
+    {
+        /* Skip trig - use linear μ blend and geometric σ blend */
+        double var_stationary = (sigma_regime * sigma_regime) / (2.0 * theta_regime);
+        if (var_stationary < 0.01)
+            var_stationary = 0.01;
+        if (var_stationary > 10.0)
+            var_stationary = 10.0;
+
+        /* Precision-weighted blend parameter */
+        double prec_particle = 1.0 / var_particle;
+        double prec_regime = 1.0 / var_stationary;
+        double t = prec_regime / (prec_particle + prec_regime);
+
+        /* Linear blend for μ, geometric for σ */
+        *mu_out = (1.0 - t) * mu_particle + t * mu_regime;
+        double sigma_out = pow(sigma_particle, 1.0 - t) * pow(sqrt(var_stationary), t);
+        *var_out = sigma_out * sigma_out;
+    }
+    else
+    {
+        /* Full geodesic computation (rare path) */
+        fisher_rao_mutate(mu_particle, var_particle,
+                          mu_regime, theta_regime, sigma_regime,
+                          mu_out, var_out);
+    }
+}
 
 /*─────────────────────────────────────────────────────────────────────────────
  * PREDICT STEP
@@ -166,6 +212,11 @@ void rbpf_ksc_predict(RBPF_KSC *rbpf)
  *
  * Observation: y = log(r²) = 2ℓ + log(ε²)
  * Linear: y - m_k = H*ℓ + (log(ε²) - m_k), H = 2
+ *
+ * KL TEMPERING SUPPORT:
+ * When deferred_weight_mode is enabled, log-likelihood increments are stored
+ * in log_lik_increment[] but NOT applied to log_weight[]. The caller
+ * (Extended layer) then computes KL divergence and applies tempered weights.
  *───────────────────────────────────────────────────────────────────────────*/
 
 rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y)
@@ -248,8 +299,19 @@ rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y)
         }
     }
 
-    /* Normalize and update weights */
+    /*═══════════════════════════════════════════════════════════════════════
+     * NORMALIZE AND UPDATE WEIGHTS
+     *
+     * KL Tempering Support:
+     * - Always store log-likelihood increment in log_lik_increment[]
+     * - Only apply to log_weight[] if NOT in deferred mode
+     * - In deferred mode, Extended layer applies tempered weights
+     *═══════════════════════════════════════════════════════════════════════*/
+
     rbpf_real_t total_marginal = RBPF_REAL(0.0);
+    rbpf_real_t *log_lik_inc = rbpf->log_lik_increment; /* KL tempering buffer */
+    const int deferred = rbpf->deferred_weight_mode;
+
     for (int i = 0; i < n; i++)
     {
         rbpf_real_t inv_lik = RBPF_REAL(1.0) / (lik_total[i] + RBPF_REAL(1e-30));
@@ -264,7 +326,19 @@ rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y)
         if (var[i] < RBPF_REAL(1e-6))
             var[i] = RBPF_REAL(1e-6);
 
-        log_weight[i] += rbpf_log(lik_total[i] + RBPF_REAL(1e-30)) + max_ll[i];
+        /* Compute log-likelihood increment for this particle */
+        rbpf_real_t inc = rbpf_log(lik_total[i] + RBPF_REAL(1e-30)) + max_ll[i];
+
+        /* Always store for KL tempering (even if not enabled) */
+        log_lik_inc[i] = inc;
+
+        /* Apply immediately only if NOT in deferred mode */
+        if (!deferred)
+        {
+            log_weight[i] += inc;
+        }
+        /* In deferred mode, caller applies: log_weight += β × log_lik_increment */
+
         total_marginal += lik_total[i] * rbpf_exp(max_ll[i]);
     }
 
@@ -445,7 +519,7 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
      * Primary regime switching is handled by BOCPD + SPRT ("afterburner"),
      * but we keep 1-2 particles per regime as mathematical insurance.
      *
-     * NEW: Uses Fisher-Rao geodesic for principled state blending.
+     * Uses Fisher-Rao geodesic for principled state blending.
      * The blend parameter t is determined by precision weighting:
      *   - Uncertain particle (high var) → large t → teleport toward regime
      *   - Confident particle (low var) → small t → preserve state
@@ -482,30 +556,27 @@ int rbpf_ksc_resample(RBPF_KSC *rbpf)
                             regime[i] = r_new;
 
                             /* ═══════════════════════════════════════════════
-                             * FISHER-RAO GEODESIC MUTATION
-                             * 
-                             * Instead of arbitrary 70/30 blend, we:
-                             * 1. Compute stationary variance of target regime
-                             * 2. Use precision weighting to determine blend t
-                             * 3. Interpolate along Fisher-Rao geodesic
+                             * FISHER-RAO GEODESIC MUTATION (Optimized)
+                             *
+                             * Uses small-angle approximation when |Δμ| < 0.1σ
+                             * to avoid expensive trig functions.
                              * ═══════════════════════════════════════════════*/
-                            
+
                             const RBPF_RegimeParams *p_new = &rbpf->params[r_new];
-                            
+
                             double mu_out, var_out;
-                            fisher_rao_mutate(
-                                (double)mu[i], 
+                            fisher_rao_mutate_fast(
+                                (double)mu[i],
                                 (double)var[i],
                                 (double)p_new->mu_vol,
                                 (double)p_new->theta,
                                 (double)p_new->sigma_vol,
-                                &mu_out, 
-                                &var_out
-                            );
-                            
+                                &mu_out,
+                                &var_out);
+
                             mu[i] = (rbpf_real_t)mu_out;
                             var[i] = (rbpf_real_t)var_out;
-                            
+
                             break;
                         }
                     }

@@ -778,6 +778,16 @@ typedef float rbpf_real_t;
         DirichletTransition trans_prior; /**< Dirichlet posterior over transitions */
         int trans_prior_enabled;         /**< 0 = use fixed matrix, 1 = learn online */
 
+        /*───────────────────────────────────────────────────────────────────────
+         * KL TEMPERING (Deferred Weight Mode)
+         *
+         * When deferred_weight_mode=1, rbpf_ksc_update() stores log-likelihood
+         * increments but does NOT apply them to log_weight[]. The Extended layer
+         * then computes KL divergence and applies tempered weights.
+         *───────────────────────────────────────────────────────────────────────*/
+        rbpf_real_t *log_lik_increment; /**< [n_particles] Log-lik increments */
+        int deferred_weight_mode;       /**< 1 = defer, 0 = immediate */
+
     } RBPF_KSC;
 
     /**
@@ -1545,6 +1555,22 @@ typedef float rbpf_real_t;
      * @param rbpf  The RBPF instance
      */
     void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * KL TEMPERING API
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /** Enable/disable deferred weight mode for KL tempering */
+    void rbpf_ksc_set_deferred_weight_mode(RBPF_KSC *rbpf, int enable);
+
+    /** Check if deferred weight mode is enabled */
+    int rbpf_ksc_get_deferred_weight_mode(const RBPF_KSC *rbpf);
+
+    /** Get pointer to log-likelihood increment buffer */
+    rbpf_real_t *rbpf_ksc_get_log_lik_increment(RBPF_KSC *rbpf);
+
+    /** Apply stored increments with tempering factor β */
+    void rbpf_ksc_apply_weight_increments(RBPF_KSC *rbpf, rbpf_real_t beta);
 
 #ifdef __cplusplus
 }
