@@ -501,6 +501,9 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     param_learn_set_regime_forgetting(&ext->storvik, 2, 0.9950f);
     param_learn_set_regime_forgetting(&ext->storvik, 3, 0.9930f);
 
+    rbpf_ext_enable_adaptive_forgetting(ext);  /* Needed to initialize struct */
+    rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);
+
     /* Enable Robust OCSN */
     ext->robust_ocsn.enabled = 1;
     ext->robust_ocsn.regime[0].prob = 0.02f;
