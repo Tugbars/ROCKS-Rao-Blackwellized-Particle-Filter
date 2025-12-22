@@ -495,14 +495,17 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     rbpf_ksc_enable_transition_learning(ext->rbpf, 1);
     */
 
-    /* Forgetting λ per regime */
-    param_learn_set_regime_forgetting(&ext->storvik, 0, 0.9990f);
-    param_learn_set_regime_forgetting(&ext->storvik, 1, 0.9970f);
-    param_learn_set_regime_forgetting(&ext->storvik, 2, 0.9950f);
-    param_learn_set_regime_forgetting(&ext->storvik, 3, 0.9930f);
+/* Enable adaptive forgetting in REGIME mode (uses fixed λ, no surprise modulation) */
+rbpf_ext_enable_adaptive_forgetting_mode(ext, ADAPT_SIGNAL_REGIME);
 
-    rbpf_ext_enable_adaptive_forgetting(ext);  /* Needed to initialize struct */
-    rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);
+/* Set YOUR tuned λ values (not the defaults) */
+rbpf_ext_set_regime_lambda(ext, 0, 0.9990f);
+rbpf_ext_set_regime_lambda(ext, 1, 0.9970f);
+rbpf_ext_set_regime_lambda(ext, 2, 0.9950f);
+rbpf_ext_set_regime_lambda(ext, 3, 0.9930f);
+
+/* Enable circuit breaker */
+rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);
 
     /* Enable Robust OCSN */
     ext->robust_ocsn.enabled = 1;
