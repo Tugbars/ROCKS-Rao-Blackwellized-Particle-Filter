@@ -35,6 +35,7 @@
 
 #include "rbpf_ksc.h"
 #include "rbpf_param_learn.h"
+#include "p2_quantile.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -176,6 +177,47 @@ extern "C"
         /* Statistics */
         uint64_t interventions;        /* Times we significantly reduced λ */
         rbpf_real_t max_surprise_seen; /* For diagnostics */
+
+        /*───────────────────────────────────────────────────────────────────────
+         * PRINCIPLED CIRCUIT BREAKER (v2)
+         *
+         * Replaces heuristic thresholds (Z > 5σ) with data-driven approach:
+         *
+         * TRIGGER: Empirical tail probability via P² quantile estimator
+         *   - Tracks p-th percentile of surprise in O(1) time/space
+         *   - Triggers when surprise > estimated percentile
+         *   - Self-calibrating, distribution-free
+         *   - Interpretable: "1-in-1000 event" vs arbitrary "5σ"
+         *
+         * RESPONSE: Bayesian forgetting based on time since last break
+         *   - emergency_λ = 1 - 1/ticks_since_last_break
+         *   - Meaning: "forget back to last structural break"
+         *   - No magic numbers, just Bayesian principle
+         *
+         * RAPID-FIRE GUARD: min_ticks_for_lambda prevents N_eff < 20
+         *   - If breaks happen at T=5, raw λ = 0.80 → N_eff = 5 (unstable)
+         *   - Floor ensures λ ≥ 0.95 → N_eff ≥ 20 (stable variance est.)
+         *
+         * Reference: Jain & Chlamtac (1985) "The P² Algorithm"
+         *─────────────────────────────────────────────────────────────────────*/
+
+        /* Configuration */
+        int enable_circuit_breaker; /* 0 = disabled (default), 1 = armed */
+        double trigger_percentile;  /* e.g., 0.999 = 1-in-1000 events */
+        int min_ticks_for_lambda;   /* Minimum N_eff to prevent λ → 0 */
+        int warmup_ticks;           /* Observations before CB can trigger */
+
+        /* State */
+        P2Quantile surprise_quantile;    /* P² estimator for tail percentile */
+        uint64_t ticks_since_last_break; /* For computing emergency λ */
+
+        /* Output */
+        int structural_break_detected;             /* 1 if CB tripped this tick */
+        rbpf_real_t last_trigger_percentile_value; /* Current p-th percentile estimate */
+        rbpf_real_t emergency_lambda_used;         /* λ used in last trip */
+
+        /* Statistics */
+        uint64_t circuit_breaker_trips; /* Total CB activations */
 
     } RBPF_AdaptiveForgetting;
 
@@ -650,6 +692,80 @@ extern "C"
         RBPF_Extended *ext,
         rbpf_real_t marginal_lik,
         int dominant_regime);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * PRINCIPLED CIRCUIT BREAKER (v2)
+     *
+     * Data-driven structural break detection using P² quantile estimation.
+     * No heuristics - triggers on empirical tail probability.
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Enable principled circuit breaker (data-driven, no heuristics)
+     *
+     * Uses P² algorithm to track empirical tail percentile of surprise.
+     * Triggers when current surprise exceeds this data-driven threshold.
+     *
+     * NO HEURISTICS:
+     *   - Trigger: surprise > empirical p-th percentile (self-calibrating)
+     *   - Response: λ = 1 - 1/T where T = ticks since last break (Bayesian)
+     *
+     * @param ext          Extended RBPF handle
+     * @param percentile   Trigger percentile (0.99 - 0.9999)
+     *                     0.999 = 1-in-1000 event triggers break
+     * @param warmup       Observations before CB can trigger (min 20)
+     *
+     * Example:
+     *   rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);  // 1-in-1000, 100 warmup
+     */
+    void rbpf_ext_enable_circuit_breaker(RBPF_Extended *ext,
+                                         double percentile,
+                                         int warmup);
+
+    /**
+     * Disable circuit breaker
+     */
+    void rbpf_ext_disable_circuit_breaker(RBPF_Extended *ext);
+
+    /**
+     * Set minimum memory horizon (rapid-fire guard)
+     *
+     * Prevents λ from going too low if breaks happen in quick succession.
+     * emergency_λ = 1 - 1/max(T, min_ticks)
+     *
+     * If breaks happen at T=5, raw λ = 0.80 → N_eff = 5 (unstable).
+     * With min_ticks=20: λ = 0.95 → N_eff = 20 (stable variance est.)
+     *
+     * @param ext        Extended RBPF handle
+     * @param min_ticks  Minimum effective memory (default 20)
+     */
+    void rbpf_ext_set_circuit_breaker_min_memory(RBPF_Extended *ext, int min_ticks);
+
+    /**
+     * Check if structural break was detected this tick
+     *
+     * Returns 1 if circuit breaker tripped on the last update.
+     * Caller can use this to take additional action (e.g., PGAS resweep).
+     */
+    int rbpf_ext_structural_break_detected(const RBPF_Extended *ext);
+
+    /**
+     * Get circuit breaker trip count
+     */
+    uint64_t rbpf_ext_get_circuit_breaker_trips(const RBPF_Extended *ext);
+
+    /**
+     * Get current empirical threshold (p-th percentile estimate)
+     *
+     * Returns the current estimate of the trigger percentile.
+     * Circuit breaker triggers when surprise exceeds this value.
+     */
+    rbpf_real_t rbpf_ext_get_circuit_breaker_threshold(const RBPF_Extended *ext);
+
+    /**
+     * Get the emergency λ used in last circuit breaker trip
+     */
+    rbpf_real_t rbpf_ext_get_last_emergency_lambda(const RBPF_Extended *ext);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * ASSET PRESETS

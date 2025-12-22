@@ -6,15 +6,29 @@
  *   - Monitor: Track one-step-ahead forecast error (predictive surprise)
  *   - Intervene: When error spikes, reduce λ to accelerate adaptation
  *
- * The key insight: Low likelihood means the current parameter set θ is
- * unlikely to have generated this observation. We should "forget" old
- * sufficient statistics faster to adapt to the new regime.
+ * PRINCIPLED CIRCUIT BREAKER (v2):
+ *   Replaces heuristic thresholds (Z > 5σ) with data-driven approach:
  *
- * Reference: West & Harrison (1997) "Bayesian Forecasting and Dynamic Models"
+ *   1. TRIGGER: Empirical tail probability via P² quantile estimator
+ *      - Tracks 99.9th percentile of surprise in O(1) time/space
+ *      - Triggers when surprise > p999 estimate
+ *      - Self-calibrating, distribution-free
+ *      - Interpretable: "1-in-1000 event" vs arbitrary "5σ"
+ *
+ *   2. RESPONSE: Bayesian forgetting based on time since last break
+ *      - emergency_λ = 1 - 1/ticks_since_last_break
+ *      - Meaning: "forget back to last structural break"
+ *      - No magic numbers, just Bayesian principle
+ *
+ * References:
+ *   - West & Harrison (1997) "Bayesian Forecasting and Dynamic Models"
+ *   - Jain & Chlamtac (1985) "The P² Algorithm for Dynamic Calculation
+ *     of Quantiles and Histograms Without Storing Observations"
  */
 
 #include "rbpf_ksc_param_integration.h"
 #include "rbpf_param_learn.h"
+#include "p2_quantile.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -44,7 +58,7 @@ static const rbpf_real_t DEFAULT_LAMBDA_REGIME[RBPF_MAX_REGIMES] = {
 #define DEFAULT_LAMBDA_CEILING RBPF_REAL(0.9995) /* N_eff ≈ 2000 maximum */
 
 /* EMA parameters */
-#define DEFAULT_BASELINE_ALPHA RBPF_REAL(0.01) /* Very slow (τ ≈ 100) - slow to adapt */
+#define DEFAULT_BASELINE_ALPHA RBPF_REAL(0.01) /* Very slow (τ ≈ 100) */
 #define DEFAULT_SIGNAL_ALPHA RBPF_REAL(0.15)   /* Faster reaction */
 
 /* Cooldown */
@@ -52,6 +66,11 @@ static const rbpf_real_t DEFAULT_LAMBDA_REGIME[RBPF_MAX_REGIMES] = {
 
 /* Intervention threshold (z-score above which we count as intervention) */
 #define INTERVENTION_THRESHOLD RBPF_REAL(1.5)
+
+/* Circuit breaker defaults */
+#define DEFAULT_TRIGGER_PERCENTILE 0.999 /* 99.9th percentile = 1-in-1000 */
+#define DEFAULT_MIN_TICKS_FOR_LAMBDA 20  /* Minimum memory horizon */
+#define DEFAULT_WARMUP_TICKS 100         /* Observations before CB can trigger */
 
 /*============================================================================
  * INITIALIZATION
@@ -100,6 +119,19 @@ void rbpf_adaptive_forgetting_init(RBPF_AdaptiveForgetting *af)
     af->cooldown_ticks = DEFAULT_COOLDOWN_TICKS;
     af->cooldown_remaining = 0;
 
+    /* Principled Circuit Breaker (v2) */
+    af->enable_circuit_breaker = 0;
+    af->trigger_percentile = DEFAULT_TRIGGER_PERCENTILE;
+    af->min_ticks_for_lambda = DEFAULT_MIN_TICKS_FOR_LAMBDA;
+    af->warmup_ticks = DEFAULT_WARMUP_TICKS;
+    af->ticks_since_last_break = 0;
+    p2_init(&af->surprise_quantile, DEFAULT_TRIGGER_PERCENTILE);
+
+    af->circuit_breaker_trips = 0;
+    af->structural_break_detected = 0;
+    af->last_trigger_percentile_value = RBPF_REAL(0.0);
+    af->emergency_lambda_used = RBPF_REAL(0.0);
+
     /* Output */
     af->lambda_current = RBPF_REAL(0.998); /* Safe default */
     af->surprise_current = RBPF_REAL(0.0);
@@ -139,15 +171,10 @@ static inline rbpf_real_t sigmoid_discount(
  * Uses the marginal likelihood from the update step to compute surprise
  * and adjust the forgetting factor.
  *
- * SEPARATION OF CONCERNS:
- *   PATH A: Predictive Surprise (Drift Detection)
- *     - Uses Z-score normalization (is today worse than yesterday?)
- *     - Triggers on gradual regime shifts
- *
- *   PATH B: Structural Surprise (Shock Detection)
- *     - Uses ABSOLUTE outlier fraction (no history needed)
- *     - Triggers immediately on heavy outlier usage
- *     - Bypasses Z-score entirely
+ * PATHS:
+ *   A: Predictive Surprise (Drift Detection) - Z-score based
+ *   B: Structural Surprise (Shock Detection) - Outlier fraction based
+ *   C: Circuit Breaker (Extreme Events) - Empirical tail probability
  *
  * @param ext              Extended RBPF handle
  * @param marginal_lik     Marginal likelihood from rbpf_ksc_update()
@@ -165,18 +192,19 @@ void rbpf_adaptive_forgetting_update(
 
     if (!af->enabled)
     {
-        /* When disabled, use fixed λ from Storvik config */
         return;
     }
 
+    /* Clear structural break flag from previous tick */
+    af->structural_break_detected = 0;
+
+    /* Increment ticks since last break (for data-driven λ) */
+    af->ticks_since_last_break++;
+
     /*═══════════════════════════════════════════════════════════════════════
-     * PATH A: PREDICTIVE SURPRISE (Drift Detection)
-     *
-     * Uses Z-score to detect when data fits worse than usual.
-     * Good for: Gradual regime shifts, persistent misspecification
+     * COMPUTE SURPRISE
      *═══════════════════════════════════════════════════════════════════════*/
 
-    /* Compute predictive surprise */
     if (marginal_lik < RBPF_REAL(1e-30))
     {
         marginal_lik = RBPF_REAL(1e-30);
@@ -191,9 +219,100 @@ void rbpf_adaptive_forgetting_update(
         af->max_surprise_seen = pred_surprise;
     }
 
-    /* Update baseline statistics (slow EMA, only when not intervening) */
+    /*═══════════════════════════════════════════════════════════════════════
+     * PATH C: PRINCIPLED CIRCUIT BREAKER (Check First)
+     *
+     * Uses P² algorithm to track empirical 99.9th percentile of surprise.
+     * Triggers when current surprise exceeds this threshold.
+     *
+     * NO HEURISTICS:
+     *   - Trigger: surprise > empirical p999 (self-calibrating)
+     *   - Response: λ = 1 - 1/ticks_since_last_break (Bayesian)
+     *
+     * The logic: "If this is a 1-in-1000 event, forget everything since
+     * the last 1-in-1000 event and start fresh."
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    if (af->enable_circuit_breaker)
+    {
+        /* Always update quantile estimator (even if not triggering) */
+        p2_update(&af->surprise_quantile, (double)pred_surprise);
+
+        /* Only trigger after warmup period */
+        if (p2_get_count(&af->surprise_quantile) >= af->warmup_ticks)
+        {
+            double p_threshold = p2_get_quantile(&af->surprise_quantile);
+            af->last_trigger_percentile_value = (rbpf_real_t)p_threshold;
+
+            if ((double)pred_surprise > p_threshold)
+            {
+                /* CIRCUIT BREAKER TRIPPED */
+
+                /*───────────────────────────────────────────────────────────────
+                 * Compute emergency λ from Bayesian principle:
+                 *
+                 * "Forget back to last structural break"
+                 *
+                 * If last break was T ticks ago:
+                 *   N_eff = T  →  λ = 1 - 1/T
+                 *
+                 * This means: "I want my effective memory to be exactly
+                 * the time since my last reset." Pure Bayesian, no magic.
+                 *───────────────────────────────────────────────────────────────*/
+
+                uint64_t T = af->ticks_since_last_break;
+
+                /* Floor to prevent λ → 0 if breaks happen rapidly */
+                if (T < (uint64_t)af->min_ticks_for_lambda)
+                {
+                    T = (uint64_t)af->min_ticks_for_lambda;
+                }
+
+                rbpf_real_t emergency_lambda = RBPF_REAL(1.0) - RBPF_REAL(1.0) / (rbpf_real_t)T;
+
+                /* Apply floor/ceiling bounds */
+                if (emergency_lambda < af->lambda_floor)
+                    emergency_lambda = af->lambda_floor;
+                if (emergency_lambda > af->lambda_ceiling)
+                    emergency_lambda = af->lambda_ceiling;
+
+                af->emergency_lambda_used = emergency_lambda;
+                af->lambda_current = emergency_lambda;
+
+                /* Reset tick counter */
+                af->ticks_since_last_break = 0;
+
+                /* Extended cooldown proportional to how extreme the event was */
+                af->cooldown_remaining = af->cooldown_ticks * 2;
+
+                /* Signal structural break */
+                af->structural_break_detected = 1;
+                af->circuit_breaker_trips++;
+                af->interventions++;
+
+                /* Push to Storvik */
+                if (ext->storvik_initialized)
+                {
+                    param_learn_set_forgetting(&ext->storvik, 1, emergency_lambda);
+                    param_learn_signal_structural_break(&ext->storvik);
+                }
+
+                /* Skip normal processing - circuit breaker overrides everything */
+                return;
+            }
+        }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * PATH A: PREDICTIVE SURPRISE (Drift Detection)
+     *
+     * Uses Z-score to detect when data fits worse than usual.
+     * Good for: Gradual regime shifts, persistent misspecification
+     *═══════════════════════════════════════════════════════════════════════*/
+
     rbpf_real_t alpha_base = af->surprise_ema_alpha;
 
+    /* Update baseline statistics (slow EMA, only when not intervening) */
     if (af->cooldown_remaining == 0 && af->surprise_zscore < RBPF_REAL(1.0))
     {
         af->surprise_baseline = alpha_base * pred_surprise +
@@ -224,22 +343,11 @@ void rbpf_adaptive_forgetting_update(
      * PATH B: STRUCTURAL SURPRISE (Shock Detection)
      *
      * Direct penalty based on outlier fraction. NO HISTORY NEEDED.
-     * This is ABSOLUTE - 80% outliers is always bad, period.
-     *
-     * Bypasses Z-score entirely to avoid the "Baseline Trap":
-     *   - Z-score normalizes everything relative to history
-     *   - But outlier fraction has an absolute meaning
-     *   - 80% outliers = crisis, even if yesterday was also 80%
      *═══════════════════════════════════════════════════════════════════════*/
 
     rbpf_real_t out_frac = ext->last_outlier_fraction;
     rbpf_real_t discount_struct = RBPF_REAL(0.0);
 
-    /* Threshold-based activation:
-     *   <20% outliers: Normal market noise, no penalty
-     *   20-80% outliers: Linear ramp from 0 to max_discount
-     *   >80% outliers: Full max_discount
-     */
     if (out_frac > RBPF_REAL(0.20))
     {
         rbpf_real_t intensity = (out_frac - RBPF_REAL(0.20)) / RBPF_REAL(0.60);
@@ -250,10 +358,6 @@ void rbpf_adaptive_forgetting_update(
 
     /*═══════════════════════════════════════════════════════════════════════
      * COMBINE: Take the STRONGER penalty
-     *
-     * MAX ensures we adapt if EITHER:
-     *   - Data fits poorly (drift) → discount_pred triggers
-     *   - Data fits only via outliers (shock) → discount_struct triggers
      *═══════════════════════════════════════════════════════════════════════*/
 
     rbpf_real_t final_discount;
@@ -261,23 +365,19 @@ void rbpf_adaptive_forgetting_update(
     switch (af->signal_source)
     {
     case ADAPT_SIGNAL_REGIME:
-        /* Pure regime baseline, no surprise modulation */
         final_discount = RBPF_REAL(0.0);
         break;
 
     case ADAPT_SIGNAL_OUTLIER_FRAC:
-        /* Only structural (for testing) */
         final_discount = discount_struct;
         break;
 
     case ADAPT_SIGNAL_PREDICTIVE_SURPRISE:
-        /* Only predictive (for testing) */
         final_discount = discount_pred;
         break;
 
     case ADAPT_SIGNAL_COMBINED:
     default:
-        /* RECOMMENDED: Max of both paths */
         final_discount = (discount_pred > discount_struct) ? discount_pred : discount_struct;
         break;
     }
@@ -285,27 +385,23 @@ void rbpf_adaptive_forgetting_update(
     af->discount_applied = final_discount;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * COMPUTE LAMBDA
+     * COMPUTE LAMBDA (Normal Path)
      *═══════════════════════════════════════════════════════════════════════*/
 
     rbpf_real_t base_lambda = af->lambda_per_regime[dominant_regime];
     rbpf_real_t lambda = base_lambda * (RBPF_REAL(1.0) - final_discount);
 
     /*═══════════════════════════════════════════════════════════════════════
-     * COOLDOWN: Hold low λ after intervention
-     *
-     * Prevents oscillation between high/low λ.
+     * COOLDOWN
      *═══════════════════════════════════════════════════════════════════════*/
 
     if (af->cooldown_remaining > 0)
     {
-        /* Keep previous (low) λ during cooldown */
         lambda = af->lambda_current;
         af->cooldown_remaining--;
     }
     else if (final_discount > RBPF_REAL(0.05) || af->surprise_zscore > INTERVENTION_THRESHOLD)
     {
-        /* Start cooldown on significant intervention */
         af->cooldown_remaining = af->cooldown_ticks;
         af->interventions++;
     }
@@ -342,16 +438,14 @@ void rbpf_ext_enable_adaptive_forgetting(RBPF_Extended *ext)
 
     RBPF_AdaptiveForgetting *af = &ext->adaptive_forgetting;
 
-    /* Initialize to defaults if not already */
     rbpf_adaptive_forgetting_init(af);
 
     af->enabled = 1;
     af->signal_source = ADAPT_SIGNAL_COMBINED;
 
-    /* Also enable Storvik forgetting as the underlying mechanism */
     if (ext->storvik_initialized)
     {
-        param_learn_set_forgetting(&ext->storvik, 1, af->lambda_per_regime[1]); /* Start at R1 */
+        param_learn_set_forgetting(&ext->storvik, 1, af->lambda_per_regime[1]);
     }
 }
 
@@ -376,7 +470,6 @@ void rbpf_ext_set_regime_lambda(RBPF_Extended *ext, int regime, rbpf_real_t lamb
     if (!ext || regime < 0 || regime >= RBPF_MAX_REGIMES)
         return;
 
-    /* Clamp to reasonable range */
     if (lambda < RBPF_REAL(0.9))
         lambda = RBPF_REAL(0.9);
     if (lambda > RBPF_REAL(0.9999))
@@ -398,7 +491,6 @@ void rbpf_ext_set_adaptive_sigmoid(RBPF_Extended *ext,
     af->sigmoid_center = center;
     af->sigmoid_steepness = steepness;
 
-    /* Clamp max_discount to prevent excessive forgetting */
     if (max_discount > RBPF_REAL(0.5))
         max_discount = RBPF_REAL(0.5);
     if (max_discount < RBPF_REAL(0.01))
@@ -413,7 +505,6 @@ void rbpf_ext_set_adaptive_bounds(RBPF_Extended *ext,
     if (!ext)
         return;
 
-    /* Ensure floor < ceiling and both in valid range */
     if (floor < RBPF_REAL(0.8))
         floor = RBPF_REAL(0.8);
     if (ceiling > RBPF_REAL(0.9999))
@@ -432,7 +523,6 @@ void rbpf_ext_set_adaptive_smoothing(RBPF_Extended *ext,
     if (!ext)
         return;
 
-    /* Clamp to reasonable range (0.001, 0.5) */
     if (baseline_alpha < RBPF_REAL(0.001))
         baseline_alpha = RBPF_REAL(0.001);
     if (baseline_alpha > RBPF_REAL(0.5))
@@ -458,6 +548,135 @@ void rbpf_ext_set_adaptive_cooldown(RBPF_Extended *ext, int ticks)
 
     ext->adaptive_forgetting.cooldown_ticks = ticks;
 }
+
+/*============================================================================
+ * PRINCIPLED CIRCUIT BREAKER API (v2)
+ *============================================================================*/
+
+/**
+ * @brief Enable principled circuit breaker
+ *
+ * Uses P² algorithm to track empirical tail percentile of surprise.
+ * Triggers when current surprise exceeds this data-driven threshold.
+ *
+ * NO HEURISTICS:
+ *   - Trigger: surprise > empirical p-th percentile (self-calibrating)
+ *   - Response: λ = 1 - 1/T where T = ticks since last break (Bayesian)
+ *
+ * @param ext          Extended RBPF handle
+ * @param percentile   Trigger percentile (0.99 - 0.9999, default 0.999)
+ *                     0.999 = 1-in-1000 event triggers break
+ * @param warmup       Observations before CB can trigger (default 100)
+ */
+void rbpf_ext_enable_circuit_breaker(RBPF_Extended *ext,
+                                     double percentile,
+                                     int warmup)
+{
+    if (!ext)
+        return;
+
+    RBPF_AdaptiveForgetting *af = &ext->adaptive_forgetting;
+
+    /* Clamp percentile to reasonable range */
+    if (percentile < 0.99)
+        percentile = 0.99; /* At least 1-in-100 */
+    if (percentile > 0.9999)
+        percentile = 0.9999; /* At most 1-in-10000 */
+
+    /* Clamp warmup */
+    if (warmup < 20)
+        warmup = 20;
+    if (warmup > 10000)
+        warmup = 10000;
+
+    af->enable_circuit_breaker = 1;
+    af->trigger_percentile = percentile;
+    af->warmup_ticks = warmup;
+
+    /* Initialize P² quantile estimator for this percentile */
+    p2_init(&af->surprise_quantile, percentile);
+
+    af->ticks_since_last_break = warmup; /* Pretend we just started */
+}
+
+/**
+ * @brief Disable circuit breaker
+ */
+void rbpf_ext_disable_circuit_breaker(RBPF_Extended *ext)
+{
+    if (!ext)
+        return;
+    ext->adaptive_forgetting.enable_circuit_breaker = 0;
+}
+
+/**
+ * @brief Set minimum memory horizon for emergency λ
+ *
+ * Prevents λ from going too low if breaks happen rapidly.
+ * emergency_λ = 1 - 1/max(T, min_ticks)
+ *
+ * @param ext        Extended RBPF handle
+ * @param min_ticks  Minimum effective memory (default 20)
+ */
+void rbpf_ext_set_circuit_breaker_min_memory(RBPF_Extended *ext, int min_ticks)
+{
+    if (!ext)
+        return;
+
+    if (min_ticks < 5)
+        min_ticks = 5;
+    if (min_ticks > 1000)
+        min_ticks = 1000;
+
+    ext->adaptive_forgetting.min_ticks_for_lambda = min_ticks;
+}
+
+/**
+ * @brief Check if structural break was detected this tick
+ */
+int rbpf_ext_structural_break_detected(const RBPF_Extended *ext)
+{
+    if (!ext)
+        return 0;
+    return ext->adaptive_forgetting.structural_break_detected;
+}
+
+/**
+ * @brief Get circuit breaker trip count
+ */
+uint64_t rbpf_ext_get_circuit_breaker_trips(const RBPF_Extended *ext)
+{
+    if (!ext)
+        return 0;
+    return ext->adaptive_forgetting.circuit_breaker_trips;
+}
+
+/**
+ * @brief Get current empirical threshold for circuit breaker
+ *
+ * Returns the current estimate of the p-th percentile of surprise.
+ * Circuit breaker triggers when surprise exceeds this value.
+ */
+rbpf_real_t rbpf_ext_get_circuit_breaker_threshold(const RBPF_Extended *ext)
+{
+    if (!ext)
+        return RBPF_REAL(0.0);
+    return ext->adaptive_forgetting.last_trigger_percentile_value;
+}
+
+/**
+ * @brief Get the emergency λ used in last circuit breaker trip
+ */
+rbpf_real_t rbpf_ext_get_last_emergency_lambda(const RBPF_Extended *ext)
+{
+    if (!ext)
+        return RBPF_REAL(0.0);
+    return ext->adaptive_forgetting.emergency_lambda_used;
+}
+
+/*============================================================================
+ * GETTERS
+ *============================================================================*/
 
 rbpf_real_t rbpf_ext_get_current_lambda(const RBPF_Extended *ext)
 {
@@ -539,6 +758,45 @@ void rbpf_ext_print_adaptive_config(const RBPF_Extended *ext)
     printf("│    Ceiling: λ=%.4f (N_eff≈%d)                            │\n",
            (float)af->lambda_ceiling, (int)(1.0f / (1.0f - af->lambda_ceiling)));
     printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│  Principled Circuit Breaker (v2):                           │\n");
+    if (af->enable_circuit_breaker)
+    {
+        int obs = p2_get_count(&af->surprise_quantile);
+        printf("│    Status:      ARMED                                       │\n");
+        printf("│    Method:      P² quantile estimator (no heuristics)       │\n");
+        printf("│    Percentile:  %.2f%% (1-in-%d event)                      │\n",
+               af->trigger_percentile * 100.0,
+               (int)(1.0 / (1.0 - af->trigger_percentile)));
+        printf("│    Warmup:      %d ticks (observed: %d)                    │\n",
+               af->warmup_ticks, obs);
+        if (obs >= af->warmup_ticks)
+        {
+            printf("│    Threshold:   %.2f (current p%.1f estimate)             │\n",
+                   (float)af->last_trigger_percentile_value,
+                   af->trigger_percentile * 100.0);
+        }
+        else
+        {
+            printf("│    Threshold:   (warming up, %d more ticks)               │\n",
+                   af->warmup_ticks - obs);
+        }
+        printf("│    Min memory:  %d ticks (prevents λ → 0)                  │\n",
+               af->min_ticks_for_lambda);
+        printf("│    Trips:       %llu                                         │\n",
+               (unsigned long long)af->circuit_breaker_trips);
+        if (af->circuit_breaker_trips > 0)
+        {
+            printf("│    Last emerg λ: %.4f (N_eff≈%d)                          │\n",
+                   (float)af->emergency_lambda_used,
+                   (int)(1.0f / (1.0f - af->emergency_lambda_used)));
+        }
+    }
+    else
+    {
+        printf("│    Status:      DISABLED                                    │\n");
+        printf("│    (Enable with rbpf_ext_enable_circuit_breaker)            │\n");
+    }
+    printf("├─────────────────────────────────────────────────────────────┤\n");
     printf("│  Smoothing:                                                 │\n");
     printf("│    Baseline α: %.3f (τ≈%.0f ticks)                         │\n",
            (float)af->surprise_ema_alpha, 1.0f / (float)af->surprise_ema_alpha);
@@ -548,9 +806,16 @@ void rbpf_ext_print_adaptive_config(const RBPF_Extended *ext)
     printf("├─────────────────────────────────────────────────────────────┤\n");
     printf("│  Current State:                                             │\n");
     printf("│    λ_current:      %.4f                                    │\n", (float)af->lambda_current);
+    printf("│    Surprise:       %.2f                                    │\n", (float)af->surprise_current);
     printf("│    Surprise z:     %+.2f                                    │\n", (float)af->surprise_zscore);
     printf("│    Discount:       %.1f%%                                    │\n", (float)af->discount_applied * 100);
     printf("│    Cooldown left:  %d                                       │\n", af->cooldown_remaining);
+    printf("│    Ticks since break: %llu                                   │\n",
+           (unsigned long long)af->ticks_since_last_break);
+    if (af->structural_break_detected)
+    {
+        printf("│    ⚠ STRUCTURAL BREAK DETECTED THIS TICK                    │\n");
+    }
     printf("├─────────────────────────────────────────────────────────────┤\n");
     printf("│  Statistics:                                                │\n");
     printf("│    Interventions:  %llu                                     │\n", (unsigned long long)af->interventions);
