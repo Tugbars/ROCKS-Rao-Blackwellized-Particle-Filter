@@ -56,6 +56,7 @@ set(ROCKS_SOURCES
     # Adaptive components
     rao-blackwellized/rbpf_silverman.c   # Silverman bandwidth for regularization
     rao-blackwellized/rbpf_sprt.c        # SPRT regime detection
+    rao-blackwellized/rbpf_mh_jitter.c   # MH jittering (Stone #2 - informed exploration)
 )
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -395,6 +396,7 @@ set(ROCKS_HEADERS
     rao-blackwellized/rbpf_ksc.h
     rao-blackwellized/rbpf_silverman.h
     rao-blackwellized/rbpf_sprt.h
+    rao-blackwellized/rbpf_mh_jitter.h
     rao-blackwellized/rbpf_kl_tempering.h
     rbpf_fisher_rao.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.h

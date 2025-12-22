@@ -82,6 +82,8 @@
 #include "bocpd.h"
 #include "rbpf_dirichlet_transition.h"
 #include "rbpf_sprt.h"
+#include "rbpf_mh_jitter.h"       /* Stone #2: Informed particle exploration */
+#include "online_vi_transition.h" /* ═══ ONLINE VI INTEGRATION ═══ */
 #include <mkl.h>
 #include <mkl_vsl.h>
 #include <stdint.h>
@@ -148,6 +150,22 @@ extern "C"
 #endif
 
 #define RBPF_MKL_N_COMPONENTS_TOTAL 11 /* 10 KSC + 1 outlier */
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * ONLINE VI CONFIGURATION
+     *
+     * LUT Precision for Rare Events:
+     *   1024:  0.1% resolution (legacy)
+     *   2048:  0.05% resolution (recommended for HFT)
+     *   4096:  0.025% resolution (tracking very rare events)
+     *
+     * Crisis regime transitions might be < 0.1% (e.g., P(calm→crash) = 0.01%)
+     * Higher resolution prevents rounding these to 0 or 1 entry.
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+#ifndef RBPF_TRANS_LUT_SIZE
+#define RBPF_TRANS_LUT_SIZE 2048 /* UPGRADED from 1024 for rare-event precision */
+#endif
 
     /*─────────────────────────────────────────────────────────────────────────────
      * PORTABLE SIMD HINTS
@@ -628,7 +646,7 @@ typedef float rbpf_real_t;
          * REGIME SYSTEM
          *======================================================================*/
         RBPF_RegimeParams params[RBPF_MAX_REGIMES];
-        uint8_t trans_lut[RBPF_MAX_REGIMES][1024]; /* Precomputed transition LUT */
+        uint8_t trans_lut[RBPF_MAX_REGIMES][RBPF_TRANS_LUT_SIZE]; /* Precomputed transition LUT */
 
         /*========================================================================
          * WORKSPACE (preallocated - NO malloc in hot path)
@@ -701,6 +719,31 @@ typedef float rbpf_real_t;
         int use_silverman_bandwidth;          /* 1 = Silverman adaptive, 0 = fixed */
         rbpf_real_t last_silverman_bandwidth; /* Diagnostic: last computed bandwidth */
 
+        /*========================================================================
+         * MH JITTERING (Stone #2 - Informed Exploration)
+         *
+         * After Silverman noise, apply Metropolis-Hastings refinement:
+         *   - Propose: h' = h + noise
+         *   - Boundary check: reject if crosses regime (Storvik safety)
+         *   - Likelihood check: accept with prob min(1, L_new/L_old)
+         *
+         * Turns blind jitter into likelihood-guided exploration.
+         * Adaptive scaling auto-tunes to ~50% acceptance rate.
+         *======================================================================*/
+        MH_Jitter_Config mh_jitter;
+        float regime_bounds[RBPF_MAX_REGIMES + 1]; /* Boundaries for regime checking */
+
+        /*========================================================================
+         * DEFERRED WEIGHT MODE (KL Tempering Support)
+         *
+         * When deferred_weight_mode=1:
+         *   - rbpf_ksc_update() stores weight increments in log_lik_increment[]
+         *   - External tempering loop calls rbpf_ksc_apply_weight_increments(β)
+         *   - Final weights: log_weight += β × log_lik_increment
+         *======================================================================*/
+        rbpf_real_t *log_lik_increment; /* [n] deferred weight increments */
+        int deferred_weight_mode;       /* 0 = immediate, 1 = deferred for tempering */
+
         /* Regime diversity preservation (prevents particle collapse to single regime) */
         int min_particles_per_regime;     /* Minimum particles guaranteed per regime */
         rbpf_real_t regime_mutation_prob; /* Probability of random regime mutation [0, 0.1] */
@@ -743,7 +786,7 @@ typedef float rbpf_real_t;
 
         SPRT_Multi sprt;
 
-        rbpf_real_t last_y; /* Last observation y = log(r²) for SPRT */
+        rbpf_real_t last_y; /* Last observation y = log(r²) for likelihood */
 
         /*========================================================================
          * BOCPD CHANGEPOINT DETECTION
@@ -778,15 +821,26 @@ typedef float rbpf_real_t;
         DirichletTransition trans_prior; /**< Dirichlet posterior over transitions */
         int trans_prior_enabled;         /**< 0 = use fixed matrix, 1 = learn online */
 
-        /*───────────────────────────────────────────────────────────────────────
-         * KL TEMPERING (Deferred Weight Mode)
+        /*========================================================================
+         * ONLINE VI TRANSITION LEARNING
          *
-         * When deferred_weight_mode=1, rbpf_ksc_update() stores log-likelihood
-         * increments but does NOT apply them to log_weight[]. The Extended layer
-         * then computes KL divergence and applies tempered weights.
-         *───────────────────────────────────────────────────────────────────────*/
-        rbpf_real_t *log_lik_increment; /**< [n_particles] Log-lik increments */
-        int deferred_weight_mode;       /**< 1 = defer, 0 = immediate */
+         * Replaces discrete Dirichlet updates with per-tick variational inference.
+         * Provides:
+         *   - Var[π_ij] for Kelly sizing
+         *   - Row entropy H[π_i] for PGAS triggers
+         *   - Geometric mean for correct LUT generation
+         *======================================================================*/
+        OnlineVI vi_transition; /**< Online VI posterior over transitions */
+        int use_online_vi;      /**< 0 = Dirichlet/fixed, 1 = Online VI */
+
+        /** SKEPTICAL: Learning rate floor to prevent stiffening
+         *  After 100k ticks, Robbins-Monro ρ_t → 0 and model stops adapting.
+         *  This floor ensures minimum responsiveness even without Lifeboat reset. */
+        double vi_rho_floor; /**< Minimum learning rate (default: 0.001) */
+
+        /** Counter for heartbeat trigger - force reset to restore adaptivity */
+        uint64_t vi_ticks_since_reset;  /**< Ticks since last VI reset */
+        uint64_t vi_heartbeat_interval; /**< Force reset after this many ticks (e.g., 50000) */
 
     } RBPF_KSC;
 
@@ -881,6 +935,31 @@ typedef float rbpf_real_t;
         int trans_learned_this_tick;              /**< 1 if a transition was learned this tick */
         float trans_stickiness[RBPF_MAX_REGIMES]; /**< Current P(stay in regime r) */
 
+        /*========================================================================
+         * ONLINE VI TRANSITION DIAGNOSTICS
+         *
+         * Provides uncertainty quantification for Kelly sizing and PGAS triggers.
+         *======================================================================*/
+
+        /** Transition variance from Online VI
+         *  INDEXING: trans_var[from][to] = Var[π_ij]
+         *  Kelly sizing: kelly_scale = 1.0 / (1.0 + sqrt(trans_var[i][j]))
+         *  Uncertain transitions → smaller positions */
+        double trans_var[RBPF_MAX_REGIMES][RBPF_MAX_REGIMES];
+
+        /** Per-row entropy: H[Dir(α_i)] for row i
+         *  High entropy = uncertain about transitions FROM regime i
+         *  Use to trigger PGAS when specific rows become uncertain */
+        double trans_row_entropy[RBPF_MAX_REGIMES];
+
+        /** Overall transition confidence [0, 1]
+         *  0 = maximum uncertainty (uniform), 1 = fully confident */
+        double trans_confidence;
+
+        /** Current VI learning rate (for diagnostics)
+         *  SKEPTICAL: Watch for ρ → 0 (stiffening) */
+        double vi_rho;
+
     } RBPF_KSC_Output;
 
     /*─────────────────────────────────────────────────────────────────────────────
@@ -943,7 +1022,7 @@ typedef float rbpf_real_t;
      * Typical usage: lag=5 for regime confirmation, lag=0 for pure filtering */
     void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag);
 
-    /* PMMH injection (call every 50-100 ticks with offline PMMH results)
+    /* PMMH injection (call every 50-100 ticks with slow-tick PMMH results)
      * Resets per-particle parameters toward PMMH estimates with controlled jitter */
     void rbpf_ksc_inject_pmmh(RBPF_KSC *rbpf, int regime,
                               rbpf_real_t pmmh_mu_vol, rbpf_real_t pmmh_sigma_vol,
@@ -954,6 +1033,150 @@ typedef float rbpf_real_t;
                                   const rbpf_real_t *pmmh_mu_vol,    /* [n_regimes] */
                                   const rbpf_real_t *pmmh_sigma_vol, /* [n_regimes] */
                                   rbpf_real_t blend);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * ONLINE VI TRANSITION LEARNING API
+     *
+     * Replaces discrete Dirichlet updates with per-tick variational inference.
+     * Provides Var[π_ij] for Kelly sizing and row entropy for uncertainty triggers.
+     *───────────────────────────────────────────────────────────────────────────*/
+
+    /**
+     * @brief Initialize Online VI (called internally by rbpf_ksc_create)
+     */
+    void rbpf_ksc_init_online_vi(RBPF_KSC *rbpf);
+
+    /**
+     * @brief Enable Online VI transition learning
+     *
+     * Replaces discrete Dirichlet updates with per-tick variational inference.
+     * Provides Var[π_ij] for Kelly sizing and row entropy for uncertainty triggers.
+     *
+     * RECOMMENDED WORKFLOW:
+     *   rbpf_ksc_build_transition_lut(rbpf, my_matrix);  // User's matrix
+     *   rbpf_ksc_vi_init_from_lut(rbpf, 20.0);           // VI inherits it
+     *   rbpf_ksc_enable_online_vi(rbpf, 1);              // Enable
+     *
+     * @param rbpf    The RBPF instance
+     * @param enable  1 to enable, 0 to use fixed/Dirichlet
+     */
+    void rbpf_ksc_enable_online_vi(RBPF_KSC *rbpf, int enable);
+
+    /**
+     * @brief Initialize VI from the current transition LUT
+     *
+     * This makes VI inherit your transition matrix as its prior.
+     * NO HEURISTICS - your matrix becomes the prior.
+     *
+     * Call this AFTER rbpf_ksc_build_transition_lut() and BEFORE
+     * rbpf_ksc_enable_online_vi().
+     *
+     * @param rbpf       The RBPF instance
+     * @param confidence ESS for the transition matrix (10-50 typical)
+     *                   Lower = faster adaptation, higher = slower
+     */
+    void rbpf_ksc_vi_init_from_lut(RBPF_KSC *rbpf, double confidence);
+
+    /**
+     * @brief Configure VI learning rate schedule (Robbins-Monro)
+     *
+     * ρ_t = ρ_0 × (τ + t)^{-κ}
+     *
+     * SKEPTICAL: With τ=64, κ=0.7, after 100k ticks:
+     *   ρ_100000 = 1.0 × (64 + 100000)^{-0.7} ≈ 0.0003
+     * This is very slow adaptation. Ensure heartbeat_interval triggers reset.
+     *
+     * @param rbpf   The RBPF instance
+     * @param rho_0  Initial learning rate (default: 1.0)
+     * @param tau    Delay parameter (default: 64.0)
+     * @param kappa  Decay exponent in [0.5, 1.0] (default: 0.7)
+     */
+    void rbpf_ksc_set_vi_learning_rate(RBPF_KSC *rbpf,
+                                       double rho_0, double tau, double kappa);
+
+    /**
+     * @brief Set learning rate floor to prevent stiffening
+     *
+     * Even after many ticks, ρ will not drop below this floor.
+     * Ensures model remains responsive without requiring Lifeboat reset.
+     *
+     * @param rbpf       The RBPF instance
+     * @param rho_floor  Minimum learning rate (default: 0.001)
+     */
+    void rbpf_ksc_set_vi_rho_floor(RBPF_KSC *rbpf, double rho_floor);
+
+    /**
+     * @brief Set heartbeat interval for forced VI reset
+     *
+     * After this many ticks without a Lifeboat injection, the VI learning rate
+     * is reset to rho_0 to restore adaptivity.
+     *
+     * SKEPTICAL: This is the "heartbeat_trigger" that prevents stiffening.
+     * Recommended: 50000 ticks (50 seconds at 1kHz)
+     *
+     * @param rbpf      The RBPF instance
+     * @param interval  Ticks between forced resets (0 = disabled)
+     */
+    void rbpf_ksc_set_vi_heartbeat(RBPF_KSC *rbpf, uint64_t interval);
+
+    /**
+     * @brief Core VI update (called from compute_outputs)
+     *
+     * Updates VI posterior from regime probabilities and log-likelihoods,
+     * rebuilds transition LUT from geometric mean, exports uncertainty.
+     *
+     * @param rbpf         The RBPF instance
+     * @param regime_probs Current regime probabilities [n_regimes]
+     * @param log_liks     Per-regime log-likelihoods [n_regimes]
+     * @param n_regimes    Number of regimes
+     * @param out          Output structure (receives trans_var, entropy, etc.)
+     */
+    void rbpf_ksc_vi_update(RBPF_KSC *rbpf,
+                            const float *regime_probs,
+                            const double *log_liks,
+                            int n_regimes,
+                            RBPF_KSC_Output *out);
+
+    /**
+     * @brief Reset VI from PGAS/Lifeboat injection
+     *
+     * CRITICAL: This is the "VI-PG Alignment Handshake".
+     * When Lifeboat injects new Π from PGAS, the fast-learning VI must adopt
+     * the new structural truth. Without this, VI continues with stale posterior.
+     *
+     * Call this in lifeboat_inject() AFTER swapping particles.
+     *
+     * @param rbpf        The RBPF instance
+     * @param pgas_trans  Row-major K×K transition matrix from PGAS
+     * @param confidence  Effective sample size for the PGAS estimate (e.g., 50.0)
+     */
+    void rbpf_ksc_vi_reset_from_pgas(RBPF_KSC *rbpf,
+                                     const double *pgas_trans,
+                                     double confidence);
+
+    /**
+     * @brief Get current VI posterior for Lifeboat comparison
+     *
+     * Returns the arithmetic mean E[π_ij] (for comparison with PGAS).
+     * For Kelly sizing, use trans_var from output struct.
+     *
+     * @param rbpf   The RBPF instance
+     * @param trans  Output: K×K transition matrix (row-major)
+     */
+    void rbpf_ksc_vi_get_transition_matrix(const RBPF_KSC *rbpf, double *trans);
+
+    /**
+     * @brief Get VI uncertainty for Lifeboat Mahalanobis distance
+     *
+     * @param rbpf  The RBPF instance
+     * @param var   Output: K×K variance matrix (row-major)
+     */
+    void rbpf_ksc_vi_get_transition_variance(const RBPF_KSC *rbpf, double *var);
+
+    /**
+     * @brief Print VI diagnostics
+     */
+    void rbpf_ksc_vi_print(const RBPF_KSC *rbpf);
 
     /*─────────────────────────────────────────────────────────────────────────────
      * STUDENT-T API
@@ -1435,6 +1658,47 @@ typedef float rbpf_real_t;
     void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime);
 
     /*─────────────────────────────────────────────────────────────────────────────
+     * MH JITTERING API (Stone #2 - Informed Exploration)
+     *
+     * Metropolis-Hastings refinement after Silverman noise.
+     * Turns blind jitter into likelihood-guided exploration.
+     * Safe with Storvik - stays within regime boundaries.
+     *───────────────────────────────────────────────────────────────────────────*/
+
+    /**
+     * @brief Enable/disable MH jittering
+     *
+     * MH jittering moves particles toward higher likelihood after Silverman noise.
+     * Adaptive scaling auto-tunes to ~50% acceptance rate.
+     *
+     * @param rbpf    RBPF instance
+     * @param enable  1 to enable, 0 to disable
+     */
+    void rbpf_ksc_enable_mh_jitter(RBPF_KSC *rbpf, int enable);
+
+    /**
+     * @brief Configure MH jittering parameters
+     *
+     * @param rbpf           RBPF instance
+     * @param proposal_scale Scale relative to Silverman bandwidth (default 1.0)
+     * @param max_attempts   Max proposals per particle (default 3)
+     */
+    void rbpf_ksc_configure_mh_jitter(RBPF_KSC *rbpf, float proposal_scale, int max_attempts);
+
+    /**
+     * @brief Print MH jittering statistics
+     *
+     * Shows: acceptance rate, boundary rejects, likelihood rejects,
+     * current proposal scale (auto-tuned).
+     */
+    void rbpf_ksc_print_mh_stats(const RBPF_KSC *rbpf);
+
+    /**
+     * @brief Reset MH jittering statistics
+     */
+    void rbpf_ksc_reset_mh_stats(RBPF_KSC *rbpf);
+
+    /*─────────────────────────────────────────────────────────────────────────────
      * BOCPD API Functions
      *───────────────────────────────────────────────────────────────────────────*/
 
@@ -1545,32 +1809,6 @@ typedef float rbpf_real_t;
      * @brief Print Dirichlet transition learning diagnostics
      */
     void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf);
-
-    /**
-     * @brief Rebuild transition LUT from Dirichlet posterior
-     *
-     * The RBPF uses a uint8_t[regime][1024] LUT for fast transition sampling.
-     * This function rebuilds it from the current Dirichlet posterior.
-     *
-     * @param rbpf  The RBPF instance
-     */
-    void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * KL TEMPERING API
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    /** Enable/disable deferred weight mode for KL tempering */
-    void rbpf_ksc_set_deferred_weight_mode(RBPF_KSC *rbpf, int enable);
-
-    /** Check if deferred weight mode is enabled */
-    int rbpf_ksc_get_deferred_weight_mode(const RBPF_KSC *rbpf);
-
-    /** Get pointer to log-likelihood increment buffer */
-    rbpf_real_t *rbpf_ksc_get_log_lik_increment(RBPF_KSC *rbpf);
-
-    /** Apply stored increments with tempering factor β */
-    void rbpf_ksc_apply_weight_increments(RBPF_KSC *rbpf, rbpf_real_t beta);
 
 #ifdef __cplusplus
 }

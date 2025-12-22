@@ -16,6 +16,7 @@
 
 #include "rbpf_ksc.h"
 #include "rbpf_sprt.h"
+#include "rbpf_mh_jitter.h"
 #include "rbpf_dirichlet_transition.h"
 #include "bocpd.h"
 #include <stdlib.h>
@@ -170,6 +171,24 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->use_silverman_bandwidth = 1;
     rbpf->last_silverman_bandwidth = RBPF_REAL(0.0);
 
+    /* MH Jittering (Stone #2) - Informed exploration after Silverman
+     * Turns blind noise into likelihood-guided particle movement.
+     * Adaptive scaling auto-tunes to ~50% acceptance rate. */
+    mh_jitter_init(&rbpf->mh_jitter);
+
+    /* Set regime boundaries as midpoints between adjacent regime centers
+     * Example for 4 regimes with μ = [-5, -4, -3, -2]:
+     *   bounds = [-10, -4.5, -3.5, -2.5, +2]
+     *   R0: [-10, -4.5), R1: [-4.5, -3.5), R2: [-3.5, -2.5), R3: [-2.5, +2) */
+    rbpf->regime_bounds[0] = -10.0f; /* Effective -∞ */
+    for (int r = 0; r < n_regimes - 1; r++)
+    {
+        float mu_r = (float)rbpf->params[r].mu_vol;
+        float mu_r1 = (float)rbpf->params[r + 1].mu_vol;
+        rbpf->regime_bounds[r + 1] = 0.5f * (mu_r + mu_r1);
+    }
+    rbpf->regime_bounds[n_regimes] = 2.0f; /* Effective +∞ */
+
     /* Regime diversity - "Pilot Light" safety net
      * Prevents P(regime=k) = 0 (absorbing state).
      * Primary regime switching handled by BOCPD + SPRT,
@@ -184,7 +203,7 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->detection.prev_regime = 0;
     rbpf->detection.cooldown = 0;
 
-    /* SPRT regime detection - use dedicated module */
+    /* SPRT regime detection */
     sprt_multi_init(&rbpf->sprt, n_regimes, 0.01, 0.01, 3);
 
     /* Dirichlet transition learning - disabled by default
@@ -452,6 +471,44 @@ void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime)
     /* Use SPRT module's force function */
     sprt_multi_force_regime(&rbpf->sprt, regime);
     rbpf->detection.stable_regime = regime;
+}
+
+/*─────────────────────────────────────────────────────────────────────────────
+ * MH JITTERING API (Stone #2 - Informed Exploration)
+ *
+ * Metropolis-Hastings refinement after Silverman noise.
+ * Turns blind jitter into likelihood-guided exploration.
+ *───────────────────────────────────────────────────────────────────────────*/
+
+void rbpf_ksc_enable_mh_jitter(RBPF_KSC *rbpf, int enable)
+{
+    if (!rbpf)
+        return;
+    rbpf->mh_jitter.enabled = enable;
+}
+
+void rbpf_ksc_configure_mh_jitter(RBPF_KSC *rbpf, float proposal_scale, int max_attempts)
+{
+    if (!rbpf)
+        return;
+    if (proposal_scale > 0.0f)
+        rbpf->mh_jitter.proposal_scale = proposal_scale;
+    if (max_attempts > 0)
+        rbpf->mh_jitter.max_attempts = max_attempts;
+}
+
+void rbpf_ksc_print_mh_stats(const RBPF_KSC *rbpf)
+{
+    if (!rbpf)
+        return;
+    mh_jitter_print_stats(&rbpf->mh_jitter);
+}
+
+void rbpf_ksc_reset_mh_stats(RBPF_KSC *rbpf)
+{
+    if (!rbpf)
+        return;
+    mh_jitter_reset_stats(&rbpf->mh_jitter);
 }
 
 /*─────────────────────────────────────────────────────────────────────────────

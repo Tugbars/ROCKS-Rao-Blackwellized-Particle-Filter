@@ -189,37 +189,34 @@ void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     out->dominant_regime = dom;
 
     /*========================================================================
-     * SPRT REGIME DETECTION
+     * REGIME DETECTION: SPRT
      *
-     * Computes per-regime observation log-likelihoods P(y | regime_k)
-     * using the OCSN (2007) log-χ² mixture model, then delegates to
-     * sprt_multi_update() for pairwise hypothesis testing.
-     *
-     * NOTE: Dirichlet transition learning is now handled by the Extended
-     * layer to maintain separation between math and policy.
+     * Pairwise hypothesis testing with min_dwell for stability.
+     * Uses log-χ² likelihood from OCSN mixture.
      *======================================================================*/
 
     RBPF_Detection *det = &rbpf->detection;
-
-    /* Compute per-regime log-likelihoods for SPRT
-     * P(y | regime k) using regime center h = μ_vol[k] */
-    double log_liks[SPRT_MAX_REGIMES];
     double y_obs = (double)rbpf->last_y;
+    int smoothed_regime;
 
-    for (int r = 0; r < n_regimes; r++)
     {
-        double h_regime = (double)rbpf->params[r].mu_vol;
-        log_liks[r] = sprt_logchisq_loglik(y_obs, h_regime);
+        /*────────────────────────────────────────────────────────────────────
+         * SPRT: Sequential Probability Ratio Test
+         *────────────────────────────────────────────────────────────────────*/
+        double log_liks[SPRT_MAX_REGIMES];
+
+        for (int r = 0; r < n_regimes; r++)
+        {
+            double h_regime = (double)rbpf->params[r].mu_vol;
+            log_liks[r] = sprt_logchisq_loglik(y_obs, h_regime);
+        }
+
+        smoothed_regime = sprt_multi_update(&rbpf->sprt, log_liks);
+        sprt_multi_get_evidence(&rbpf->sprt, out->sprt_evidence);
     }
 
-    /* Update SPRT module - handles pairwise tests and regime switching */
-    int sprt_regime = sprt_multi_update(&rbpf->sprt, log_liks);
-
-    out->smoothed_regime = sprt_regime;
-    det->stable_regime = sprt_regime;
-
-    /* Copy SPRT evidence to output for diagnostics */
-    sprt_multi_get_evidence(&rbpf->sprt, out->sprt_evidence);
+    out->smoothed_regime = smoothed_regime;
+    det->stable_regime = smoothed_regime;
 
     /*========================================================================
      * SELF-AWARE SIGNALS
