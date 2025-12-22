@@ -1089,4 +1089,54 @@ t = σ²_target / (σ²_particle + σ²_target)
 
 ---
 
+
+Our consensus on **PARIS** (PARticle-based, Rapid Incremental Smoother) within your specific HFT stack is that it serves as the **"Trajectory Repair Kit"** for the Live Thread.
+
+While the RBPF forward filter tells you where the market is *now*, PARIS ensures that the **history** of how we got here remains diverse and statistically valid for the background thread.
+
+Here is the breakdown of the consensus we reached regarding its role, implementation, and integration:
+
+### 1. The Operational Consensus: Where it fits
+
+PARIS does not run in the background; it runs on the **Live Thread**.
+
+* **Frequency:** Every market tick (Incremental Smoothing).
+* **The Problem it Solves:** Path Degeneracy. Without PARIS, your particle histories collapse into a single ancestor within ~100 ticks. If that one ancestor is "wrong" or a noisy outlier, your background PGAS thread will learn a "garbage" transition matrix.
+* **The Solution:** PARIS "repairs" the ancestry pointers at every step by looking at the immediate future () to re-select better ancestors for time .
+
+### 2. The Computational Consensus:  vs 
+
+Though the original Olsson & Westerborn paper highlights an  version via rejection sampling, our consensus for your **i9-14900KF / MKL** build is:
+
+* **Stick to  with MKL batching.**
+* **Why:** Rejection sampling involves heavy branching logic which kills the instruction pipeline on modern CPUs. For your target , a vectorized MKL kernel that computes the full  backward weight matrix is actually **faster** and has **zero jitter** compared to the "more efficient"  algorithm.
+
+### 3. Integration Consensus: Why we need it for your stack
+
+| Component | Why it needs PARIS |
+| --- | --- |
+| **Storvik (Live)** | Updates parameters () using smoothed paths, which reduces the "filtering bias" and prevents the model from chasing noise. |
+| **Kelly Sizing** | Smoothed regime probabilities are more stable than filtered ones. This prevents your position sizing from "chattering" during micro-spikes. |
+| **PGAS (Background)** | PARIS provides the **Reference Trajectory**. This is the single most important role. It ensures that when PGAS wakes up to update the transition matrix (), it is working with a high-quality, diverse set of paths. |
+| **Lifeboat** | The Lifeboat relies on a "Consistent Particle Cloud." PARIS ensures that cloud has a long, valid history so the handoff doesn't cause a weight collapse. |
+
+### 4. The "Handshake" with PGAS
+
+Our consensus on the data flow is:
+
+1. **Live Thread:** Runs RBPF + PARIS every tick.
+2. **Buffer:** The Live Thread stores a window of these *smoothed* particles ().
+3. **Trigger:** When PGAS is triggered, it grabs this  buffer.
+4. **Inference:** Because PARIS has kept the history diverse, PGAS can efficiently sample new transition matrices () without getting stuck in local modes.
+
+### 5. Summary Table
+
+| Feature | Consensus Value |
+| --- | --- |
+| **Target Latency** | **Sub-5µs** (Incremental overhead) |
+| **Complexity** |  (AVX-512/MKL Vectorized) |
+| **Smoothing Lag** | **1-Tick** (Immediate retrospective repair) |
+| **Primary Goal** | Prevent Path Collapse for the PGAS thread |
+
+
 *Last updated: December 2025*

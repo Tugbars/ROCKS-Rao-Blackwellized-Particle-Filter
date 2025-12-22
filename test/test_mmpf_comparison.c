@@ -497,12 +497,14 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
 
 /* Enable adaptive forgetting in REGIME mode (uses fixed λ, no surprise modulation) */
 rbpf_ext_enable_adaptive_forgetting_mode(ext, ADAPT_SIGNAL_REGIME);
+//rbpf_ext_enable_adaptive_forgetting(ext); 
 
-/* Set YOUR tuned λ values (not the defaults) */
-rbpf_ext_set_regime_lambda(ext, 0, 0.9990f);
+/* Set YOUR tuned λ values (not the defaults). Delete these if you want to make it completely adaptive */
+rbpf_ext_set_regime_lambda(ext, 0, 0.9990f); 
 rbpf_ext_set_regime_lambda(ext, 1, 0.9970f);
 rbpf_ext_set_regime_lambda(ext, 2, 0.9950f);
 rbpf_ext_set_regime_lambda(ext, 3, 0.9930f);
+
 
 /* Enable circuit breaker */
 rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);

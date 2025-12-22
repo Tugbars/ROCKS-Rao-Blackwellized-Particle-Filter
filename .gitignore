@@ -51,3 +51,4 @@ RBPF/rao-blackwellized/adaptive_ksc.md
 test/rbpf_performance_analysis.md
 adaptive_rbpf_architecture.md
 PGAS/ARCHITECTURE.md
+volatility_filter_architecture.md
