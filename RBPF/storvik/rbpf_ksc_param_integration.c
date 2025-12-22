@@ -611,25 +611,25 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
             param_learn_apply_resampling(&ext->storvik, rbpf->indices, n);
         }
 
+        /*───────────────────────────────────────────────────────────────────
+         * HYBRID APPROACH:
+         *   1. ALWAYS run filtered Storvik (real-time, every tick)
+         *   2. If smoother enabled, ALSO push to buffer
+         *   3. On structural break, smoother does PARIS flush
+         *
+         * This gives us:
+         *   - Real-time parameter tracking (no blind period)
+         *   - Smoothed corrections on regime changes
+         *───────────────────────────────────────────────────────────────────*/
+
+        /* Always: Filtered Storvik update */
+        extract_particle_info_optimized(ext, output->resampled);
+        param_learn_update(&ext->storvik, ext->particle_info, n);
+
+        /* Additionally: Smoother buffer management (if enabled) */
         if (ext->smoothed_storvik_enabled && ext->smoother)
         {
-            /*───────────────────────────────────────────────────────────────
-             * SMOOTHED PATH: PARIS Fixed-Lag
-             *
-             * Storvik receives smoothed (ℓ̃, ℓ̃_lag) from PARIS.
-             * State machine handles P², ESS collapse, cooldown.
-             *───────────────────────────────────────────────────────────────*/
             rbpf_ext_smoother_step(ext, output);
-        }
-        else
-        {
-            /*───────────────────────────────────────────────────────────────
-             * FILTERED PATH: Baseline
-             *
-             * Storvik receives filtered (ℓ, ℓ_lag) directly from RBPF.
-             *───────────────────────────────────────────────────────────────*/
-            extract_particle_info_optimized(ext, output->resampled);
-            param_learn_update(&ext->storvik, ext->particle_info, n);
         }
     }
 
