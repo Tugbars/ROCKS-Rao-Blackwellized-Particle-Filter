@@ -487,7 +487,6 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
         0.004f, 0.020f, 0.056f, 0.920f};
     rbpf_ext_build_transition_lut(ext, trans);
 
-
     /* ═══════════════════════════════════════════════════════════════════════
      * ENABLE DIRICHLET TRANSITION LEARNING
      *
@@ -496,26 +495,25 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
      * ═══════════════════════════════════════════════════════════════════════*/
     /*
     rbpf_ksc_set_transition_learning_params(ext->rbpf,
-                                            30.0f,   // stickiness 
-                                            1.0f,    // distance_scale 
-                                            0.999f); // gamma 
+                                            30.0f,   // stickiness
+                                            1.0f,    // distance_scale
+                                            0.999f); // gamma
     rbpf_ksc_enable_transition_learning(ext->rbpf, 1);
     */
 
-/* Enable adaptive forgetting in REGIME mode (uses fixed λ, no surprise modulation) */
-rbpf_ext_enable_adaptive_forgetting_mode(ext, ADAPT_SIGNAL_REGIME);
-//rbpf_ext_enable_adaptive_forgetting(ext); 
+    /* Enable adaptive forgetting in REGIME mode (uses fixed λ, no surprise modulation) */
+    rbpf_ext_enable_adaptive_forgetting_mode(ext, ADAPT_SIGNAL_REGIME);
+    // rbpf_ext_enable_adaptive_forgetting(ext);
 
-/* Set YOUR tuned λ values (not the defaults). Delete these if you want to make it completely adaptive 
-rbpf_ext_set_regime_lambda(ext, 0, 0.9990f); 
-rbpf_ext_set_regime_lambda(ext, 1, 0.9970f);
-rbpf_ext_set_regime_lambda(ext, 2, 0.9950f);
-rbpf_ext_set_regime_lambda(ext, 3, 0.9930f);
-*/
+    /* Set YOUR tuned λ values (not the defaults). Delete these if you want to make it completely adaptive
+    rbpf_ext_set_regime_lambda(ext, 0, 0.9990f);
+    rbpf_ext_set_regime_lambda(ext, 1, 0.9970f);
+    rbpf_ext_set_regime_lambda(ext, 2, 0.9950f);
+    rbpf_ext_set_regime_lambda(ext, 3, 0.9930f);
+    */
 
-
-/* Enable circuit breaker */
-rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);
+    /* Enable circuit breaker */
+    rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);
 
     /* Enable Robust OCSN */
     ext->robust_ocsn.enabled = 1;
@@ -1142,3 +1140,115 @@ int main(int argc, char **argv)
 
     return 0;
 }
+
+/*
+
+══════════════════════════════════════════════════════════════
+  RBPF Parameter Tuner
+═══════════════════════════════════════════════════════════════
+  Mode: Full (3^8=6561)
+  Configs: 6561
+  Particles: 256
+
+  Data: 8000 ticks
+
+  Threads: 32
+
+  Progress: 6500/6561 (99%)
+
+Completed in 74.1 sec (11.3 ms/config)
+
+═══════════════════════════════════════════════════════════════
+  BEST FOR VOL RMSE
+═══════════════════════════════════════════════════════════════
+  Config:
+    μ_calm=-4.50  μ_crisis=-2.00
+    σ_calm=0.080  σ_ratio=8.0
+    θ_calm=0.0080  θ_ratio=15.0
+    stickiness=0.92  λ_calm=0.9980
+  ─────────────────────────────
+    Vol RMSE:     0.13651
+    Log-Vol RMSE: 0.4288
+    Hypo Acc:     64.4%
+    Trans Lag:    12.2 ticks
+    False Crisis: 120
+    Min ESS:      10.5
+    Score:        2.8150
+
+═══════════════════════════════════════════════════════════════
+  BEST FOR HYPOTHESIS ACCURACY
+═══════════════════════════════════════════════════════════════
+  Config:
+    μ_calm=-5.50  μ_crisis=-2.00
+    σ_calm=0.080  σ_ratio=8.0
+    θ_calm=0.0030  θ_ratio=40.0
+    stickiness=0.98  λ_calm=0.9980
+  ─────────────────────────────
+    Vol RMSE:     0.14317
+    Log-Vol RMSE: 0.4232
+    Hypo Acc:     81.7%
+    Trans Lag:    15.3 ticks
+    False Crisis: 216
+    Min ESS:      3.6
+    Score:        2.9309
+
+═══════════════════════════════════════════════════════════════
+  BEST FOR TRANSITION LAG
+═══════════════════════════════════════════════════════════════
+  Config:
+    μ_calm=-5.50  μ_crisis=-2.00
+    σ_calm=0.100  σ_ratio=4.0
+    θ_calm=0.0050  θ_ratio=40.0
+    stickiness=0.92  λ_calm=0.9995
+  ─────────────────────────────
+    Vol RMSE:     0.15197
+    Log-Vol RMSE: 0.4501
+    Hypo Acc:     47.2%
+    Trans Lag:    6.5 ticks
+    False Crisis: 528
+    Min ESS:      3.0
+    Score:        3.4370
+
+═══════════════════════════════════════════════════════════════
+  BEST BALANCED (0.35×RMSE + 0.30×Acc + 0.20×Lag + 0.15×FC)
+═══════════════════════════════════════════════════════════════
+  Config:
+    μ_calm=-4.50  μ_crisis=-1.50
+    σ_calm=0.060  σ_ratio=8.0
+    θ_calm=0.0030  θ_ratio=40.0
+    stickiness=0.92  λ_calm=0.9995
+  ─────────────────────────────
+    Vol RMSE:     0.13742
+    Log-Vol RMSE: 0.4351
+    Hypo Acc:     63.5%
+    Trans Lag:    10.7 ticks
+    False Crisis: 75
+    Min ESS:      11.2
+    Score:        2.7869
+
+  Results saved to: rbpf_tuning_results.csv
+
+═══════════════════════════════════════════════════════════════
+  RECOMMENDED C CODE (Balanced Best)
+═══════════════════════════════════════════════════════════════
+
+
+rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.50f, 0.060f); 
+rbpf_ext_set_regime_params(ext, 1, 0.0416f, -3.51f, 0.199f);  
+rbpf_ext_set_regime_params(ext, 2, 0.0814f, -2.49f, 0.341f);  
+rbpf_ext_set_regime_params(ext, 3, 0.1200f, -1.50f, 0.480f);  
+
+rbpf_real_t trans[16] = {
+    0.920f, 0.056f, 0.020f, 0.004f,
+    0.032f, 0.920f, 0.036f, 0.012f,
+    0.012f, 0.036f, 0.920f, 0.032f,
+    0.004f, 0.020f, 0.056f, 0.920f};
+rbpf_ext_build_transition_lut(ext, trans);
+
+
+param_learn_set_regime_forgetting(&ext->storvik, 0, 0.9995f);
+param_learn_set_regime_forgetting(&ext->storvik, 1, 0.9975f);
+param_learn_set_regime_forgetting(&ext->storvik, 2, 0.9955f);
+param_learn_set_regime_forgetting(&ext->storvik, 3, 0.9935f);
+
+*/
