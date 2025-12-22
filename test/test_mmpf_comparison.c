@@ -455,10 +455,10 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
 
     /* Create extended RBPF with full stack */
     RBPF_Extended *ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
+    rbpf_ext_enable_kl_tempering(ext);
 
 
     /* Enable PARIS smoothed Storvik (L=50 tick lag) */
-
     rbpf_ext_enable_smoothed_storvik(ext, 5);
 
 
@@ -486,6 +486,7 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
         0.012f, 0.036f, 0.920f, 0.032f,
         0.004f, 0.020f, 0.056f, 0.920f};
     rbpf_ext_build_transition_lut(ext, trans);
+
 
     /* ═══════════════════════════════════════════════════════════════════════
      * ENABLE DIRICHLET TRANSITION LEARNING

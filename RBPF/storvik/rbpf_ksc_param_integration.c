@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <inttypes.h>
 
 /*═══════════════════════════════════════════════════════════════════════════
  * SIMD AND CACHE CONFIGURATION
@@ -1112,4 +1113,128 @@ void rbpf_ext_print_storvik_stats(const RBPF_Extended *ext, int regime)
         return;
     printf("\nStorvik Statistics (Regime %d):\n", regime);
     param_learn_print_regime_stats(&ext->storvik, regime);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * KL TEMPERING API
+ *
+ * Information-geometric weight normalization. When enabled:
+ * - rbpf_ksc_update() stores log_lik_increment but doesn't apply
+ * - rbpf_kl_step() computes KL divergence and applies tempered weights
+ * - Zombie detection triggers structural break signals
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void rbpf_ext_enable_kl_tempering(RBPF_Extended *ext)
+{
+    if (!ext)
+        return;
+
+    ext->kl_tempering_enabled = 1;
+
+    /* Enable deferred weight mode on underlying RBPF */
+    rbpf_ksc_set_deferred_weight_mode(ext->rbpf, 1);
+
+    /* Initialize KL state if not already done */
+    if (ext->kl_state)
+    {
+        rbpf_kl_state_reset(ext->kl_state);
+    }
+}
+
+void rbpf_ext_disable_kl_tempering(RBPF_Extended *ext)
+{
+    if (!ext)
+        return;
+
+    ext->kl_tempering_enabled = 0;
+
+    /* Disable deferred weight mode - weights applied immediately */
+    rbpf_ksc_set_deferred_weight_mode(ext->rbpf, 0);
+}
+
+int rbpf_ext_kl_tempering_enabled(const RBPF_Extended *ext)
+{
+    return ext ? ext->kl_tempering_enabled : 0;
+}
+
+float rbpf_ext_get_last_beta(const RBPF_Extended *ext)
+{
+    if (!ext || !ext->kl_state)
+        return 1.0f;
+    return ext->kl_state->last_beta;
+}
+
+float rbpf_ext_get_last_kl(const RBPF_Extended *ext)
+{
+    if (!ext || !ext->kl_state)
+        return 0.0f;
+    return ext->kl_state->last_kl;
+}
+
+uint64_t rbpf_ext_get_zombie_resets(const RBPF_Extended *ext)
+{
+    if (!ext || !ext->kl_state)
+        return 0;
+    return ext->kl_state->zombie_reset_count;
+}
+
+void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext)
+{
+    if (!ext)
+    {
+        printf("KL Tempering: ext is NULL\n");
+        return;
+    }
+
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  KL Tempering Diagnostics\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  Enabled:           %s\n", ext->kl_tempering_enabled ? "YES" : "NO");
+
+    if (ext->kl_tempering_enabled && ext->kl_state)
+    {
+        RBPF_KL_State *kl = ext->kl_state;
+
+        printf("  Particles:         %d\n", kl->n_particles);
+        printf("  KL ceiling:        %.4f nats (log N)\n", kl->max_kl);
+        printf("  Beta floor:        %.2f\n", kl->beta_floor);
+        printf("\n");
+        printf("  Last tick:\n");
+        printf("    KL divergence:   %.4f nats\n", kl->last_kl);
+        printf("    Beta applied:    %.4f\n", kl->last_beta);
+        printf("    log(Z_old):      %.4f\n", kl->log_Z_old);
+        printf("\n");
+        printf("  Counters:\n");
+        printf("    Ticks processed: %" PRIu64 "\n", kl->ticks_processed);
+        printf("    Hard clamps:     %" PRIu64 " (%.3f%%)\n",
+               kl->hard_clamp_count,
+               kl->ticks_processed > 0 ? 100.0 * kl->hard_clamp_count / kl->ticks_processed : 0.0);
+        printf("    Soft dampens:    %" PRIu64 " (%.3f%%)\n",
+               kl->soft_dampen_count,
+               kl->ticks_processed > 0 ? 100.0 * kl->soft_dampen_count / kl->ticks_processed : 0.0);
+        printf("    Zombie resets:   %" PRIu64 "\n", kl->zombie_reset_count);
+        printf("\n");
+        printf("  Zombie state:\n");
+        printf("    Consecutive low: %d / %d\n",
+               kl->consecutive_low_beta, kl->zombie_threshold);
+        printf("    Currently zombie: %s\n",
+               kl->consecutive_low_beta >= kl->zombie_threshold ? "YES" : "NO");
+        printf("\n");
+        printf("  P² Quantile (p95):\n");
+        printf("    Warmup:          %s (%" PRIu64 " / %d)\n",
+               kl->warmup_complete ? "COMPLETE" : "IN PROGRESS",
+               kl->ticks_processed, kl->warmup_ticks);
+        printf("    Current p95:     %.4f nats\n", kl->kl_p95);
+    }
+    else if (!ext->kl_tempering_enabled)
+    {
+        printf("  (Enable with rbpf_ext_enable_kl_tempering())\n");
+    }
+    else
+    {
+        printf("  KL state not initialized\n");
+    }
+
+    printf("═══════════════════════════════════════════════════════════════\n");
 }
