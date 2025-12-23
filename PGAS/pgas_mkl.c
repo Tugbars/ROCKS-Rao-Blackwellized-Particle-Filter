@@ -250,8 +250,8 @@ PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed)
     state->adaptive_kappa_enabled = 0;
     state->kappa_min = 20.0f;
     state->kappa_max = 500.0f;
-    state->kappa_up_rate = 0.3f;   /* Fast reaction to volatility spikes */
-    state->kappa_down_rate = 0.1f; /* Slow return to normal */
+    state->kappa_up_rate = 0.3f;   /* Fast DECREASE when chatter high (regime change) */
+    state->kappa_down_rate = 0.1f; /* Slow INCREASE when chatter low (stability) */
     state->last_chatter_ratio = 1.0f;
     state->last_off_diag_count = 0;
     state->last_total_count = 0;
@@ -1194,12 +1194,18 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
      * ADAPTIVE KAPPA UPDATE (if enabled)
      *
      * ASYMMETRIC ADAPTATION:
-     * - Volatility spikes arrive INSTANTLY → increase κ FAST (suppress noise)
-     * - Calm returns SLOWLY → decrease κ SLOW (maintain stability)
      *
-     * This asymmetry reflects market reality:
-     *   - False negative (missing spike) → catastrophic loss
-     *   - False positive (over-regularizing calm) → minor inefficiency
+     * Chatter ratio = observed_transitions / expected_from_prior
+     *
+     * - ratio > 1.5: Data has MORE switches than prior expects
+     *                → Prior is TOO STICKY → DECREASE κ (fast)
+     *
+     * - ratio < 0.5: Data has FEWER switches than prior expects
+     *                → Prior is NOT STICKY ENOUGH → INCREASE κ (slow)
+     *
+     * Asymmetry rationale:
+     *   - Volatility spikes → sudden excess chatter → need fast κ reduction
+     *   - Return to calm → gradual → slow κ increase is fine
      * ═══════════════════════════════════════════════════════════════════*/
 
     if (state->adaptive_kappa_enabled)
@@ -1209,16 +1215,18 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
 
         if (ratio > 1.5f)
         {
-            /* Too much chatter: FAST increase in stickiness
-             * React quickly to volatility spike / flash crash */
-            float factor = 1.0f + state->kappa_up_rate * (ratio - 1.0f);
+            /* Data has more transitions than prior expects
+             * → Prior too sticky → DECREASE κ (fast) */
+            float factor = 1.0f - state->kappa_up_rate * (ratio - 1.0f);
+            if (factor < 0.5f)
+                factor = 0.5f; /* Don't halve more than once */
             kappa_new = state->sticky_kappa * factor;
         }
         else if (ratio < 0.5f)
         {
-            /* Prior too strong: SLOW decrease in stickiness
-             * Gradual return to normal, maintain stability */
-            float factor = 1.0f - state->kappa_down_rate * (1.0f - ratio * 2.0f);
+            /* Data has fewer transitions than prior expects
+             * → Prior not sticky enough → INCREASE κ (slow) */
+            float factor = 1.0f + state->kappa_down_rate * (1.0f - ratio * 2.0f);
             kappa_new = state->sticky_kappa * factor;
         }
         /* else: ratio in [0.5, 1.5] → keep kappa unchanged */

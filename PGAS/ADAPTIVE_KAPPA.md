@@ -34,9 +34,9 @@ Where:
 
 | Chatter Ratio | Meaning | Action |
 |---------------|---------|--------|
-| > 1.5 | PGAS sees more switching than prior expects | Increase κ (more sticky) |
+| > 1.5 | Data has MORE switches than prior expects | DECREASE κ (prior too sticky) |
 | 0.5 - 1.5 | Prior matches data | Keep κ |
-| < 0.5 | Prior suppressing real transitions | Decrease κ (less sticky) |
+| < 0.5 | Data has FEWER switches than prior expects | INCREASE κ (prior not sticky enough) |
 
 ---
 
@@ -114,12 +114,14 @@ if (adaptive_kappa_enabled) {
     float ratio = last_chatter_ratio;
     
     if (ratio > 1.5f) {
-        // Too much chatter: FAST increase stickiness
-        kappa *= 1.0f + kappa_up_rate * (ratio - 1.0f);
+        // Data has more transitions than prior expects
+        // Prior too sticky → DECREASE kappa (fast)
+        kappa *= 1.0f - kappa_up_rate * (ratio - 1.0f);
     }
     else if (ratio < 0.5f) {
-        // Prior too strong: SLOW decrease stickiness
-        kappa *= 1.0f - kappa_down_rate * (1.0f - 2.0f * ratio);
+        // Data has fewer transitions than prior expects  
+        // Prior not sticky enough → INCREASE kappa (slow)
+        kappa *= 1.0f + kappa_down_rate * (1.0f - 2.0f * ratio);
     }
     // else: ratio in [0.5, 1.5] → no change
     
@@ -134,8 +136,8 @@ if (adaptive_kappa_enabled) {
 |-----------|---------|-------------|
 | `kappa_min` | 20.0 | Lower bound (prevents instability) |
 | `kappa_max` | 500.0 | Upper bound (prevents over-regularization) |
-| `kappa_up_rate` | 0.3 | Fast increase on volatility spike |
-| `kappa_down_rate` | 0.1 | Slow decrease during recovery |
+| `kappa_up_rate` | 0.3 | Fast DECREASE when chatter > 1.5 |
+| `kappa_down_rate` | 0.1 | Slow INCREASE when chatter < 0.5 |
 
 ---
 
@@ -165,8 +167,8 @@ pgas_mkl_enable_adaptive_kappa(pgas, 1);
 pgas_mkl_configure_adaptive_kappa(pgas, 
     50.0f,   // kappa_min
     300.0f,  // kappa_max  
-    0.3f,    // up_rate (fast reaction to spikes)
-    0.1f);   // down_rate (slow return to normal)
+    0.3f,    // up_rate (fast DECREASE when chatter high)
+    0.1f);   // down_rate (slow INCREASE when chatter low)
 
 for (int i = 0; i < n_sweeps; i++) {
     pgas_mkl_gibbs_sweep(pgas);
@@ -293,32 +295,38 @@ For HFT: slower is safer (0.1-0.2)
 
 In trading, volatility spikes arrive **instantly**, but calm returns **slowly**. 
 
-**Implementation**: Uses separate rates for increase vs decrease:
-- **kappa_up_rate = 0.3** (fast) — React quickly to volatility spike
-- **kappa_down_rate = 0.1** (slow) — Gradual return to normal
+**Corrected Logic**:
+- **chatter > 1.5**: Data has MORE transitions than prior expects → prior too sticky → DECREASE κ (fast)
+- **chatter < 0.5**: Data has FEWER transitions than prior expects → prior not sticky enough → INCREASE κ (slow)
+
+**Implementation**: Uses separate rates for decrease vs increase:
+- **kappa_up_rate = 0.3** (fast) — React quickly to regime change (DECREASE κ)
+- **kappa_down_rate = 0.1** (slow) — Gradual return to stability (INCREASE κ)
 
 ```c
 if (ratio > 1.5f) {
-    // Fast increase - react to volatility spike
-    kappa *= 1.0f + kappa_up_rate * (ratio - 1.0f);
+    // Data has more switches than prior expects
+    // Prior too sticky → DECREASE κ (fast)
+    kappa *= 1.0f - kappa_up_rate * (ratio - 1.0f);
 }
 else if (ratio < 0.5f) {
-    // Slow decrease - gradual return to normal
-    kappa *= 1.0f - kappa_down_rate * (1.0f - 2.0f * ratio);
+    // Data has fewer switches than prior expects
+    // Prior not sticky enough → INCREASE κ (slow)
+    kappa *= 1.0f + kappa_down_rate * (1.0f - 2.0f * ratio);
 }
 ```
 
 **Rationale**: 
-- False negative (missing a spike) → catastrophic loss
-- False positive (over-regularizing calm) → minor inefficiency
+- Fast κ decrease allows quick adaptation to regime changes
+- Slow κ increase prevents oscillation during stable periods
 
 **Configuration**:
 ```c
 pgas_mkl_configure_adaptive_kappa(pgas,
     50.0f,   // kappa_min
     300.0f,  // kappa_max
-    0.3f,    // up_rate (fast)
-    0.1f);   // down_rate (slow)
+    0.3f,    // up_rate (fast DECREASE)
+    0.1f);   // down_rate (slow INCREASE)
 ```
 
 ---

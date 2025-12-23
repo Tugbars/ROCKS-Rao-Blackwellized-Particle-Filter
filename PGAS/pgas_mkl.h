@@ -316,9 +316,14 @@ extern "C"
      * Disabled by default — enable explicitly with pgas_mkl_enable_adaptive_kappa().
      *
      * Theory:
-     *   - chatter_ratio = observed_transitions / expected_transitions
-     *   - If ratio > 1.5: prior too weak, increase κ
-     *   - If ratio < 0.5: prior too strong, decrease κ
+     *   chatter_ratio = observed_transitions / expected_from_prior
+     *
+     *   - If ratio > 1.5: Data has MORE switches than prior expects
+     *                     → Prior is too sticky → DECREASE κ
+     *
+     *   - If ratio < 0.5: Data has FEWER switches than prior expects
+     *                     → Prior not sticky enough → INCREASE κ
+     *
      *   - If ratio ≈ 1.0: κ is well-calibrated
      *
      * This allows PGAS to self-tune to actual market stickiness.
@@ -344,13 +349,15 @@ extern "C"
     /**
      * @brief Configure adaptive kappa parameters
      *
-     * Uses ASYMMETRIC rates: fast increase (react to spikes), slow decrease (stable recovery)
+     * Uses ASYMMETRIC rates:
+     *   - up_rate: Fast DECREASE when chatter high (regime change detected)
+     *   - down_rate: Slow INCREASE when chatter low (return to stability)
      *
      * @param state         PGAS state
      * @param kappa_min     Lower bound for κ (default: 20.0)
      * @param kappa_max     Upper bound for κ (default: 500.0)
-     * @param up_rate       Rate for increasing κ when chatter high (default: 0.3)
-     * @param down_rate     Rate for decreasing κ when prior too strong (default: 0.1)
+     * @param up_rate       Rate for DECREASING κ when chatter > 1.5 (default: 0.3)
+     * @param down_rate     Rate for INCREASING κ when chatter < 0.5 (default: 0.1)
      */
     static inline void pgas_mkl_configure_adaptive_kappa(PGASMKLState *state,
                                                          float kappa_min,
