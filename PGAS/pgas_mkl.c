@@ -98,6 +98,8 @@ static void init_ocsn_constants(void)
  * @param y  Observation y_t = log(r_t²)
  * @param h  Log-volatility state h_t
  * @return   log P(y | h) under OCSN mixture
+ *
+ * SAFETY: Returns -1e20f instead of -Inf/NaN to prevent weight collapse
  */
 static inline float ocsn_log_likelihood_single(float y, float h)
 {
@@ -124,7 +126,15 @@ static inline float ocsn_log_likelihood_single(float y, float h)
         sum += expf(log_comps[j] - max_log);
     }
 
-    return max_log + logf(sum);
+    float result = max_log + logf(sum);
+
+    /* Guard against NaN/Inf - return large negative instead */
+    if (!isfinite(result) || result < -1e20f)
+    {
+        return -1e20f;
+    }
+
+    return result;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -481,6 +491,9 @@ static int sample_regime_mkl(const PGASMKLModel *m, int prev_regime,
  * Compute normalized weights from log-weights using MKL VML
  *
  * Uses N_padded for SIMD but only sums/normalizes first N elements
+ *
+ * SAFETY: If all weights collapse to zero (total particle degeneracy),
+ * reset to uniform distribution to keep the filter alive.
  */
 static void logsumexp_normalize_mkl(const float *log_weights, int N, int N_padded,
                                     float *weights, float *workspace)
@@ -488,6 +501,19 @@ static void logsumexp_normalize_mkl(const float *log_weights, int N, int N_padde
     /* Find max using CBLAS (only over valid N elements) */
     int max_idx = cblas_isamax(N, log_weights, 1);
     float max_val = log_weights[max_idx];
+
+    /* Guard against all -inf (total collapse) */
+    if (max_val < -1e30f || !isfinite(max_val))
+    {
+        /* Total collapse: Reset to uniform */
+        float unif = 1.0f / N;
+        for (int i = 0; i < N; i++)
+            weights[i] = unif;
+        for (int i = N; i < N_padded; i++)
+            weights[i] = 0.0f;
+        return;
+    }
+
     float neg_max = -max_val;
 
     /* Subtract max using full N_padded for SIMD */
@@ -511,6 +537,18 @@ static void logsumexp_normalize_mkl(const float *log_weights, int N, int N_padde
 
     /* Sum only valid N elements */
     float sum = cblas_sasum(N, weights, 1);
+
+    /* Guard against zero sum (shouldn't happen after max check, but be safe) */
+    if (sum < 1e-30f || !isfinite(sum))
+    {
+        /* Total collapse: Reset to uniform */
+        float unif = 1.0f / N;
+        for (i = 0; i < N; i++)
+            weights[i] = unif;
+        for (i = N; i < N_padded; i++)
+            weights[i] = 0.0f;
+        return;
+    }
 
     /* Normalize only valid N elements */
     float inv_sum = 1.0f / sum;
@@ -636,7 +674,13 @@ static void compute_log_emission_ocsn_mkl(float y, const float *h, int N, int N_
 #endif
     for (i = 0; i < N; i++)
     {
-        log_lik[i] = log_lik[i] + exp_comps[i];
+        float result = log_lik[i] + exp_comps[i];
+        /* Guard against NaN/Inf - clamp to large negative */
+        if (!isfinite(result) || result < -1e20f)
+        {
+            result = -1e20f;
+        }
+        log_lik[i] = result;
     }
 
     /* Set padding to NEG_INF */
@@ -799,10 +843,20 @@ static void compute_log_emission_ocsn_avx2(float y, const float *h, int N, int N
         _mm256_storeu_ps(&log_lik[i], result);
     }
 
-    /* Handle remainder with scalar */
+    /* Handle remainder with scalar (already has guard) */
     for (; i < N; i++)
     {
         log_lik[i] = ocsn_log_likelihood_single(y, h[i]);
+    }
+
+    /* Clamp extreme values to prevent weight collapse */
+    const float MIN_LOG_LIK = -1e20f;
+    for (i = 0; i < N; i++)
+    {
+        if (!isfinite(log_lik[i]) || log_lik[i] < MIN_LOG_LIK)
+        {
+            log_lik[i] = MIN_LOG_LIK;
+        }
     }
 
     /* Set padding to NEG_INF */
@@ -1217,7 +1271,7 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
      * Reference: Ljung & Söderström, "Theory and Practice of RLS"
      * ═══════════════════════════════════════════════════════════════════*/
 
-    if (state->adaptive_kappa_enabled)
+    if (state->adaptive_kappa_enabled && state->last_total_count >= 10)
     {
         const int K = state->K;
         const float alpha = state->prior_alpha;
@@ -1225,9 +1279,6 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         /* 1. Get current diagnostics */
         int total_switches = state->last_off_diag_count;
         int total_obs = state->last_total_count;
-
-        if (total_obs < 10)
-            return; /* Need minimum data */
 
         /* 2. Expected switch rate from current prior */
         float expected_diag = (state->sticky_kappa + alpha) /
@@ -1415,6 +1466,17 @@ static inline void logsumexp_normalize_avx2(const float *log_weights, int N, int
             max_val = log_weights[i];
     }
 
+    /* SAFETY: Check for total collapse */
+    if (max_val < -1e30f || !isfinite(max_val))
+    {
+        float unif = 1.0f / N;
+        for (i = 0; i < N; i++)
+            weights[i] = unif;
+        for (i = N; i < N_padded; i++)
+            weights[i] = 0.0f;
+        return;
+    }
+
     /* Phase 2: Subtract max, exp, and accumulate sum */
     __m256 neg_max = _mm256_set1_ps(-max_val);
     __m256 sum_vec = _mm256_setzero_ps();
@@ -1442,6 +1504,17 @@ static inline void logsumexp_normalize_avx2(const float *log_weights, int N, int
         float exp_v = expf(log_weights[i] - max_val);
         weights[i] = exp_v;
         sum += exp_v;
+    }
+
+    /* SAFETY: Check for zero sum */
+    if (sum < 1e-30f || !isfinite(sum))
+    {
+        float unif = 1.0f / N;
+        for (i = 0; i < N; i++)
+            weights[i] = unif;
+        for (i = N; i < N_padded; i++)
+            weights[i] = 0.0f;
+        return;
     }
 
     /* Phase 3: Normalize */

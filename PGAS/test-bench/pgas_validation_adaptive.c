@@ -213,6 +213,11 @@ void run_adaptive_test(const AdaptiveScenario *scenario, uint32_t seed)
     printf("Generating synthetic data (diag=%.2f)...\n", diag);
     SyntheticData *data = generate_synthetic_data(K, T, trans_true, mu_vol,
                                                   sigma_vol, phi, sigma_h, seed);
+    if (!data)
+    {
+        printf("ERROR: Failed to generate synthetic data\n");
+        return;
+    }
 
     /* Initialize PGAS with WRONG κ */
     printf("Initializing PGAS with κ=%.0f...\n", scenario->initial_kappa);
@@ -233,6 +238,12 @@ void run_adaptive_test(const AdaptiveScenario *scenario, uint32_t seed)
     }
 
     PGASMKLState *pgas = pgas_mkl_alloc(N, T, K, seed + 1000);
+    if (!pgas)
+    {
+        printf("ERROR: Failed to allocate PGAS state\n");
+        free_synthetic_data(data);
+        return;
+    }
 
     double init_trans[16];
     for (int i = 0; i < K * K; i++)
@@ -251,13 +262,22 @@ void run_adaptive_test(const AdaptiveScenario *scenario, uint32_t seed)
 
     /* Load observations */
     double *obs_double = (double *)malloc(T * sizeof(double));
+    if (!obs_double)
+    {
+        printf("ERROR: Failed to allocate obs_double\n");
+        pgas_mkl_free(pgas);
+        free_synthetic_data(data);
+        return;
+    }
     for (int i = 0; i < T; i++)
         obs_double[i] = (double)data->observations[i];
     pgas_mkl_load_observations(pgas, obs_double, T);
     free(obs_double);
 
     /* Initialize reference */
+    printf("Running initial CSMC sweep...\n");
     pgas_mkl_csmc_sweep(pgas);
+    printf("Initial sweep complete.\n");
 
     /* Capture κ BEFORE burn-in */
     float kappa_start = pgas_mkl_get_sticky_kappa(pgas);
@@ -606,13 +626,22 @@ int main(void)
 
     int n_scenarios = sizeof(scenarios) / sizeof(scenarios[0]);
 
-    for (int i = 0; i < n_scenarios; i++)
+    /* DEBUG: To isolate crash, try running specific scenario:
+     * Change start_idx and end_idx to run single scenario
+     * 0 = diag=0.90, 1 = diag=0.98, 2 = diag=0.95 */
+    int start_idx = 0;
+    int end_idx = n_scenarios; /* Change to 1 to run only scenario 0, etc. */
+
+    for (int i = start_idx; i < end_idx; i++)
     {
         run_adaptive_test(&scenarios[i], base_seed + i * 10000);
     }
 
     /* Head-to-head comparison */
-    run_comparison_test(base_seed + 99999);
+    if (start_idx == 0 && end_idx == n_scenarios)
+    {
+        run_comparison_test(base_seed + 99999);
+    }
 
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
