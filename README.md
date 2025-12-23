@@ -102,19 +102,45 @@ Every component has mathematical justification. No heuristics.
 | Component | Principle | What It Does |
 |-----------|-----------|--------------|
 | **Rao-Blackwellization** | Variance reduction theorem | Analytically marginalizes continuous state → 10× fewer particles |
-| **Omori 10-component** | Optimal log-χ² approximation | Accurate likelihood in tails (vs 7-component KSC) |
-| **Student-t** | Scale mixture of Gaussians | Fat tails are structural, not anomalies |
-| **OCSN 11th component** | Robust likelihood | Kalman gain → 0 on outliers, state protected |
-| **Silverman bandwidth** | Density estimation theory | Adaptive regularization based on particle distribution |
-| **Storvik** | Conjugate sufficient statistics | O(1) parameter learning, no MCMC |
-| **Adaptive forgetting** | Exponential discounting | Tracks non-stationary dynamics without posterior fossilization |
-| **SPRT** | Wald's optimal stopping | Minimizes expected samples at given error rates |
+| **OCSN 10-component** | Optimal log-χ² approximation (Omori 2007) | Accurate likelihood in tails (vs 7-component KSC) |
+| **OCSN 11th component** | Robust likelihood mixture | Kalman gain → 0 on outliers, state protected |
+| **Silverman bandwidth** | Density estimation theory | Adaptive regularization: h = 0.9·σ·N^{-1/5} |
+| **KL tempering** | Information-theoretic smoothing | Prevents weight collapse, controls effective sample size |
+| **MH Jitter** | Metropolis-Hastings MCMC | Escapes particle boundaries (+20% ESS, -19% lag) |
+| **Fisher-Rao geodesic** | Information geometry (Amari 2000) | Principled regime mutation on hyperbolic half-plane H² |
+| **Storvik statistics** | Conjugate sufficient statistics | O(1) parameter learning per particle, no MCMC |
+| **Adaptive forgetting** | Exponential discounting with regime-λ | Tracks non-stationarity without posterior fossilization |
+| **Emergency λ override** | Circuit breaker pattern | Structural break → fast forgetting → auto-decay to normal |
+| **SPRT** | Wald's optimal stopping theorem | Minimizes expected detection time at given α, β error rates |
+| **PARIS smoother** | Backward information recursion | O(N) retrospective state correction |
+| **Storvik + PARIS** | Smoothed sufficient statistics | PARIS refines regime assignments → Storvik updates params |
+| **Transition LUT** | Pre-computed log-probabilities | Cache-aligned O(1) regime transition lookup |
+| **Welford algorithm** | Numerically stable online variance | Prevents catastrophic cancellation in Storvik stats |
+
+## What Each Solves
+
+| Problem | Solution |
+|---------|----------|
+| Too many particles needed | Rao-Blackwellization |
+| Log-χ² approximation error | OCSN 10-component |
+| Outliers blow up filter | 11th component + MH Jitter |
+| Particle degeneracy | Silverman + KL tempering |
+| Particles stuck at boundaries | MH Jitter |
+| Arbitrary regime blending | Fisher-Rao geodesic |
+| Expensive parameter MCMC | Storvik sufficient stats |
+| Non-stationary parameters | Adaptive forgetting |
+| Structural breaks | Emergency λ override |
+| Regime detection speed/accuracy | SPRT with Wald bounds |
+| Online-only = no hindsight | PARIS backward pass |
+| Filtered vs smoothed params | Storvik + PARIS interaction |
+| Transition lookup overhead | Pre-computed LUT |
+| Numerical instability | Welford online variance |
 
 ---
 
 ## Information-Theoretic Analysis
 
-### Why RMSE ≈ 0.46 Cannot Be Improved
+### Why RMSE ≈ 0.43 Cannot Be Improved
 
 The observation model is:
 
