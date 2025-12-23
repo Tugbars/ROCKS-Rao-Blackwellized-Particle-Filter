@@ -256,6 +256,147 @@ Production configuration: **512 particles, 40 μs median latency**
 
 ---
 
+## Component Interaction Diagram
+
+```
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ROCKS FILTER                                   │
+│            Regime-switching Online Calibrated Kalman-particle System        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│                              ┌─────────┐                                    │
+│                              │   r_t   │                                    │
+│                              └────┬────┘                                    │
+│                                   │                                         │
+│                                   ▼                                         │
+│                        ┌─────────────────────┐                              │
+│                        │  y_t = log(r_t²)    │  KSC Transform               │
+│                        └──────────┬──────────┘                              │
+│                                   │                                         │
+│                                   ▼                                         │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                         OCSN LIKELIHOOD                                │ │
+│  │              10-component mixture + 11th outlier component             │ │
+│  └────────────────────────────────┬───────────────────────────────────────┘ │
+│                                   │                                         │
+│                                   ▼                                         │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                   RAO-BLACKWELLIZED PARTICLE FILTER                    │ │
+│  │  ┌──────────────────────────────────────────────────────────────────┐  │ │
+│  │  │  KALMAN (exact)          PARTICLES (sampled)                     │  │ │
+│  │  │  h_t | regime    ◄────►  P(regime | y_{1:t})                     │  │ │
+│  │  └──────────────────────────────────────────────────────────────────┘  │ │
+│  │                                   │                                    │ │
+│  │                                   ▼                                    │ │
+│  │  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────────────┐   │ │
+│  │  │ Resample   │►│ Silverman  │►│KL Temper   │►│ MH Jitter          │   │ │
+│  │  │ (ESS<N/2)  │ │ bandwidth  │ │ w^(1/τ)    │ │ boundary escape    │   │ │
+│  │  └────────────┘ └────────────┘ └────────────┘ └─────────┬──────────┘   │ │
+│  │                                                         │              │ │
+│  │                                                         ▼              │ │
+│  │                                        ┌────────────────────────────┐  │ │
+│  │                                        │ Fisher-Rao Geodesic        │  │ │
+│  │                                        │ (regime mutation on H²)    │  │ │
+│  │                                        └────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                   │                                         │
+│           ┌───────────────────────┼───────────────────────┐                 │
+│           │                       │                       │                 │
+│           ▼                       ▼                       ▼                 │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐         │
+│  │      SPRT       │    │    STORVIK      │    │     PARIS       │         │
+│  │                 │    │                 │    │                 │         │
+│  │ Regime detection│    │ Parameter learn │◄──►│ Backward smooth │         │
+│  │ Wald boundaries │    │ Adaptive λ_k    │    │ O(N) complexity │         │
+│  │        │        │    │ Emergency override   └────────┬────────┘         │
+│  │        ▼        │    └────────┬────────┘             │                  │
+│  │ Transition LUT  │             │                      │                  │
+│  └────────┬────────┘             └───────────┬──────────┘                  │
+│           │                                  │                              │
+│           └──────────────────┬───────────────┘                              │
+│                              │                                              │
+│                              ▼                                              │
+│                    ┌───────────────────┐                                    │
+│                    │      OUTPUT       │                                    │
+│                    │  E[h_t], P(r_t)   │                                    │
+│                    │  θ_k, ±2σ bands   │                                    │
+│                    └───────────────────┘                                    │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  VALIDATION ORACLES                                                         │
+│                                                                             │
+│     HDP-HMM ◄────────────► PGAS          If all three agree:               │
+│         ▲                    ▲            • Structure valid (K, μ_k)        │
+│          ╲                  ╱             • Dynamics valid (π_ij)           │
+│           ╲                ╱              • Filter optimal (h_t)            │
+│            ╲              ╱                                                 │
+│              ►── RBPF ◄──                 = Certificate of Correctness      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  COMPONENT REFERENCE                                                        │
+├──────────────────────┬──────────────────────────────────────────────────────┤
+│ KSC Transform        │ Kim, Shephard, Chib (1998)                           │
+│ OCSN 10-component    │ Omori, Chib, Shephard, Nakajima (2007)               │
+│ Storvik learning     │ Storvik (2002)                                       │
+│ PARIS smoother       │ Olsson & Westerborn (2017)                           │
+│ MH Jitter            │ Gilks & Berzuini (2001)                              │
+│ KL Tempering         │ Herbst & Schorfheide (2019)                          │
+│ Silverman bandwidth  │ Silverman (1986)                                     │
+│ Fisher-Rao geodesic  │ Amari & Nagaoka (2000)                               │
+│ SPRT detection       │ Wald (1945)                                          │
+│ Adaptive forgetting  │ West & Harrison (1997)                               │
+│ P² circuit breaker   │ Jain & Chlamtac (1985)                               │
+│ HDP-HMM oracle       │ Fox et al. (2011), Van Gael et al. (2008)            │
+│ PGAS oracle          │ Lindsten, Jordan, Schön (2014)                       │
+└──────────────────────┴──────────────────────────────────────────────────────┘
+
+```
+
+## Data Flow Summary 
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        TICK TIMELINE                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  r_t arrives                                                    │
+│      │                                                          │
+│      ├──▶ KSC transform ──▶ y_t = log(r_t²)                    │
+│      │                                                          │
+│      ├──▶ OCSN likelihood ──▶ log P(y_t | h_t, r_t)            │
+│      │        │                                                 │
+│      │        ├──▶ 10 components (normal)                       │
+│      │        └──▶ 11th component (outlier protection)          │
+│      │                                                          │
+│      ├──▶ Kalman update ──▶ h_t|t (per particle)               │
+│      │                                                          │
+│      ├──▶ Weight update ──▶ w_t^(i)                            │
+│      │                                                          │
+│      ├──▶ ESS check ──▶ Resample? ──▶ Silverman ──▶ KL temper  │
+│      │                                                          │
+│      ├──▶ MH Jitter ──▶ Escape boundaries                       │
+│      │                                                          │
+│      ├──▶ Regime transition? ──▶ Fisher-Rao mutation            │
+│      │                                                          │
+│      ├──▶ SPRT update ──▶ Regime detection                      │
+│      │                                                          │
+│      ├──▶ Storvik update ──▶ T_k, S_k, Q_k                     │
+│      │        │                                                 │
+│      │        └──▶ Adaptive λ_k (or emergency override)         │
+│      │                                                          │
+│      ├──▶ PARIS backward pass (periodic) ──▶ Smoothed states    │
+│      │        │                                                 │
+│      │        └──▶ Storvik correction with smoothed weights     │
+│      │                                                          │
+│      └──▶ OUTPUT: E[h_t], P(r_t), θ_k, uncertainty             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+```
+
 ## Quick Start
 
 ```c
