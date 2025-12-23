@@ -166,6 +166,51 @@ target_compile_options(pgas_learn_trans PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(pgas_learn_trans PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
+# Library: PGAS-PARIS Integration
+#───────────────────────────────────────────────────────────────────────────────
+
+add_library(pgas_paris STATIC
+    ../pgas_paris.c
+)
+
+target_link_libraries(pgas_paris
+    PUBLIC
+        pgas_mkl
+        paris_mkl
+        MKL::MKL
+)
+
+target_compile_options(pgas_paris PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(pgas_paris PRIVATE ${COMMON_DEFS})
+
+#───────────────────────────────────────────────────────────────────────────────
+# Validation: PGAS vs PGAS-PARIS Comparison
+#
+# Compares vanilla PGAS against PGAS with PARIS backward smoothing.
+# Validates that PGAS-PARIS integration is working correctly.
+# Checks:
+#   - Both produce valid stochastic matrices
+#   - PARIS trajectory diversity > 0% (backward pass working)
+#   - Matrices not identical (PARIS actually being used)
+#   - Matrices reasonably similar (no fundamental bugs)
+#───────────────────────────────────────────────────────────────────────────────
+
+add_executable(test_pgas_vs_paris
+    test_pgas_vs_paris.c
+)
+
+target_link_libraries(test_pgas_vs_paris
+    PRIVATE
+        pgas_paris
+        pgas_mkl
+        paris_mkl
+        MKL::MKL
+)
+
+target_compile_options(test_pgas_vs_paris PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(test_pgas_vs_paris PRIVATE ${COMMON_DEFS})
+
+#───────────────────────────────────────────────────────────────────────────────
 # CTest Integration
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -177,6 +222,7 @@ add_test(NAME paris_mkl_test COMMAND test_paris_mkl)
 add_test(NAME lifeboat_test COMMAND test_lifeboat)
 add_test(NAME pgas_validation_a_test COMMAND pgas_validation_a)
 add_test(NAME pgas_validation_adaptive_test COMMAND pgas_validation_adaptive)
+add_test(NAME pgas_vs_paris_test COMMAND test_pgas_vs_paris)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
@@ -190,6 +236,7 @@ message(STATUS "  test_paris_mkl            - PARIS backward smoother tests")
 message(STATUS "  test_lifeboat             - Lifeboat integration tests")
 message(STATUS "  pgas_validation_a         - Option A: Ground truth recovery")
 message(STATUS "  pgas_validation_adaptive  - Adaptive κ self-tuning")
+message(STATUS "  test_pgas_vs_paris        - PGAS vs PGAS-PARIS comparison")
 message(STATUS "  benchmark_all             - Full benchmark suite")
 message(STATUS "  pgas_learn_trans          - Learn Π from test_mmpf data")
 message(STATUS "")
