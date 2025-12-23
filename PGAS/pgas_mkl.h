@@ -136,6 +136,18 @@ extern "C"
         float prior_alpha;                            /**< Symmetric Dirichlet prior (default: 1.0) */
         float sticky_kappa;                           /**< Self-transition bias for sticky prior (default: 10.0) */
 
+        /* ═══════════════════════════════════════════════════════════════════
+         * ADAPTIVE KAPPA (Optional)
+         * Uses chatter ratio as feedback to auto-tune stickiness prior
+         * ═══════════════════════════════════════════════════════════════════*/
+        int adaptive_kappa_enabled; /**< 0=disabled (default), 1=enabled */
+        float kappa_min;            /**< Lower bound (default: 20.0) */
+        float kappa_max;            /**< Upper bound (default: 500.0) */
+        float kappa_adapt_rate;     /**< Adaptation speed (default: 0.2) */
+        float last_chatter_ratio;   /**< Most recent chatter ratio */
+        int last_off_diag_count;    /**< Off-diagonal transitions in last sweep */
+        int last_total_count;       /**< Total transitions in last sweep */
+
         /* MKL RNG - main stream */
         MKLRngStream rng;
 
@@ -294,6 +306,81 @@ extern "C"
             state->prior_alpha = alpha;
             state->sticky_kappa = kappa;
         }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * ADAPTIVE KAPPA
+     *
+     * Uses chatter ratio as feedback to auto-tune stickiness prior.
+     * Disabled by default — enable explicitly with pgas_mkl_enable_adaptive_kappa().
+     *
+     * Theory:
+     *   - chatter_ratio = observed_transitions / expected_transitions
+     *   - If ratio > 1.5: prior too weak, increase κ
+     *   - If ratio < 0.5: prior too strong, decrease κ
+     *   - If ratio ≈ 1.0: κ is well-calibrated
+     *
+     * This allows PGAS to self-tune to actual market stickiness.
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @brief Enable adaptive kappa adjustment
+     *
+     * When enabled, PGAS will adjust sticky_kappa after each Gibbs sweep
+     * based on the observed chatter ratio.
+     *
+     * @param state   PGAS state
+     * @param enable  1=enabled, 0=disabled
+     */
+    static inline void pgas_mkl_enable_adaptive_kappa(PGASMKLState *state, int enable)
+    {
+        if (state)
+        {
+            state->adaptive_kappa_enabled = enable;
+        }
+    }
+
+    /**
+     * @brief Configure adaptive kappa parameters
+     *
+     * @param state       PGAS state
+     * @param kappa_min   Lower bound for κ (default: 20.0)
+     * @param kappa_max   Upper bound for κ (default: 500.0)
+     * @param adapt_rate  Adaptation speed, 0.0-1.0 (default: 0.2)
+     */
+    static inline void pgas_mkl_configure_adaptive_kappa(PGASMKLState *state,
+                                                         float kappa_min,
+                                                         float kappa_max,
+                                                         float adapt_rate)
+    {
+        if (state)
+        {
+            state->kappa_min = kappa_min;
+            state->kappa_max = kappa_max;
+            state->kappa_adapt_rate = adapt_rate;
+        }
+    }
+
+    /**
+     * @brief Get current chatter ratio
+     *
+     * @param state  PGAS state
+     * @return       Ratio of observed to expected transitions (1.0 = perfect)
+     */
+    static inline float pgas_mkl_get_chatter_ratio(const PGASMKLState *state)
+    {
+        return state ? state->last_chatter_ratio : 0.0f;
+    }
+
+    /**
+     * @brief Get current sticky kappa
+     *
+     * @param state  PGAS state
+     * @return       Current κ value
+     */
+    static inline float pgas_mkl_get_sticky_kappa(const PGASMKLState *state)
+    {
+        return state ? state->sticky_kappa : 0.0f;
     }
 
     /**
