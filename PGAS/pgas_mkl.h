@@ -11,6 +11,8 @@
  *   - AVX2/AVX-512 SIMD for custom kernels
  *   - OpenMP for particle-level parallelism
  *   - SoA memory layout with 64-byte alignment
+ *
+ * UPDATED: OCSN 10-component emission + Transition learning for oracle validation
  */
 
 #ifndef PGAS_MKL_H
@@ -38,6 +40,10 @@ extern "C"
 
 #ifndef PGAS_MKL_MAX_REGIMES
 #define PGAS_MKL_MAX_REGIMES 8
+#endif
+
+#ifndef PGAS_MKL_MAX_K
+#define PGAS_MKL_MAX_K PGAS_MKL_MAX_REGIMES
 #endif
 
 #define PGAS_MKL_ALIGN 64 /**< AVX-512 / cache line alignment */
@@ -122,6 +128,14 @@ extern "C"
         /* Model */
         PGASMKLModel model;
 
+        /* ═══════════════════════════════════════════════════════════════════
+         * TRANSITION LEARNING (NEW)
+         * Used for Gibbs sampling of transition matrix
+         * ═══════════════════════════════════════════════════════════════════*/
+        int n_trans[PGAS_MKL_MAX_K * PGAS_MKL_MAX_K]; /**< Transition counts from ref trajectory */
+        float prior_alpha;                            /**< Symmetric Dirichlet prior (default: 1.0) */
+        float sticky_kappa;                           /**< Self-transition bias for sticky prior (default: 10.0) */
+
         /* MKL RNG - main stream */
         MKLRngStream rng;
 
@@ -140,6 +154,13 @@ extern "C"
         float *ws_normal;  /**< [N_padded] normal random numbers */
         int *ws_indices;   /**< [N_padded] sampled indices */
         float *ws_cumsum;  /**< [N_padded] cumulative sum for sampling */
+        float *ws_ocsn;    /**< [11 * N_padded] OCSN batch workspace */
+
+        /* Walker's Alias Table workspace for O(1) sampling */
+        float *ws_alias_prob; /**< [N_padded] alias probability table */
+        int *ws_alias_idx;    /**< [N_padded] alias index table */
+        int *ws_alias_small;  /**< [N_padded] small stack for building */
+        int *ws_alias_large;  /**< [N_padded] large stack for building */
 
         /* Diagnostics */
         int ancestor_proposals;
@@ -232,6 +253,92 @@ extern "C"
      * @return 0=success, 1=still_mixing, 2=failed
      */
     int pgas_mkl_run_adaptive(PGASMKLState *state);
+
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * TRANSITION LEARNING (NEW)
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @brief Sample transition matrix from Dirichlet posterior
+     *
+     * Uses counts from reference trajectory + sticky prior.
+     * π_i ~ Dirichlet(α + n_{i1}, ..., α + n_{iK} + κ·I(j=i))
+     *
+     * @param state  PGAS state with ref_regimes containing sampled trajectory
+     */
+    void pgas_mkl_sample_transitions(PGASMKLState *state);
+
+    /**
+     * @brief Full Gibbs sweep: CSMC for states + Dirichlet for transitions
+     *
+     * This is the main entry point for using PGAS as an oracle
+     * to learn the optimal transition matrix from data.
+     *
+     * @param state  PGAS state
+     * @return       Ancestor acceptance rate from CSMC sweep
+     */
+    float pgas_mkl_gibbs_sweep(PGASMKLState *state);
+
+    /**
+     * @brief Set transition learning priors
+     *
+     * @param state   PGAS state
+     * @param alpha   Symmetric Dirichlet prior (default: 1.0)
+     * @param kappa   Sticky self-transition bias (default: 10.0)
+     */
+    static inline void pgas_mkl_set_transition_prior(PGASMKLState *state,
+                                                     float alpha, float kappa)
+    {
+        if (state)
+        {
+            state->prior_alpha = alpha;
+            state->sticky_kappa = kappa;
+        }
+    }
+
+    /**
+     * @brief Get learned transition matrix
+     *
+     * @param state      PGAS state
+     * @param trans_out  Output array [K × K]
+     * @param K          Number of regimes
+     */
+    static inline void pgas_mkl_get_transitions(const PGASMKLState *state,
+                                                float *trans_out, int K)
+    {
+        if (!state || !trans_out)
+            return;
+        int K_copy = (K < state->K) ? K : state->K;
+        for (int i = 0; i < K_copy; i++)
+        {
+            for (int j = 0; j < K_copy; j++)
+            {
+                trans_out[i * K + j] = state->model.trans[i * state->K + j];
+            }
+        }
+    }
+
+    /**
+     * @brief Get transition counts from last trajectory
+     *
+     * @param state      PGAS state
+     * @param counts_out Output array [K × K]
+     * @param K          Number of regimes
+     */
+    static inline void pgas_mkl_get_transition_counts(const PGASMKLState *state,
+                                                      int *counts_out, int K)
+    {
+        if (!state || !counts_out)
+            return;
+        int K_copy = (K < state->K) ? K : state->K;
+        for (int i = 0; i < K_copy; i++)
+        {
+            for (int j = 0; j < K_copy; j++)
+            {
+                counts_out[i * K + j] = state->n_trans[i * state->K + j];
+            }
+        }
+    }
 
     /*═══════════════════════════════════════════════════════════════════════════════
      * PARIS OPERATIONS (integrated with PGAS state)
