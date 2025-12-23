@@ -246,6 +246,15 @@ PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed)
     state->sticky_kappa = 10.0f;
     memset(state->n_trans, 0, sizeof(state->n_trans));
 
+    /* Initialize adaptive kappa (DISABLED by default) */
+    state->adaptive_kappa_enabled = 0;
+    state->kappa_min = 20.0f;
+    state->kappa_max = 500.0f;
+    state->kappa_adapt_rate = 0.2f;
+    state->last_chatter_ratio = 1.0f;
+    state->last_off_diag_count = 0;
+    state->last_total_count = 0;
+
     return state;
 }
 
@@ -1134,6 +1143,90 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         {
             state->n_trans[s_prev * K + s_curr]++;
         }
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * CHATTER RATIO COMPUTATION
+     *
+     * Chatter ratio = observed_off_diagonal / expected_off_diagonal
+     *
+     * Expected off-diagonal based on current kappa:
+     *   expected_diag ≈ (kappa + alpha) / (kappa + K*alpha)
+     *   expected_off_diag_rate = 1 - expected_diag
+     *   expected_off_diag_count = (T-1) * expected_off_diag_rate
+     * ═══════════════════════════════════════════════════════════════════*/
+
+    int off_diag_count = 0;
+    int total_count = 0;
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            total_count += state->n_trans[i * K + j];
+            if (i != j)
+            {
+                off_diag_count += state->n_trans[i * K + j];
+            }
+        }
+    }
+
+    /* Store for diagnostics */
+    state->last_off_diag_count = off_diag_count;
+    state->last_total_count = total_count;
+
+    /* Compute expected off-diagonal rate from prior */
+    float expected_diag = (state->sticky_kappa + state->prior_alpha) /
+                          (state->sticky_kappa + K * state->prior_alpha);
+    float expected_off_diag_count = (float)(T - 1) * (1.0f - expected_diag);
+
+    /* Chatter ratio: >1 means more switching than prior expects */
+    if (expected_off_diag_count > 0.1f)
+    {
+        state->last_chatter_ratio = (float)off_diag_count / expected_off_diag_count;
+    }
+    else
+    {
+        state->last_chatter_ratio = 1.0f;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * ADAPTIVE KAPPA UPDATE (if enabled)
+     *
+     * Smoothly adjust kappa based on chatter ratio:
+     *   - ratio > 1.5: too much chatter → increase kappa (more sticky)
+     *   - ratio < 0.5: prior suppressing real transitions → decrease kappa
+     *   - ratio ≈ 1.0: well-calibrated → no change
+     *
+     * Uses exponential smoothing to avoid oscillation.
+     * ═══════════════════════════════════════════════════════════════════*/
+
+    if (state->adaptive_kappa_enabled)
+    {
+        float ratio = state->last_chatter_ratio;
+        float rate = state->kappa_adapt_rate;
+        float kappa_new = state->sticky_kappa;
+
+        if (ratio > 1.5f)
+        {
+            /* Too much chatter: increase stickiness */
+            float factor = 1.0f + rate * (ratio - 1.0f);
+            kappa_new = state->sticky_kappa * factor;
+        }
+        else if (ratio < 0.5f)
+        {
+            /* Prior too strong: decrease stickiness */
+            float factor = 1.0f - rate * (1.0f - ratio * 2.0f);
+            kappa_new = state->sticky_kappa * factor;
+        }
+        /* else: ratio in [0.5, 1.5] → keep kappa unchanged */
+
+        /* Clamp to bounds */
+        if (kappa_new < state->kappa_min)
+            kappa_new = state->kappa_min;
+        if (kappa_new > state->kappa_max)
+            kappa_new = state->kappa_max;
+
+        state->sticky_kappa = kappa_new;
     }
 
     /* Sample each row from Dirichlet (via Gamma samples) */
