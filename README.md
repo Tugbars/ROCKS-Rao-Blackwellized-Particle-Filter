@@ -1,6 +1,6 @@
 # ROCKS: Rao-blackwellized Online Conjugate KSC-Storvik
 
-**Optimal real-time stochastic volatility filtering at the Bayesian Cramér-Rao bound**
+**ROCKS: A Rao-Blackwellized particle filter with information-geometric regime switching, online Storvik learning, PARIS smoothing, and SPRT detection — validated against HDP-HMM and PGAS oracles. Real-time stochastic volatility filtering at the Bayesian Cramér-Rao bound**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
