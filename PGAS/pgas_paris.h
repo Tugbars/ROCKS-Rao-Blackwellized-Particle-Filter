@@ -325,6 +325,184 @@ extern "C"
      */
     int pgas_paris_ensemble_is_converged(const PGASParisEnsemble *ens, float threshold);
 
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * REGIME PARAMETER LEARNING
+     *
+     * Extends PGAS-PARIS to learn regime-specific parameters:
+     *   - μ_vol[k]: Long-run mean log-volatility per regime
+     *   - σ_vol[k]: Emission spread per regime (optional)
+     *
+     * Uses conjugate priors for closed-form Gibbs updates:
+     *   - μ_k ~ Normal(m₀, s₀²)  →  Normal posterior
+     *   - σ_k ~ InvGamma(a, b)   →  InvGamma posterior
+     *
+     * Literature:
+     *   - Lindsten et al. (2014) for Rao-Blackwellized parameter learning
+     *   - Fox et al. (2011) for sticky HDP-HMM parameter sampling
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Prior configuration for regime parameter learning
+     */
+    typedef struct
+    {
+        /* μ_vol prior: Normal(mu_prior_mean, mu_prior_var) per regime */
+        float mu_prior_mean[PGAS_MKL_MAX_REGIMES]; /**< Prior mean for μ_k */
+        float mu_prior_var[PGAS_MKL_MAX_REGIMES];  /**< Prior variance for μ_k */
+
+        /* σ_vol prior: InvGamma(sigma_prior_shape, sigma_prior_scale) */
+        float sigma_prior_shape; /**< Shape parameter (a) for all regimes */
+        float sigma_prior_scale; /**< Scale parameter (b) for all regimes */
+
+        /* Learning control */
+        int learn_mu;    /**< Enable μ_vol learning */
+        int learn_sigma; /**< Enable σ_vol learning */
+
+        /* Ordering constraint to prevent label switching */
+        int enforce_ordering; /**< If 1, enforce μ_0 < μ_1 < ... < μ_{K-1} */
+    } PGASParisRegimePrior;
+
+    /**
+     * Sufficient statistics for regime parameter learning
+     * Collected from PARIS ensemble trajectories (Rao-Blackwellized)
+     */
+    typedef struct
+    {
+        int K;
+
+        /* Per-regime statistics (averaged across M trajectories) */
+        double n_k[PGAS_MKL_MAX_REGIMES];        /**< Expected count in regime k */
+        double sum_h_k[PGAS_MKL_MAX_REGIMES];    /**< Sum of h values in regime k */
+        double sum_h_sq_k[PGAS_MKL_MAX_REGIMES]; /**< Sum of h² values in regime k */
+
+        /* For AR(1) dynamics: compute residuals h_t - φ*h_{t-1} */
+        double sum_resid_k[PGAS_MKL_MAX_REGIMES];    /**< Sum of (h_t - φ*h_{t-1}) in regime k */
+        double sum_resid_sq_k[PGAS_MKL_MAX_REGIMES]; /**< Sum of (h_t - φ*h_{t-1})² in regime k */
+    } PGASParisRegimeStats;
+
+    /**
+     * Initialize regime learning prior with defaults
+     *
+     * Defaults:
+     *   - μ_k prior: N(-3.0, 2.0²) for all k (weak prior centered at typical vol)
+     *   - σ_k prior: InvGamma(3, 0.1) (weak prior on emission spread)
+     *   - Learning disabled by default
+     *   - Ordering enforced by default
+     *
+     * @param prior  Prior struct to initialize
+     * @param K      Number of regimes
+     */
+    void pgas_paris_regime_prior_init(PGASParisRegimePrior *prior, int K);
+
+    /**
+     * Set μ_vol prior for a specific regime
+     *
+     * @param prior      Prior struct
+     * @param k          Regime index
+     * @param mean       Prior mean
+     * @param variance   Prior variance
+     */
+    void pgas_paris_set_mu_prior(PGASParisRegimePrior *prior, int k,
+                                 float mean, float variance);
+
+    /**
+     * Collect sufficient statistics from PARIS ensemble
+     *
+     * Computes Rao-Blackwellized statistics across M trajectories:
+     *   - E[n_k]: Expected count in regime k
+     *   - E[Σh | z=k]: Expected sum of h values in regime k
+     *   - E[Σh² | z=k]: Expected sum of h² in regime k
+     *
+     * @param state  PGAS-PARIS state (after backward smoothing + trajectory sampling)
+     * @param stats  Output statistics struct
+     */
+    void pgas_paris_collect_regime_stats(PGASParisState *state,
+                                         PGASParisRegimeStats *stats);
+
+    /**
+     * Sample μ_vol from Normal posterior
+     *
+     * For AR(1) SV model: h_t = μ_k(1-φ) + φ*h_{t-1} + σ_h*ε
+     * We estimate μ_k from the "target" that h regresses toward.
+     *
+     * Posterior: μ_k | data ~ N(μ_post, σ²_post)
+     * where:
+     *   σ²_post = 1 / (1/s₀² + n_k*(1-φ)²/σ_h²)
+     *   μ_post = σ²_post * (m₀/s₀² + (1-φ)*Σresid_k/σ_h²)
+     *
+     * @param state  PGAS-PARIS state
+     * @param stats  Sufficient statistics from collect_regime_stats
+     * @param prior  Prior configuration
+     */
+    void pgas_paris_sample_mu_vol(PGASParisState *state,
+                                  const PGASParisRegimeStats *stats,
+                                  const PGASParisRegimePrior *prior);
+
+    /**
+     * Sample σ_vol from Inverse-Gamma posterior (optional)
+     *
+     * Posterior: σ²_k | data ~ InvGamma(a_post, b_post)
+     * where:
+     *   a_post = a₀ + n_k/2
+     *   b_post = b₀ + 0.5 * Σ(h_t - μ_k)²
+     *
+     * @param state  PGAS-PARIS state
+     * @param stats  Sufficient statistics
+     * @param prior  Prior configuration
+     */
+    void pgas_paris_sample_sigma_vol(PGASParisState *state,
+                                     const PGASParisRegimeStats *stats,
+                                     const PGASParisRegimePrior *prior);
+
+    /**
+     * Enforce μ-ordering to prevent label switching
+     *
+     * After sampling, sorts regimes so μ_0 < μ_1 < ... < μ_{K-1}
+     * Also permutes Π rows/columns accordingly.
+     *
+     * This is the ALIGN step in the Lifeboat protocol.
+     *
+     * @param state  PGAS-PARIS state
+     */
+    void pgas_paris_enforce_mu_ordering(PGASParisState *state);
+
+    /**
+     * Get learned μ_vol values
+     *
+     * @param state    PGAS-PARIS state
+     * @param mu_out   Output array [K]
+     * @param K        Number of regimes
+     */
+    void pgas_paris_get_mu_vol(const PGASParisState *state, float *mu_out, int K);
+
+    /**
+     * Get learned σ_vol values
+     *
+     * @param state      PGAS-PARIS state
+     * @param sigma_out  Output array [K]
+     * @param K          Number of regimes
+     */
+    void pgas_paris_get_sigma_vol(const PGASParisState *state, float *sigma_out, int K);
+
+    /**
+     * Full Gibbs sweep with regime parameter learning
+     *
+     * Extended sweep:
+     *   1. CSMC forward pass
+     *   2. PARIS backward smoothing
+     *   3. Sample trajectories
+     *   4. Count transitions → Sample Π
+     *   5. Collect regime stats → Sample μ_vol (if enabled)
+     *   6. Sample σ_vol (if enabled)
+     *   7. Enforce μ-ordering (if enabled)
+     *
+     * @param state  PGAS-PARIS state
+     * @param prior  Regime learning prior (NULL to skip regime learning)
+     * @return       CSMC acceptance rate
+     */
+    float pgas_paris_gibbs_sweep_full(PGASParisState *state,
+                                      const PGASParisRegimePrior *prior);
+
 #ifdef __cplusplus
 }
 #endif

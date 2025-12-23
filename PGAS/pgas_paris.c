@@ -677,3 +677,424 @@ int pgas_paris_ensemble_is_converged(const PGASParisEnsemble *ens, float thresho
         return 0;
     return pgas_paris_ensemble_get_max_std(ens) < threshold;
 }
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * REGIME PARAMETER LEARNING
+ *
+ * Rao-Blackwellized estimation of μ_vol[k] and σ_vol[k] using PARIS ensemble.
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+void pgas_paris_regime_prior_init(PGASParisRegimePrior *prior, int K)
+{
+    if (!prior)
+        return;
+
+    /* Default μ_vol prior: N(-3.0, 2.0²) - weak prior, typical log-vol range */
+    for (int k = 0; k < K && k < PGAS_MKL_MAX_REGIMES; k++)
+    {
+        prior->mu_prior_mean[k] = -3.0f;
+        prior->mu_prior_var[k] = 4.0f; /* 2.0² */
+    }
+
+    /* Default σ_vol prior: InvGamma(3, 0.1) - weak prior on emission spread */
+    prior->sigma_prior_shape = 3.0f;
+    prior->sigma_prior_scale = 0.1f;
+
+    /* Learning disabled by default */
+    prior->learn_mu = 0;
+    prior->learn_sigma = 0;
+
+    /* Ordering enforced by default (prevents label switching) */
+    prior->enforce_ordering = 1;
+}
+
+void pgas_paris_set_mu_prior(PGASParisRegimePrior *prior, int k,
+                             float mean, float variance)
+{
+    if (!prior || k < 0 || k >= PGAS_MKL_MAX_REGIMES)
+        return;
+    prior->mu_prior_mean[k] = mean;
+    prior->mu_prior_var[k] = variance;
+}
+
+void pgas_paris_collect_regime_stats(PGASParisState *state,
+                                     PGASParisRegimeStats *stats)
+{
+    if (!state || !state->pgas || !stats)
+        return;
+
+    PGASMKLState *pgas = state->pgas;
+    const int K = pgas->K;
+    const int T = pgas->T;
+    const int M = state->n_trajectories;
+    const int Np = pgas->N_padded;
+    const float phi = pgas->model.phi;
+
+    stats->K = K;
+
+    /* Zero initialize */
+    for (int k = 0; k < K; k++)
+    {
+        stats->n_k[k] = 0.0;
+        stats->sum_h_k[k] = 0.0;
+        stats->sum_h_sq_k[k] = 0.0;
+        stats->sum_resid_k[k] = 0.0;
+        stats->sum_resid_sq_k[k] = 0.0;
+    }
+
+    /* Accumulate statistics from each trajectory */
+    for (int m = 0; m < M; m++)
+    {
+        int *traj = &state->traj.trajectories[m * T];
+
+        for (int t = 0; t < T; t++)
+        {
+            int z_t = traj[t];
+
+            /* Get h value at this time (from smoothed PARIS index) */
+            int particle_idx = state->paris->smoothed[t * state->paris->N_padded + m];
+            float h_t = state->paris->h[t * state->paris->N_padded + particle_idx];
+
+            stats->n_k[z_t] += 1.0;
+            stats->sum_h_k[z_t] += h_t;
+            stats->sum_h_sq_k[z_t] += h_t * h_t;
+
+            /* Compute residuals for t > 0 */
+            if (t > 0)
+            {
+                int prev_particle_idx = state->paris->smoothed[(t - 1) * state->paris->N_padded + m];
+                float h_prev = state->paris->h[(t - 1) * state->paris->N_padded + prev_particle_idx];
+
+                /* Residual: h_t - φ*h_{t-1} (should equal μ_k*(1-φ) + σ_h*ε) */
+                float resid = h_t - phi * h_prev;
+
+                stats->sum_resid_k[z_t] += resid;
+                stats->sum_resid_sq_k[z_t] += resid * resid;
+            }
+        }
+    }
+
+    /* Normalize by M to get expected counts (Rao-Blackwellization) */
+    for (int k = 0; k < K; k++)
+    {
+        stats->n_k[k] /= M;
+        stats->sum_h_k[k] /= M;
+        stats->sum_h_sq_k[k] /= M;
+        stats->sum_resid_k[k] /= M;
+        stats->sum_resid_sq_k[k] /= M;
+    }
+}
+
+void pgas_paris_sample_mu_vol(PGASParisState *state,
+                              const PGASParisRegimeStats *stats,
+                              const PGASParisRegimePrior *prior)
+{
+    if (!state || !state->pgas || !stats || !prior)
+        return;
+    if (!prior->learn_mu)
+        return;
+
+    PGASMKLState *pgas = state->pgas;
+    const int K = pgas->K;
+    const float phi = pgas->model.phi;
+    const float sigma_h = pgas->model.sigma_h;
+    const float sigma_h_sq = sigma_h * sigma_h;
+    const float one_minus_phi = 1.0f - phi;
+    const float one_minus_phi_sq = one_minus_phi * one_minus_phi;
+
+    VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
+
+    for (int k = 0; k < K; k++)
+    {
+        /* Prior parameters */
+        float m0 = prior->mu_prior_mean[k];
+        float s0_sq = prior->mu_prior_var[k];
+
+        /* Data likelihood contribution
+         * From: h_t = μ_k*(1-φ) + φ*h_{t-1} + σ_h*ε
+         * Rearranging: residual = h_t - φ*h_{t-1} = μ_k*(1-φ) + σ_h*ε
+         * So: E[residual | z=k] = μ_k*(1-φ)
+         *     μ_k = E[residual]/(1-φ)
+         *
+         * The "data" for estimating μ_k is sum_resid_k / (1-φ)
+         */
+        double n_k = stats->n_k[k];
+
+        if (n_k < 1.0)
+        {
+            /* No data for this regime, sample from prior */
+            float sample;
+            vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1,
+                          &sample, m0, sqrtf(s0_sq));
+            pgas->model.mu_vol[k] = sample;
+            continue;
+        }
+
+        /* Posterior variance:
+         * 1/σ²_post = 1/s₀² + n_k*(1-φ)²/σ_h²
+         */
+        double precision_prior = 1.0 / s0_sq;
+        double precision_data = n_k * one_minus_phi_sq / sigma_h_sq;
+        double precision_post = precision_prior + precision_data;
+        double var_post = 1.0 / precision_post;
+
+        /* Posterior mean:
+         * μ_post = σ²_post * (m₀/s₀² + (1-φ)*Σresid_k/σ_h²)
+         *
+         * Note: sum_resid_k = Σ(h_t - φ*h_{t-1}) for z_t = k
+         * We want μ_k such that residual ≈ μ_k*(1-φ)
+         * So we use sum_resid_k directly (it's already multiplied by n_k in effect)
+         */
+        double data_contribution = one_minus_phi * stats->sum_resid_k[k] / sigma_h_sq;
+        double prior_contribution = m0 / s0_sq;
+        double mean_post = var_post * (prior_contribution + data_contribution);
+
+        /* Sample from posterior */
+        float sample;
+        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1,
+                      &sample, (float)mean_post, sqrtf((float)var_post));
+
+        pgas->model.mu_vol[k] = sample;
+
+        /* Update precomputed mu_shift = μ_k * (1-φ) */
+        pgas->model.mu_shift[k] = sample * one_minus_phi;
+    }
+}
+
+void pgas_paris_sample_sigma_vol(PGASParisState *state,
+                                 const PGASParisRegimeStats *stats,
+                                 const PGASParisRegimePrior *prior)
+{
+    if (!state || !state->pgas || !stats || !prior)
+        return;
+    if (!prior->learn_sigma)
+        return;
+
+    PGASMKLState *pgas = state->pgas;
+    const int K = pgas->K;
+    const float phi = pgas->model.phi;
+    const float one_minus_phi = 1.0f - phi;
+
+    VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
+
+    for (int k = 0; k < K; k++)
+    {
+        /* Prior parameters: InvGamma(a, b) */
+        float a0 = prior->sigma_prior_shape;
+        float b0 = prior->sigma_prior_scale;
+
+        double n_k = stats->n_k[k];
+
+        if (n_k < 2.0)
+        {
+            /* Not enough data, keep current value */
+            continue;
+        }
+
+        /* Posterior: InvGamma(a_post, b_post)
+         * a_post = a₀ + n_k/2
+         * b_post = b₀ + 0.5 * Σ(residual - μ_k*(1-φ))²
+         */
+        float mu_k = pgas->model.mu_vol[k];
+        float target = mu_k * one_minus_phi;
+
+        /* Compute sum of squared deviations from target
+         * We have: sum_resid_k = Σ(h_t - φ*h_{t-1})
+         *          sum_resid_sq_k = Σ(h_t - φ*h_{t-1})²
+         *
+         * Σ(resid - target)² = Σresid² - 2*target*Σresid + n*target²
+         */
+        double ss = stats->sum_resid_sq_k[k] - 2.0 * target * stats->sum_resid_k[k] + n_k * target * target;
+
+        if (ss < 0.0)
+            ss = 0.0; /* Numerical safety */
+
+        double a_post = a0 + n_k / 2.0;
+        double b_post = b0 + ss / 2.0;
+
+        /* Sample from InvGamma(a_post, b_post)
+         * = 1/Gamma(a_post, 1/b_post)
+         */
+        double gamma_sample;
+        vdRngGamma(VSL_RNG_METHOD_GAMMA_GNORM, stream, 1,
+                   &gamma_sample, a_post, 0.0, 1.0 / b_post);
+
+        double sigma_sq = 1.0 / gamma_sample;
+        float sigma = sqrtf((float)sigma_sq);
+
+        /* Clamp to reasonable range */
+        if (sigma < 0.01f)
+            sigma = 0.01f;
+        if (sigma > 2.0f)
+            sigma = 2.0f;
+
+        pgas->model.sigma_vol[k] = sigma;
+    }
+}
+
+void pgas_paris_enforce_mu_ordering(PGASParisState *state)
+{
+    if (!state || !state->pgas)
+        return;
+
+    PGASMKLState *pgas = state->pgas;
+    const int K = pgas->K;
+
+    /* Build permutation that sorts μ_vol in ascending order */
+    int perm[PGAS_MKL_MAX_REGIMES];
+    for (int k = 0; k < K; k++)
+        perm[k] = k;
+
+    /* Simple insertion sort (K is small) */
+    for (int i = 1; i < K; i++)
+    {
+        int key = perm[i];
+        float key_mu = pgas->model.mu_vol[key];
+        int j = i - 1;
+
+        while (j >= 0 && pgas->model.mu_vol[perm[j]] > key_mu)
+        {
+            perm[j + 1] = perm[j];
+            j--;
+        }
+        perm[j + 1] = key;
+    }
+
+    /* Check if already sorted */
+    int already_sorted = 1;
+    for (int k = 0; k < K; k++)
+    {
+        if (perm[k] != k)
+        {
+            already_sorted = 0;
+            break;
+        }
+    }
+    if (already_sorted)
+        return;
+
+    /* Apply permutation to model parameters */
+    float new_mu_vol[PGAS_MKL_MAX_REGIMES];
+    float new_sigma_vol[PGAS_MKL_MAX_REGIMES];
+    float new_mu_shift[PGAS_MKL_MAX_REGIMES];
+    float new_trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
+    float new_log_trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
+
+    /* Permute μ_vol, σ_vol */
+    for (int k = 0; k < K; k++)
+    {
+        new_mu_vol[k] = pgas->model.mu_vol[perm[k]];
+        new_sigma_vol[k] = pgas->model.sigma_vol[perm[k]];
+        new_mu_shift[k] = pgas->model.mu_shift[perm[k]];
+    }
+
+    /* Permute transition matrix: both rows and columns
+     * new_trans[i][j] = old_trans[perm[i]][perm[j]]
+     */
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            new_trans[i * K + j] = pgas->model.trans[perm[i] * K + perm[j]];
+            new_log_trans[i * K + j] = pgas->model.log_trans[perm[i] * K + perm[j]];
+        }
+    }
+
+    /* Copy back */
+    for (int k = 0; k < K; k++)
+    {
+        pgas->model.mu_vol[k] = new_mu_vol[k];
+        pgas->model.sigma_vol[k] = new_sigma_vol[k];
+        pgas->model.mu_shift[k] = new_mu_shift[k];
+    }
+    for (int i = 0; i < K * K; i++)
+    {
+        pgas->model.trans[i] = new_trans[i];
+        pgas->model.log_trans[i] = new_log_trans[i];
+    }
+
+    /* Also update log_trans_T (transposed) */
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            pgas->model.log_trans_T[j * K + i] = pgas->model.log_trans[i * K + j];
+        }
+    }
+}
+
+void pgas_paris_get_mu_vol(const PGASParisState *state, float *mu_out, int K)
+{
+    if (!state || !state->pgas || !mu_out)
+        return;
+    int K_copy = (K < state->pgas->K) ? K : state->pgas->K;
+    for (int k = 0; k < K_copy; k++)
+    {
+        mu_out[k] = state->pgas->model.mu_vol[k];
+    }
+}
+
+void pgas_paris_get_sigma_vol(const PGASParisState *state, float *sigma_out, int K)
+{
+    if (!state || !state->pgas || !sigma_out)
+        return;
+    int K_copy = (K < state->pgas->K) ? K : state->pgas->K;
+    for (int k = 0; k < K_copy; k++)
+    {
+        sigma_out[k] = state->pgas->model.sigma_vol[k];
+    }
+}
+
+float pgas_paris_gibbs_sweep_full(PGASParisState *state,
+                                  const PGASParisRegimePrior *prior)
+{
+    if (!state || !state->pgas)
+        return 0.0f;
+
+    /* 1. CSMC forward pass */
+    float accept = pgas_mkl_csmc_sweep(state->pgas);
+
+    /* 2. Copy particles to PARIS */
+    pgas_paris_copy_particles(state);
+
+    /* 3. PARIS backward smoothing */
+    pgas_paris_run_backward(state);
+
+    /* 4. Sample trajectories from smoothed distribution */
+    pgas_paris_sample_trajectories(state);
+
+    /* 5. Count transitions from ensemble */
+    pgas_paris_count_transitions(state);
+
+    /* 6. Sample Π from Dirichlet posterior */
+    pgas_paris_sample_trans_matrix(state);
+
+    /* 7. Regime parameter learning (if prior provided and enabled) */
+    if (prior && (prior->learn_mu || prior->learn_sigma))
+    {
+        PGASParisRegimeStats stats;
+        pgas_paris_collect_regime_stats(state, &stats);
+
+        /* Sample μ_vol */
+        if (prior->learn_mu)
+        {
+            pgas_paris_sample_mu_vol(state, &stats, prior);
+        }
+
+        /* Sample σ_vol */
+        if (prior->learn_sigma)
+        {
+            pgas_paris_sample_sigma_vol(state, &stats, prior);
+        }
+
+        /* Enforce ordering to prevent label switching */
+        if (prior->enforce_ordering)
+        {
+            pgas_paris_enforce_mu_ordering(state);
+        }
+    }
+
+    state->total_sweeps++;
+
+    return accept;
+}

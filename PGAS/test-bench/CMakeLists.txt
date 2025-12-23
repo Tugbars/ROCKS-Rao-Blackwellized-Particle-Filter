@@ -173,6 +173,11 @@ add_library(pgas_paris STATIC
     ../pgas_paris.c
 )
 
+target_include_directories(pgas_paris
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
 target_link_libraries(pgas_paris
     PUBLIC
         pgas_mkl
@@ -223,6 +228,36 @@ add_test(NAME lifeboat_test COMMAND test_lifeboat)
 add_test(NAME pgas_validation_a_test COMMAND pgas_validation_a)
 add_test(NAME pgas_validation_adaptive_test COMMAND pgas_validation_adaptive)
 add_test(NAME pgas_vs_paris_test COMMAND test_pgas_vs_paris)
+add_test(NAME regime_learning_test COMMAND test_regime_learning)
+
+#───────────────────────────────────────────────────────────────────────────────
+# Validation: Regime Parameter Learning (PGAS vs PGAS-PARIS)
+#
+# Side-by-side comparison of μ_vol learning:
+#   - Vanilla PGAS: Single reference trajectory
+#   - PGAS-PARIS: Rao-Blackwellized ensemble (M trajectories)
+#
+# Compares:
+#   - μ_vol RMSE vs ground truth
+#   - Posterior variance (lower = better)
+#   - Convergence speed
+#   - Π learning quality
+#───────────────────────────────────────────────────────────────────────────────
+
+add_executable(test_regime_learning
+    test_regime_learning.c
+)
+
+target_link_libraries(test_regime_learning
+    PRIVATE
+        pgas_paris
+        pgas_mkl
+        paris_mkl
+        MKL::MKL
+)
+
+target_compile_options(test_regime_learning PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(test_regime_learning PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
@@ -237,6 +272,7 @@ message(STATUS "  test_lifeboat             - Lifeboat integration tests")
 message(STATUS "  pgas_validation_a         - Option A: Ground truth recovery")
 message(STATUS "  pgas_validation_adaptive  - Adaptive κ self-tuning")
 message(STATUS "  test_pgas_vs_paris        - PGAS vs PGAS-PARIS comparison")
+message(STATUS "  test_regime_learning      - μ_vol learning: PGAS vs PGAS-PARIS")
 message(STATUS "  benchmark_all             - Full benchmark suite")
 message(STATUS "  pgas_learn_trans          - Learn Π from test_mmpf data")
 message(STATUS "")
