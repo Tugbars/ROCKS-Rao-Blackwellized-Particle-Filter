@@ -216,7 +216,7 @@ void pgas_paris_copy_particles(PGASParisState *state)
  * BACKWARD SMOOTHING
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-void pgas_paris_backward_smooth(PGASParisState *state)
+void pgas_paris_run_backward(PGASParisState *state)
 {
     if (!state || !state->paris)
         return;
@@ -327,8 +327,22 @@ void pgas_paris_count_transitions(PGASParisState *state)
 /*═══════════════════════════════════════════════════════════════════════════════
  * TRANSITION MATRIX SAMPLING
  *
- * Sample from Dirichlet posterior using PARIS ensemble counts.
- * This replaces pgas_mkl_sample_transitions() when using PARIS.
+ * Sample from Dirichlet posterior using PARIS ensemble EXPECTED counts.
+ *
+ * CRITICAL FIX: Use average counts across M trajectories, not sum!
+ *
+ * The Problem (before):
+ *   - Summing counts from M=8 trajectories gives 8×(T-1) observations
+ *   - This inflates effective data count, drowning out the sticky prior κ
+ *   - Result: diagonal collapses, chatter spikes
+ *
+ * The Fix (Rao-Blackwellization):
+ *   - Use expected counts: E[n_ij] = sum(n_ij^m) / M
+ *   - This maintains (T-1) effective observations
+ *   - Prior κ remains properly weighted
+ *   - Lower variance than single-path PGAS (Lindsten et al. 2014)
+ *
+ * Dirichlet: π_i ~ Dir(α + E[n_i1], ..., α + E[n_iK] + κ·δ_{ij})
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 void pgas_paris_sample_trans_matrix(PGASParisState *state)
@@ -340,6 +354,7 @@ void pgas_paris_sample_trans_matrix(PGASParisState *state)
     const int K = pgas->K;
     const float alpha = pgas->prior_alpha;
     const float kappa = pgas->sticky_kappa;
+    const int M = state->n_trajectories; /* Number of PARIS trajectories */
 
     VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
 
@@ -351,8 +366,12 @@ void pgas_paris_sample_trans_matrix(PGASParisState *state)
 
         for (int j = 0; j < K; j++)
         {
-            /* Dirichlet parameter: α + n_ij + κ·δ_{ij} */
-            double dir_alpha = alpha + (double)state->traj.n_trans[i * K + j];
+            /* CRITICAL: Use EXPECTED count (average across M trajectories)
+             * This keeps effective observation count at (T-1), not M×(T-1) */
+            double expected_count = (double)state->traj.n_trans[i * K + j] / M;
+
+            /* Dirichlet parameter: α + E[n_ij] + κ·δ_{ij} */
+            double dir_alpha = alpha + expected_count;
             if (i == j)
             {
                 dir_alpha += kappa; /* Sticky prior */
@@ -382,26 +401,26 @@ void pgas_paris_sample_trans_matrix(PGASParisState *state)
     }
 
     /* Update chatter ratio for adaptive κ
-     * Compare PARIS ensemble counts to expected from stickiness prior */
-    int total_self = 0;
-    int total_switch = 0;
+     * Use expected counts (rates cancel, but consistent with above) */
+    double total_self = 0.0;
+    double total_switch = 0.0;
 
     for (int i = 0; i < K; i++)
     {
-        total_self += state->traj.n_trans[i * K + i];
+        total_self += (double)state->traj.n_trans[i * K + i] / M;
         for (int j = 0; j < K; j++)
         {
             if (i != j)
             {
-                total_switch += state->traj.n_trans[i * K + j];
+                total_switch += (double)state->traj.n_trans[i * K + j] / M;
             }
         }
     }
 
     /* Expected self-transition rate from current κ */
     float expected_self_rate = kappa / (kappa + K - 1 + K * alpha);
-    float actual_self_rate = (total_self + total_switch > 0)
-                                 ? (float)total_self / (total_self + total_switch)
+    float actual_self_rate = (total_self + total_switch > 0.001)
+                                 ? (float)(total_self / (total_self + total_switch))
                                  : expected_self_rate;
 
     /* Chatter ratio: actual_switches / expected_switches */
@@ -421,18 +440,23 @@ void pgas_paris_sample_trans_matrix(PGASParisState *state)
         pgas->rls_chatter_estimate = lambda * pgas->rls_chatter_estimate +
                                      (1.0f - lambda) * pgas->last_chatter_ratio;
 
-        /* Adjust κ based on smoothed chatter */
+        /* Adjust κ based on smoothed chatter
+         * Use multiplicative update for scale-invariance */
         float smoothed_chatter = pgas->rls_chatter_estimate;
 
-        if (smoothed_chatter > 1.05f)
+        /* Adaptive rate based on deviation from target (1.0) */
+        float deviation = smoothed_chatter - 1.0f;
+        float adapt_rate = 0.02f; /* 2% per sweep */
+
+        if (deviation > 0.05f)
         {
             /* Too many switches → increase κ */
-            pgas->sticky_kappa *= (1.0f + pgas->kappa_up_rate);
+            pgas->sticky_kappa *= (1.0f + adapt_rate * deviation);
         }
-        else if (smoothed_chatter < 0.95f)
+        else if (deviation < -0.05f)
         {
             /* Too few switches → decrease κ */
-            pgas->sticky_kappa *= (1.0f - pgas->kappa_down_rate);
+            pgas->sticky_kappa *= (1.0f + adapt_rate * deviation); /* deviation is negative */
         }
 
         /* Clamp to bounds */
@@ -463,7 +487,7 @@ float pgas_paris_gibbs_sweep(PGASParisState *state)
     pgas_paris_copy_particles(state);
 
     /* 3. PARIS backward smoothing */
-    pgas_paris_backward_smooth(state);
+    pgas_paris_run_backward(state);
 
     /* 4. Sample M trajectories */
     pgas_paris_sample_trajectories(state);
@@ -533,24 +557,36 @@ void pgas_paris_print_diagnostics(const PGASParisState *state)
     printf("PGAS-PARIS DIAGNOSTICS\n");
     printf("═══════════════════════════════════════════════════════════\n");
     printf("Total sweeps:         %d\n", state->total_sweeps);
-    printf("Trajectories sampled: %d\n", state->n_trajectories);
+    printf("Trajectories sampled: %d (M)\n", state->n_trajectories);
     printf("Trajectory diversity: %.2f%%\n", state->traj.trajectory_diversity * 100.0f);
     printf("Path degeneracy:      %.2f%%\n", pgas_paris_get_path_degeneracy(state) * 100.0f);
     printf("CSMC acceptance:      %.3f\n", pgas_mkl_get_acceptance_rate(state->pgas));
     printf("Chatter ratio:        %.2f\n", pgas_mkl_get_chatter_ratio(state->pgas));
     printf("Sticky κ:             %.1f\n", pgas_mkl_get_sticky_kappa(state->pgas));
 
-    printf("\nPARIS ensemble transition counts:\n");
     int K = state->traj.K;
+    int M = state->n_trajectories;
+
+    printf("\nPARIS expected transition counts (E[n_ij] = sum/M):\n");
     for (int i = 0; i < K; i++)
     {
         printf("  [");
         for (int j = 0; j < K; j++)
         {
-            printf(" %5d", state->traj.n_trans[i * K + j]);
+            double expected = (double)state->traj.n_trans[i * K + j] / M;
+            printf(" %6.1f", expected);
         }
         printf(" ]\n");
     }
+
+    /* Show total expected transitions (should be ~T-1) */
+    double total_expected = 0.0;
+    for (int i = 0; i < K * K; i++)
+    {
+        total_expected += (double)state->traj.n_trans[i] / M;
+    }
+    printf("  Total expected: %.1f (should be ~T-1 = %d)\n", total_expected, state->pgas->T - 1);
+
     printf("═══════════════════════════════════════════════════════════\n");
 }
 
