@@ -110,7 +110,7 @@ The error distribution confirms optimality:
 
 ### Volatility Tracking
 
-<img width="4170" height="2370" alt="rbpf_fig1_volatility_tracking" src="https://github.com/user-attachments/assets/ff3b16dc-b6b3-4692-a764-7d0f042ce4f1" />
+<img width="4170" height="2370" alt="rbpf_fig1_volatility_tracking" src="https://github.com/user-attachments/assets/23dc2d9c-f92a-4b3c-8fe0-73b165dde93d" />
 
 The filter tracks true volatility across 7 market scenarios:
 - Extended Calm (1500 ticks)
@@ -123,7 +123,7 @@ The filter tracks true volatility across 7 market scenarios:
 
 ### Regime Detection
 
-<img width="4169" height="2670" alt="rbpf_fig2_regime_detection" src="https://github.com/user-attachments/assets/44580c41-5855-4a0b-8f8c-e98aa5320697" />
+<img width="4169" height="2670" alt="rbpf_fig2_regime_detection" src="https://github.com/user-attachments/assets/336ccd84-7c8a-4b9a-9f78-632d327f9400" />
 
 Three-hypothesis classification (CALM / TREND / CRISIS):
 - Probability stack shows soft transitions
@@ -132,7 +132,7 @@ Three-hypothesis classification (CALM / TREND / CRISIS):
 
 ### Flash Crash Handling
 
-<img width="3570" height="2370" alt="rbpf_fig3_flash_crash" src="https://github.com/user-attachments/assets/af5a5153-e688-49be-a99b-0177f5226090" />
+<img width="3570" height="2370" alt="rbpf_fig3_flash_crash" src="https://github.com/user-attachments/assets/a3bd24da-b505-4884-b020-9abdc55ccefa" />
 
 The 60-tick flash crash scenario demonstrates:
 - **12σ outlier absorbed** without state corruption
@@ -142,7 +142,7 @@ The 60-tick flash crash scenario demonstrates:
 
 ### Crisis Persistence
 
-<img width="3570" height="2369" alt="rbpf_fig4_crisis_persistence" src="https://github.com/user-attachments/assets/9e2d273c-f178-47e4-91a4-119a235a7e6f" />
+<img width="3570" height="2369" alt="rbpf_fig4_crisis_persistence" src="https://github.com/user-attachments/assets/487af369-9f80-419b-9e2e-e0b8b27d65ca" />
 
 Sustained crisis with extreme outliers:
 - **15σ outlier handled** without particle collapse
