@@ -332,15 +332,53 @@ python rbpf_viz_plots.py   # Generates figures
 
 ## References
 
-1. Kim, Shephard & Chib (1998). *Stochastic volatility: likelihood inference and comparison with ARCH models*. Review of Economic Studies.
+### Observation Model & Likelihood
+1. **Kim, Shephard & Chib (1998).** *Stochastic volatility: likelihood inference and comparison with ARCH models.* Review of Economic Studies. — KSC log-squared transform
+2. **Omori, Chib, Shephard & Nakajima (2007).** *Stochastic volatility with leverage: Fast and efficient likelihood inference.* Journal of Econometrics. — OCSN 10-component mixture
 
-2. Omori, Chib, Shephard & Nakajima (2007). *Stochastic volatility with leverage: Fast and efficient likelihood inference*. Journal of Econometrics.
+### Particle Filtering & Parameter Learning
+3. **Storvik (2002).** *Particle filters for state-space models with unknown parameters.* IEEE Transactions on Signal Processing. — Sufficient statistics framework
+4. **Liu & West (2001).** *Combined parameter and state estimation in simulation-based filtering.* — Liu-West smoothing for parameter diversity
 
-3. Storvik (2002). *Particle filters for state-space models with the presence of unknown static parameters*. IEEE Transactions on Signal Processing.
+### Smoothing & Particle Diversity
+5. **Olsson & Westerborn (2017).** *Efficient particle-based online smoothing: The PaRIS algorithm.* Bernoulli. — PARIS backward smoother
+6. **Gilks & Berzuini (2001).** *Following a moving target: Monte Carlo inference for dynamic Bayesian models.* JRSS-B. — Resample-Move (MH Jitter)
+7. **Herbst & Schorfheide (2019).** *Tempered particle filtering.* Journal of Econometrics. — KL tempering
+8. **Silverman (1986).** *Density Estimation for Statistics and Data Analysis.* Chapman & Hall. — Bandwidth selection
 
-4. Wald (1945). *Sequential tests of statistical hypotheses*. Annals of Mathematical Statistics.
+### Information Geometry
+9. **Amari & Nagaoka (2000).** *Methods of Information Geometry.* AMS. — Fisher information metric
+10. **Costa et al. (2015).** *Fisher-Rao geodesic distance for state estimation.* — Geodesic particle mutation on H²
 
-5. Silverman (1986). *Density Estimation for Statistics and Data Analysis*. Chapman & Hall.
+### Sequential Analysis & Adaptive Control
+11. **Wald (1945).** *Sequential tests of statistical hypotheses.* Annals of Mathematical Statistics. — SPRT theory
+12. **West & Harrison (1997).** *Bayesian Forecasting and Dynamic Models.* Springer. — Adaptive forgetting / discount factors
+13. **Jain & Chlamtac (1985).** *The P² algorithm for dynamic calculation of quantiles.* Communications of the ACM. — Circuit breaker quantile estimation
+
+### Validation Oracles
+14. **Fox, Sudderth, Jordan & Willsky (2011).** *A sticky HDP-HMM with application to speaker diarization.* Annals of Applied Statistics. — HDP-HMM for regime discovery
+15. **Van Gael, Saatci, Teh & Ghahramani (2008).** *Beam sampling for the infinite hidden Markov model.* ICML. — Beam sampling
+16. **Lindsten, Jordan & Schön (2014).** *Particle Gibbs with ancestor sampling.* JMLR. — PGAS for transition learning
+
+---
+
+## Summary Table
+
+| Component | Reference |
+|-----------|-----------|
+| Log-squared transform | Kim et al. (1998) |
+| 10-component mixture | Omori et al. (2007) |
+| Storvik learning | Storvik (2002) |
+| PARIS smoother | Olsson & Westerborn (2017) |
+| MH Jitter | Gilks & Berzuini (2001) |
+| KL tempering | Herbst & Schorfheide (2019) |
+| Silverman bandwidth | Silverman (1986) |
+| Fisher-Rao geodesic | Amari & Nagaoka (2000), Costa et al. (2015) |
+| SPRT detection | Wald (1945) |
+| Adaptive forgetting | West & Harrison (1997) |
+| P² circuit breaker | Jain & Chlamtac (1985) |
+| HDP-HMM oracle | Fox et al. (2011) |
+| PGAS oracle | Lindsten et al. (2014) |
 
 ---
 
