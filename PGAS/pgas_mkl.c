@@ -640,6 +640,9 @@ static void compute_log_emission_ocsn_mkl(float y, const float *h, int N, int N_
 #if defined(__AVX2__) || defined(PGAS_USE_AVX2)
 #define PGAS_HAS_AVX2 1
 #include <immintrin.h>
+#ifdef _MSC_VER
+#include <intrin.h> /* For _BitScanForward */
+#endif
 
 /**
  * AVX2 SIMD strategy: Process 8 particles at once
@@ -1193,9 +1196,9 @@ float pgas_mkl_gibbs_sweep(PGASMKLState *state)
  *
  * Fixes applied:
  *   1. Inlined AVX2 logsumexp - eliminates 4 MKL calls per particle
- *   2. fast_log_avx2 instead of vsLn - keeps data in registers
- *   3. schedule(static) - eliminates dynamic work-stealing overhead
- *   4. Walker's Alias Sampling - O(1) branchless sampling
+ *   2. Walker's Alias Sampling - O(1) branchless sampling
+ *   3. Batch RNG per timestep - reduces dispatcher calls
+ *   4. schedule(static) - eliminates dynamic work-stealing overhead
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 /* Workload threshold: below this, sequential is faster than parallel overhead */
@@ -1291,7 +1294,7 @@ static inline void logsumexp_normalize_avx2(const float *log_weights, int N, int
 /**
  * Walker's Alias Table for O(1) categorical sampling
  *
- * Build phase: O(N) - done once per backward step
+ * Build phase: O(N) - done once per particle
  * Sample phase: O(1) - branchless table lookup
  */
 typedef struct
@@ -1411,9 +1414,9 @@ void pgas_paris_backward_smooth(PGASMKLState *state)
     float *local_bw = state->ws_bw;
     VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
 
-    /* Pre-generate all random numbers for this timestep batch */
-    float *rand_u1 = state->ws_uniform; /* Reuse workspace */
-    float *rand_u2 = state->ws_normal;  /* Reuse workspace */
+    /* Pre-generate random numbers for this timestep batch */
+    float *rand_u1 = state->ws_uniform;
+    float *rand_u2 = state->ws_normal;
 
     int t, n, i;
     for (t = T - 2; t >= 0; t--)
