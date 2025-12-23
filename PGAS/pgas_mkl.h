@@ -143,7 +143,8 @@ extern "C"
         int adaptive_kappa_enabled; /**< 0=disabled (default), 1=enabled */
         float kappa_min;            /**< Lower bound (default: 20.0) */
         float kappa_max;            /**< Upper bound (default: 500.0) */
-        float kappa_adapt_rate;     /**< Adaptation speed (default: 0.2) */
+        float kappa_up_rate;        /**< Rate for increasing κ (default: 0.3) - fast reaction to spikes */
+        float kappa_down_rate;      /**< Rate for decreasing κ (default: 0.1) - slow return to normal */
         float last_chatter_ratio;   /**< Most recent chatter ratio */
         int last_off_diag_count;    /**< Off-diagonal transitions in last sweep */
         int last_total_count;       /**< Total transitions in last sweep */
@@ -343,21 +344,26 @@ extern "C"
     /**
      * @brief Configure adaptive kappa parameters
      *
-     * @param state       PGAS state
-     * @param kappa_min   Lower bound for κ (default: 20.0)
-     * @param kappa_max   Upper bound for κ (default: 500.0)
-     * @param adapt_rate  Adaptation speed, 0.0-1.0 (default: 0.2)
+     * Uses ASYMMETRIC rates: fast increase (react to spikes), slow decrease (stable recovery)
+     *
+     * @param state         PGAS state
+     * @param kappa_min     Lower bound for κ (default: 20.0)
+     * @param kappa_max     Upper bound for κ (default: 500.0)
+     * @param up_rate       Rate for increasing κ when chatter high (default: 0.3)
+     * @param down_rate     Rate for decreasing κ when prior too strong (default: 0.1)
      */
     static inline void pgas_mkl_configure_adaptive_kappa(PGASMKLState *state,
                                                          float kappa_min,
                                                          float kappa_max,
-                                                         float adapt_rate)
+                                                         float up_rate,
+                                                         float down_rate)
     {
         if (state)
         {
             state->kappa_min = kappa_min;
             state->kappa_max = kappa_max;
-            state->kappa_adapt_rate = adapt_rate;
+            state->kappa_up_rate = up_rate;
+            state->kappa_down_rate = down_rate;
         }
     }
 

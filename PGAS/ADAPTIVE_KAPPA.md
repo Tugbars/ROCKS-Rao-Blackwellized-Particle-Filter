@@ -114,12 +114,12 @@ if (adaptive_kappa_enabled) {
     float ratio = last_chatter_ratio;
     
     if (ratio > 1.5f) {
-        // Too much chatter: increase stickiness
-        kappa *= 1.0f + adapt_rate * (ratio - 1.0f);
+        // Too much chatter: FAST increase stickiness
+        kappa *= 1.0f + kappa_up_rate * (ratio - 1.0f);
     }
     else if (ratio < 0.5f) {
-        // Prior too strong: decrease stickiness
-        kappa *= 1.0f - adapt_rate * (1.0f - 2.0f * ratio);
+        // Prior too strong: SLOW decrease stickiness
+        kappa *= 1.0f - kappa_down_rate * (1.0f - 2.0f * ratio);
     }
     // else: ratio in [0.5, 1.5] → no change
     
@@ -134,7 +134,8 @@ if (adaptive_kappa_enabled) {
 |-----------|---------|-------------|
 | `kappa_min` | 20.0 | Lower bound (prevents instability) |
 | `kappa_max` | 500.0 | Upper bound (prevents over-regularization) |
-| `adapt_rate` | 0.2 | Speed of adaptation (0.0-1.0) |
+| `kappa_up_rate` | 0.3 | Fast increase on volatility spike |
+| `kappa_down_rate` | 0.1 | Slow decrease during recovery |
 
 ---
 
@@ -164,7 +165,8 @@ pgas_mkl_enable_adaptive_kappa(pgas, 1);
 pgas_mkl_configure_adaptive_kappa(pgas, 
     50.0f,   // kappa_min
     300.0f,  // kappa_max  
-    0.15f);  // adapt_rate
+    0.3f,    // up_rate (fast reaction to spikes)
+    0.1f);   // down_rate (slow return to normal)
 
 for (int i = 0; i < n_sweeps; i++) {
     pgas_mkl_gibbs_sweep(pgas);
@@ -282,3 +284,180 @@ For HFT: slower is safer (0.1-0.2)
 4. Structure preserved — always sticky diagonal
 
 **Key Insight**: Adapt *how much to trust the prior*, not the answer itself. This is robust where Online EM is brittle.
+
+---
+
+## Production Considerations
+
+### A. Asymmetric Adaptation Rates (IMPLEMENTED)
+
+In trading, volatility spikes arrive **instantly**, but calm returns **slowly**. 
+
+**Implementation**: Uses separate rates for increase vs decrease:
+- **kappa_up_rate = 0.3** (fast) — React quickly to volatility spike
+- **kappa_down_rate = 0.1** (slow) — Gradual return to normal
+
+```c
+if (ratio > 1.5f) {
+    // Fast increase - react to volatility spike
+    kappa *= 1.0f + kappa_up_rate * (ratio - 1.0f);
+}
+else if (ratio < 0.5f) {
+    // Slow decrease - gradual return to normal
+    kappa *= 1.0f - kappa_down_rate * (1.0f - 2.0f * ratio);
+}
+```
+
+**Rationale**: 
+- False negative (missing a spike) → catastrophic loss
+- False positive (over-regularizing calm) → minor inefficiency
+
+**Configuration**:
+```c
+pgas_mkl_configure_adaptive_kappa(pgas,
+    50.0f,   // kappa_min
+    300.0f,  // kappa_max
+    0.3f,    // up_rate (fast)
+    0.1f);   // down_rate (slow)
+```
+
+---
+
+### B. Transition Matrix Handoff to RBPF
+
+The RBPF runs on the fast tick loop. Don't hand off raw sampled transitions from a single Gibbs sweep — too noisy.
+
+**Recommendation**: Use exponential moving average for RBPF's transition matrix:
+
+```c
+// In lifeboat handoff
+float eta = 0.1f;  // Smoothing factor
+for (int i = 0; i < K*K; i++) {
+    Pi_RBPF[i] = (1.0f - eta) * Pi_RBPF[i] + eta * Pi_learned[i];
+}
+```
+
+**Benefits**:
+- Single outlier sweep doesn't destabilize RBPF
+- RBPF "worldview" remains smooth
+- Gradual adaptation to regime changes
+
+**Tuning η**:
+| η | Behavior |
+|---|----------|
+| 0.05 | Very smooth, slow to adapt |
+| 0.1 | Balanced (recommended) |
+| 0.3 | Responsive but may oscillate |
+
+---
+
+### C. Regime "Ghosting" — A Feature, Not a Bug
+
+In HFT, some regimes may not be visited for thousands of ticks (e.g., "Limit Up/Down").
+
+**Observation**: `n_trans` only updates for regimes present in `ref_regimes`. If a regime isn't visited, its row drifts back toward the prior.
+
+**Why this is good**:
+- "Refreshes" model's openness to rare events
+- Prevents over-fitting to recent calm periods
+- When rare regime finally appears, prior provides reasonable starting point
+
+**Caution**: If a regime is never visited during PGAS window, the learned row will be dominated by prior. This is correct Bayesian behavior but may surprise if not expected.
+
+---
+
+### D. "Arrogance" Protection Checklist
+
+To ensure this doesn't get stuck like Online EM:
+
+| Protection | Implementation | Why |
+|------------|----------------|-----|
+| **κ_min ≥ 20** | `kappa_min = 20.0f` | Never become un-sticky, or RBPF loses mind on microstructure noise |
+| **κ_max ≤ 500** | `kappa_max = 500.0f` | Never become so sticky that real transitions are suppressed |
+| **Lifeboat validation** | `lifeboat_mkl_validate()` | If PGAS fails to converge (low acceptance), don't update RBPF — stay with last "known good" |
+| **Bounded adaptation** | Rate ∈ [0.05, 0.3] | Prevent wild swings in κ |
+
+```c
+// In lifeboat handoff
+if (lifeboat_mkl_validate(&packet) && packet.ancestor_acceptance > 0.5f) {
+    // Good PGAS run — update RBPF
+    update_rbpf_transitions(rbpf, &packet);
+} else {
+    // Bad run — keep previous parameters
+    log_warning("PGAS validation failed, keeping previous transitions");
+}
+```
+
+---
+
+### E. Monitoring Metrics
+
+Log these in production:
+
+| Metric | Healthy Range | Alert If |
+|--------|---------------|----------|
+| `kappa` | 50 - 200 | < 30 or > 400 |
+| `chatter_ratio` | 0.7 - 1.3 | < 0.3 or > 2.0 |
+| `acceptance_rate` | 0.6 - 0.95 | < 0.4 |
+| `regime_coverage` | 3-4 regimes visited | < 2 regimes |
+
+```c
+void log_pgas_health(PGASMKLState *pgas) {
+    log_metric("pgas.kappa", pgas_mkl_get_sticky_kappa(pgas));
+    log_metric("pgas.chatter", pgas_mkl_get_chatter_ratio(pgas));
+    log_metric("pgas.acceptance", pgas_mkl_get_acceptance_rate(pgas));
+}
+```
+
+---
+
+### F. Recovery Procedures
+
+If PGAS gets into a bad state:
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| κ stuck at min (20) | Prior too weak for noise | Increase kappa_min to 50 |
+| κ stuck at max (500) | Prior too strong OR regime change | Reset κ to 100, increase window |
+| Acceptance < 0.3 | Model mismatch | Check mu_vol, phi, sigma_h |
+| Chatter > 3.0 | Observation noise spike | Temporary — wait for recovery |
+| Single regime dominates | Market in one state | Normal — will recover when market moves |
+
+**Emergency Reset**:
+```c
+void pgas_emergency_reset(PGASMKLState *pgas) {
+    pgas->sticky_kappa = 100.0f;  // Reset to default
+    pgas->last_chatter_ratio = 1.0f;
+    // Re-initialize reference trajectory
+    pgas_mkl_csmc_sweep(pgas);
+}
+```
+
+---
+
+## Future Enhancements
+
+### Regime-Specific κ (Not Yet Implemented)
+Different regimes may have different stickiness:
+- Crisis regime: very sticky (hard to exit)
+- Normal regime: moderately sticky
+- Transition regime: less sticky
+
+Would require K separate κ values instead of one global.
+
+### Chatter Ratio EMA (Not Yet Implemented)
+Smooth chatter ratio over multiple sweeps to reduce noise:
+```c
+chatter_ema = 0.9f * chatter_ema + 0.1f * current_chatter;
+// Adapt based on EMA, not instantaneous value
+```
+
+### Transition Matrix EMA for RBPF Handoff (Recommended)
+Don't hand raw samples to RBPF — use running mean:
+```c
+float eta = 0.1f;
+for (int i = 0; i < K*K; i++) {
+    Pi_RBPF[i] = (1.0f - eta) * Pi_RBPF[i] + eta * Pi_learned[i];
+}
+```
+This belongs in the Lifeboat layer, not PGAS core.
