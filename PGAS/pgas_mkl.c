@@ -250,9 +250,12 @@ PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed)
     state->adaptive_kappa_enabled = 0;
     state->kappa_min = 20.0f;
     state->kappa_max = 500.0f;
-    state->kappa_up_rate = 0.3f;   /* Fast DECREASE when chatter high (regime change) */
-    state->kappa_down_rate = 0.1f; /* Slow INCREASE when chatter low (stability) */
+    state->kappa_up_rate = 0.3f;   /* Legacy */
+    state->kappa_down_rate = 0.1f; /* Legacy */
     state->last_chatter_ratio = 1.0f;
+    state->rls_chatter_estimate = 1.0f; /* Start assuming prior matches data */
+    state->rls_variance = 1.0f;         /* High initial uncertainty */
+    state->rls_forgetting = 0.97f;      /* ~33 sweep effective window */
     state->last_off_diag_count = 0;
     state->last_total_count = 0;
 
@@ -1193,45 +1196,114 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
     /* ═══════════════════════════════════════════════════════════════════
      * ADAPTIVE KAPPA UPDATE (if enabled)
      *
-     * ASYMMETRIC ADAPTATION:
+     * Method: CHATTER-CORRECTED MOMENT MATCHING with RLS SMOOTHING
      *
-     * Chatter ratio = observed_transitions / expected_from_prior
+     * Key insight: Single-sweep chatter is NOISY (OCSN σ≈2.2).
+     * Solution: Use Recursive Least Squares (RLS) with forgetting factor
+     *           to estimate the "true" underlying chatter ratio.
      *
-     * - ratio > 1.5: Data has MORE switches than prior expects
-     *                → Prior is TOO STICKY → DECREASE κ (fast)
+     * RLS is a Kalman filter for tracking a slowly-varying parameter:
+     *   K = P / (λ + P)                    // Adaptive gain
+     *   θ̂ = θ̂ + K * (y - θ̂)              // Update estimate
+     *   P = (1/λ) * (P - K*P)              // Update variance
      *
-     * - ratio < 0.5: Data has FEWER switches than prior expects
-     *                → Prior is NOT STICKY ENOUGH → INCREASE κ (slow)
+     * λ = forgetting factor (0.97 → ~33 sweep effective window)
      *
-     * Asymmetry rationale:
-     *   - Volatility spikes → sudden excess chatter → need fast κ reduction
-     *   - Return to calm → gradual → slow κ increase is fine
+     * Benefits over EMA:
+     *   - Adaptive gain (trusts estimate more when confident)
+     *   - Principled (optimal for tracking non-stationary signals)
+     *   - Tracks estimation uncertainty
+     *
+     * Reference: Ljung & Söderström, "Theory and Practice of RLS"
      * ═══════════════════════════════════════════════════════════════════*/
 
     if (state->adaptive_kappa_enabled)
     {
-        float ratio = state->last_chatter_ratio;
-        float kappa_new = state->sticky_kappa;
+        const int K = state->K;
+        const float alpha = state->prior_alpha;
 
-        if (ratio > 1.5f)
-        {
-            /* Data has more transitions than prior expects
-             * → Prior too sticky → DECREASE κ (fast) */
-            float factor = 1.0f - state->kappa_up_rate * (ratio - 1.0f);
-            if (factor < 0.5f)
-                factor = 0.5f; /* Don't halve more than once */
-            kappa_new = state->sticky_kappa * factor;
-        }
-        else if (ratio < 0.5f)
-        {
-            /* Data has fewer transitions than prior expects
-             * → Prior not sticky enough → INCREASE κ (slow) */
-            float factor = 1.0f + state->kappa_down_rate * (1.0f - ratio * 2.0f);
-            kappa_new = state->sticky_kappa * factor;
-        }
-        /* else: ratio in [0.5, 1.5] → keep kappa unchanged */
+        /* 1. Get current diagnostics */
+        int total_switches = state->last_off_diag_count;
+        int total_obs = state->last_total_count;
 
-        /* Clamp to bounds */
+        if (total_obs < 10)
+            return; /* Need minimum data */
+
+        /* 2. Expected switch rate from current prior */
+        float expected_diag = (state->sticky_kappa + alpha) /
+                              (state->sticky_kappa + K * alpha);
+        float expected_switch_rate = 1.0f - expected_diag;
+
+        /* 3. Observed switch rate */
+        float observed_switch_rate = (float)total_switches / (float)total_obs;
+
+        /* 4. Raw Chatter Ratio (with Laplace smoothing) */
+        float laplace = 0.5f / (float)total_obs;
+        float raw_chatter = (observed_switch_rate + laplace) /
+                            (expected_switch_rate + laplace);
+
+        /* 5. RLS Update for chatter estimate
+         * This is optimal for tracking a slowly-varying signal */
+        float lambda = state->rls_forgetting; /* 0.97 default */
+        float P = state->rls_variance;
+        float theta = state->rls_chatter_estimate;
+
+        /* Kalman gain */
+        float rls_gain = P / (lambda + P);
+
+        /* Update estimate */
+        float innovation = raw_chatter - theta;
+        theta = theta + rls_gain * innovation;
+
+        /* Update variance (with forgetting) */
+        P = (1.0f / lambda) * (P - rls_gain * P);
+
+        /* Prevent variance collapse (maintain adaptivity) */
+        if (P < 0.01f)
+            P = 0.01f;
+        if (P > 10.0f)
+            P = 10.0f;
+
+        /* Store RLS state */
+        state->rls_chatter_estimate = theta;
+        state->rls_variance = P;
+        state->last_chatter_ratio = theta; /* For diagnostics */
+
+        /* 6. Clamp smoothed chatter to prevent extreme swings */
+        float chatter = theta;
+        if (chatter < 0.3f)
+            chatter = 0.3f;
+        if (chatter > 3.0f)
+            chatter = 3.0f;
+
+        /* 7. Calculate Corrected Target Diagonal */
+        float target_switch_rate = expected_switch_rate * chatter;
+        float target_diag = 1.0f - target_switch_rate;
+
+        /* Clamp to valid range [1/K + ε, 0.999] */
+        float min_diag = 1.0f / K + 0.01f;
+        if (target_diag < min_diag)
+            target_diag = min_diag;
+        if (target_diag > 0.999f)
+            target_diag = 0.999f;
+
+        /* 8. Map target_diag back to Kappa (The Oracle) */
+        float kappa_oracle = alpha * (target_diag * K - 1.0f) / (1.0f - target_diag);
+
+        /* Clamp oracle to bounds before log */
+        if (kappa_oracle < state->kappa_min)
+            kappa_oracle = state->kappa_min;
+        if (kappa_oracle > state->kappa_max)
+            kappa_oracle = state->kappa_max;
+
+        /* 9. Log-Space Momentum Update
+         * Moderate momentum (0.8) since RLS already smooths */
+        float momentum = 0.8f;
+        float log_kappa_new = momentum * logf(state->sticky_kappa) +
+                              (1.0f - momentum) * logf(kappa_oracle);
+        float kappa_new = expf(log_kappa_new);
+
+        /* 10. Clamp to user bounds */
         if (kappa_new < state->kappa_min)
             kappa_new = state->kappa_min;
         if (kappa_new > state->kappa_max)

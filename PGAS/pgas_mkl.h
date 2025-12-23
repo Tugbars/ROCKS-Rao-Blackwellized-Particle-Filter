@@ -143,9 +143,12 @@ extern "C"
         int adaptive_kappa_enabled; /**< 0=disabled (default), 1=enabled */
         float kappa_min;            /**< Lower bound (default: 20.0) */
         float kappa_max;            /**< Upper bound (default: 500.0) */
-        float kappa_up_rate;        /**< Rate for increasing κ (default: 0.3) - fast reaction to spikes */
-        float kappa_down_rate;      /**< Rate for decreasing κ (default: 0.1) - slow return to normal */
-        float last_chatter_ratio;   /**< Most recent chatter ratio */
+        float kappa_up_rate;        /**< (Legacy) Rate for increasing κ */
+        float kappa_down_rate;      /**< (Legacy) Rate for decreasing κ */
+        float last_chatter_ratio;   /**< EMA-smoothed chatter ratio */
+        float rls_chatter_estimate; /**< RLS estimate of true chatter */
+        float rls_variance;         /**< RLS estimation variance P */
+        float rls_forgetting;       /**< RLS forgetting factor λ (default: 0.97) */
         int last_off_diag_count;    /**< Off-diagonal transitions in last sweep */
         int last_total_count;       /**< Total transitions in last sweep */
 
@@ -312,21 +315,25 @@ extern "C"
     /*═══════════════════════════════════════════════════════════════════════════════
      * ADAPTIVE KAPPA
      *
-     * Uses chatter ratio as feedback to auto-tune stickiness prior.
+     * Uses CHATTER-CORRECTED MOMENT MATCHING with RLS SMOOTHING.
      * Disabled by default — enable explicitly with pgas_mkl_enable_adaptive_kappa().
      *
-     * Theory:
-     *   chatter_ratio = observed_transitions / expected_from_prior
+     * The Problem: "Adaptive MCMC Death Spiral"
+     *   - Naive moment-matching uses obs_diag from PGAS counts
+     *   - But PGAS counts are BIASED by current κ
+     *   - High κ → sticky trajectory → high obs_diag → higher κ (feedback!)
      *
-     *   - If ratio > 1.5: Data has MORE switches than prior expects
-     *                     → Prior is too sticky → DECREASE κ
+     * The Solution: Use CHATTER RATIO as negative feedback
+     *   - chatter = observed_switches / expected_switches
+     *   - If chatter > 1: data fights prior → decrease κ
+     *   - If chatter < 1: data calmer than prior → increase κ
      *
-     *   - If ratio < 0.5: Data has FEWER switches than prior expects
-     *                     → Prior not sticky enough → INCREASE κ
+     * Smoothing: Recursive Least Squares (RLS) with forgetting factor
+     *   - More principled than EMA
+     *   - Adaptive gain based on estimation uncertainty
+     *   - Tracks non-stationary signals optimally
      *
-     *   - If ratio ≈ 1.0: κ is well-calibrated
-     *
-     * This allows PGAS to self-tune to actual market stickiness.
+     * Reference: Ljung & Söderström, "Theory and Practice of RLS"
      *═══════════════════════════════════════════════════════════════════════════════*/
 
     /**
@@ -347,17 +354,15 @@ extern "C"
     }
 
     /**
-     * @brief Configure adaptive kappa parameters
+     * @brief Configure adaptive kappa bounds
      *
-     * Uses ASYMMETRIC rates:
-     *   - up_rate: Fast DECREASE when chatter high (regime change detected)
-     *   - down_rate: Slow INCREASE when chatter low (return to stability)
+     * Uses RLS-smoothed chatter-corrected moment matching.
      *
      * @param state         PGAS state
      * @param kappa_min     Lower bound for κ (default: 20.0)
      * @param kappa_max     Upper bound for κ (default: 500.0)
-     * @param up_rate       Rate for DECREASING κ when chatter > 1.5 (default: 0.3)
-     * @param down_rate     Rate for INCREASING κ when chatter < 0.5 (default: 0.1)
+     * @param up_rate       (Legacy) Not used in current implementation
+     * @param down_rate     (Legacy) Not used in current implementation
      */
     static inline void pgas_mkl_configure_adaptive_kappa(PGASMKLState *state,
                                                          float kappa_min,
@@ -372,6 +377,36 @@ extern "C"
             state->kappa_up_rate = up_rate;
             state->kappa_down_rate = down_rate;
         }
+    }
+
+    /**
+     * @brief Set RLS forgetting factor for adaptive kappa
+     *
+     * λ = 0.95 → ~20 sweep effective window (faster adaptation)
+     * λ = 0.97 → ~33 sweep effective window (default)
+     * λ = 0.99 → ~100 sweep effective window (slower, more stable)
+     *
+     * @param state         PGAS state
+     * @param forgetting    Forgetting factor λ ∈ (0.9, 1.0)
+     */
+    static inline void pgas_mkl_set_rls_forgetting(PGASMKLState *state,
+                                                   float forgetting)
+    {
+        if (state && forgetting > 0.9f && forgetting < 1.0f)
+        {
+            state->rls_forgetting = forgetting;
+        }
+    }
+
+    /**
+     * @brief Get RLS estimation variance (for diagnostics)
+     *
+     * Low P → confident in chatter estimate
+     * High P → uncertain, adapting faster
+     */
+    static inline float pgas_mkl_get_rls_variance(const PGASMKLState *state)
+    {
+        return state ? state->rls_variance : 0.0f;
     }
 
     /**
