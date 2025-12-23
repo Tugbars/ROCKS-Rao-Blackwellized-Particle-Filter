@@ -216,20 +216,6 @@ Sustained crisis with extreme outliers:
 
 ---
 
-## Per-Scenario Accuracy
-
-| Scenario | Accuracy | Notes |
-|----------|----------|-------|
-| Extended Calm | **99.0%** | Near-perfect in stable conditions |
-| Flash Crash | **80.2%** | Fast in, fast out |
-| Sudden Crisis | **73.4%** | Rapid detection |
-| Recovery | **63.2%** | Smooth de-escalation |
-| Crisis Persist | **59.1%** | Sustained tracking |
-| Slow Trend | **55.8%** | Gradual transitions harder |
-| Choppy | **45.8%** | Random switching is hardest |
-
----
-
 ## Latency
 
 | Particles | Median (μs) | P99 (μs) | Max (μs) |
