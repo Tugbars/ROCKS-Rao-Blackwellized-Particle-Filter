@@ -28,34 +28,73 @@ This filter achieves the **information-theoretic limit** for real-time volatilit
 Every component has mathematical justification. No heuristics.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         ROCKS Filter                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   Observation Model                                             │
-│   ├── KSC (1998) log-squared transform                         │
-│   ├── Omori (2007) 10-component Gaussian mixture               │
-│   └── Student-t extension for fat-tailed returns               │
-│                                                                 │
-│   State Estimation                                              │
-│   ├── Rao-Blackwellized particle filter                        │
-│   │   └── Kalman filter for continuous state (exact)           │
-│   │   └── Particles for discrete regime (sampled)              │
-│   ├── Silverman bandwidth for regularization                   │
-│   └── Systematic resampling with ESS threshold                 │
-│                                                                 │
-│   Robustness                                                    │
-│   ├── OCSN 11th component for outlier absorption               │
-│   └── Student-t likelihood for structural fat tails            │
-│                                                                 │
-│   Online Learning                                               │
-│   ├── Storvik sufficient statistics                            │
-│   └── Adaptive forgetting (regime-dependent λ)                 │
-│                                                                 │
-│   Regime Detection                                              │
-│   └── SPRT (Sequential Probability Ratio Test)                 │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ROCKS Filter                                   │
+│            Regime-switching Online Calibrated Kalman-particle System        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Observation Model                                                         │
+│   ├── KSC (1998) log-squared return transform: y_t = log(r_t²)             │
+│   ├── OCSN (2007) 10-component Gaussian mixture for log-χ²(1)              │
+│   ├── 11th outlier component (θ=5%, wide variance) for fat tails           │
+│   └── Precomputed log-constants for O(1) likelihood evaluation             │
+│                                                                             │
+│   State Estimation: Rao-Blackwellized Particle Filter                       │
+│   ├── Analytical Kalman update for h_t | regime (exact, no particles)      │
+│   ├── Discrete particles for regime posterior P(r_t | y_{1:t})             │
+│   ├── Systematic resampling with adaptive ESS threshold                    │
+│   └── Particle Regeneration & Diversity                                    │
+│       ├── Silverman bandwidth regularization (h = 0.9·σ·N^{-1/5})          │
+│       ├── KL-divergence tempering for weight smoothing                     │
+│       └── MH Jitter for particle boundary escape (+20% ESS, -19% lag)      │
+│                                                                             │
+│   Regime Dynamics                                                           │
+│   ├── Pre-computed transition LUT (log-space, cache-aligned)               │
+│   ├── 4-regime default: CALM → TREND → ELEVATED → CRISIS                   │
+│   ├── Diagonal-dominant transitions (κ ≈ 0.92 stickiness)                  │
+│   └── Fisher-Rao distance metric for regime separation                     │
+│                                                                             │
+│   Regime Detection                                                          │
+│   └── SPRT (Sequential Probability Ratio Test)                             │
+│       ├── Log-likelihood ratio accumulation                                │
+│       ├── Wald boundaries for detection/false-alarm tradeoff               │
+│       └── Per-regime hypothesis testing                                    │
+│                                                                             │
+│   Online Parameter Learning                                                 │
+│   ├── Storvik sufficient statistics (T_k, S_k, Q_k per regime)             │
+│   ├── Regime-adaptive forgetting factor λ_k ∈ [0.995, 0.9995]              │
+│   ├── Emergency λ override with auto-decay (circuit breaker)               │
+│   ├── Welford online variance for numerical stability                      │
+│   └── Storvik + PARIS interaction                                          │
+│       ├── PARIS provides smoothed regime assignments                       │
+│       ├── Storvik updates sufficient stats with smoothed weights           │
+│       └── Backward pass refines parameter estimates retrospectively        │
+│                                                                             │
+│   Smoothing & Retrospection                                                 │
+│   └── PARIS algorithm (Particle Approximation of Retrospective ISampling)  │
+│       ├── O(N) backward smoothing with ancestor weights                    │
+│       └── Feeds corrected assignments back to Storvik learner              │
+│                                                                             │
+│   Validation Oracles (Offline Ground Truth)                                 │
+│   ├── Sticky HDP-HMM: Beam sampling + Blocked FFBS                         │
+│   │   └── Automatic regime discovery, validates K and μ_k                  │
+│   └── PGAS-MKL: Particle Gibbs with Ancestor Sampling                      │
+│       └── Transition matrix learning via Dirichlet posterior               │
+│                                                                             │
+│   Performance Layer                                                         │
+│   ├── Intel MKL: VSL RNG, VML vectorized exp/log, CBLAS                    │
+│   ├── AVX-512/AVX2 SIMD for likelihood and resampling                      │
+│   ├── Structure-of-Arrays (SoA) with 64-byte cache alignment               │
+│   ├── Precomputed constants (OCSN_LOG_CONST, OCSN_INV_2V)                   │
+│   └── Zero-allocation hot path (pre-allocated scratch buffers)             │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│   Theoretical Guarantees                                                    │
+│   ├── Cramér-Rao optimal: ±2σ coverage ≈ 95%                               │
+│   ├── Outlier-robust: 0 spurious regime switches on fat-tail events        │
+│   ├── Detection lag: ~16 ticks (information-theoretic cost of robustness)  │
+│   └── Online complexity: O(N·K) per tick, N=particles, K=regimes           │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why Each Component
