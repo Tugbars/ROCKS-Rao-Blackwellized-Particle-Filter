@@ -481,10 +481,11 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
 
     /* Transition matrix (stickiness=0.92) */
     rbpf_real_t trans[16] = {
-        0.920f, 0.056f, 0.020f, 0.004f,
-        0.032f, 0.920f, 0.036f, 0.012f,
-        0.012f, 0.036f, 0.920f, 0.032f,
-        0.004f, 0.020f, 0.056f, 0.920f};
+        0.9874f, 0.0008f, 0.0014f, 0.0104f,
+        0.0199f, 0.9496f, 0.0089f, 0.0216f,
+        0.0198f, 0.0063f, 0.9487f, 0.0251f,
+        0.0485f, 0.0052f, 0.0063f, 0.9400f};
+
     rbpf_ext_build_transition_lut(ext, trans);
 
     /* ═══════════════════════════════════════════════════════════════════════

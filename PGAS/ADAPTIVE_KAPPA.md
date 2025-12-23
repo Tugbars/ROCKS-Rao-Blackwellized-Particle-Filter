@@ -109,26 +109,106 @@ This is essentially a **likelihood ratio** for the stickiness hypothesis.
 
 ## Adaptation Algorithm
 
+### The "Adaptive MCMC Death Spiral" Problem
+
+Naive moment-matching has a **circular dependency**:
+1. High κ → PGAS produces sticky trajectory
+2. Moment-matching sees sticky trajectory → thinks κ should be high
+3. κ stays high → repeat!
+
+The prior is essentially **validating itself**.
+
+### Solution: Chatter-Corrected Moment Matching
+
+Use the **chatter ratio** as a negative feedback signal to break the loop:
+
 ```c
-if (adaptive_kappa_enabled) {
-    float ratio = last_chatter_ratio;
-    
-    if (ratio > 1.5f) {
-        // Data has more transitions than prior expects
-        // Prior too sticky → DECREASE kappa (fast)
-        kappa *= 1.0f - kappa_up_rate * (ratio - 1.0f);
-    }
-    else if (ratio < 0.5f) {
-        // Data has fewer transitions than prior expects  
-        // Prior not sticky enough → INCREASE kappa (slow)
-        kappa *= 1.0f + kappa_down_rate * (1.0f - 2.0f * ratio);
-    }
-    // else: ratio in [0.5, 1.5] → no change
-    
-    // Clamp to bounds
-    kappa = clamp(kappa, kappa_min, kappa_max);
-}
+// 1. Expected switch rate from current prior
+expected_diag = (κ + α) / (κ + K*α);
+expected_switch_rate = 1 - expected_diag;
+
+// 2. Observed switch rate from PGAS counts
+observed_switch_rate = off_diag_count / total_count;
+
+// 3. Chatter Ratio (with Laplace smoothing)
+chatter = (observed + 0.5/N) / (expected + 0.5/N);
+
+// 4. Corrected Target Diagonal
+target_switch_rate = expected_switch_rate * chatter;
+target_diag = 1 - target_switch_rate;
+
+// 5. Oracle κ from target diagonal
+kappa_oracle = α * (target_diag * K - 1) / (1 - target_diag);
+
+// 6. Log-Space Momentum Update
+log_kappa_new = 0.7 * log(kappa) + 0.3 * log(kappa_oracle);
+kappa = exp(log_kappa_new);
 ```
+
+### Why This Works
+
+| Scenario | Chatter | Effect |
+|----------|---------|--------|
+| Data fights prior (more switches) | > 1 | target_diag ↓ → κ ↓ |
+| Data matches prior | ≈ 1 | κ stable |
+| Data calmer than prior | < 1 | target_diag ↑ → κ ↑ |
+
+**The feedback is negative**: if PGAS sees excess switching, κ decreases to accommodate.
+
+### Stabilization: RLS Smoothing
+
+Single-sweep chatter is **extremely noisy** due to OCSN observation noise (σ≈2.2). Without smoothing, κ can swing from 30 → 300 in a few sweeps.
+
+**Solution: Recursive Least Squares (RLS) with Forgetting Factor**
+
+RLS is a Kalman filter for tracking a slowly-varying parameter:
+
+```c
+// RLS state: estimate θ, variance P
+
+// Kalman gain (adaptive)
+float K = P / (λ + P);
+
+// Update estimate
+θ = θ + K * (raw_chatter - θ);
+
+// Update variance (with forgetting)
+P = (1/λ) * (P - K * P);
+```
+
+**Why RLS > EMA:**
+
+| Aspect | EMA | RLS |
+|--------|-----|-----|
+| Gain | Fixed | **Adaptive** (based on P) |
+| Early phase | Over-trusts noisy data | **High P → cautious** |
+| Steady state | Fixed response | **Low P → stable** |
+| Theory | Heuristic | **Optimal** for tracking |
+
+**Forgetting Factor λ:**
+- λ = 0.95 → ~20 sweep effective window (faster)
+- λ = 0.97 → ~33 sweep effective window (default)
+- λ = 0.99 → ~100 sweep effective window (slower)
+
+```c
+// Configure RLS forgetting factor
+pgas_mkl_set_rls_forgetting(pgas, 0.97f);
+
+// Monitor RLS variance (for diagnostics)
+float P = pgas_mkl_get_rls_variance(pgas);
+// Low P → confident, high P → still adapting
+```
+
+### Log-Space Momentum Update
+
+Updates in log-space ensure **symmetric steps**:
+
+| Linear (bad) | Log-space (good) |
+|--------------|------------------|
+| κ=100→50: moves 50 | κ=100→50: ratio 0.5 |
+| κ=100→200: moves 100 | κ=100→200: ratio 2.0 |
+
+The momentum factor (0.7) also satisfies **diminishing adaptation** for ergodicity (Andrieu & Moulines 2006).
 
 ### Parameters
 
@@ -136,8 +216,18 @@ if (adaptive_kappa_enabled) {
 |-----------|---------|-------------|
 | `kappa_min` | 20.0 | Lower bound (prevents instability) |
 | `kappa_max` | 500.0 | Upper bound (prevents over-regularization) |
-| `kappa_up_rate` | 0.3 | Fast DECREASE when chatter > 1.5 |
-| `kappa_down_rate` | 0.1 | Slow INCREASE when chatter < 0.5 |
+| `rls_forgetting` | 0.97 | λ: forgetting factor (~33 sweep window) |
+| `rls_variance` | 1.0 | P: initial estimation uncertainty |
+| `momentum` | 0.8 | Log-space κ update momentum (internal) |
+| `chatter_min` | 0.3 | Minimum chatter (prevents upward spiral) |
+| `chatter_max` | 3.0 | Maximum chatter (prevents downward spiral) |
+| Laplace | 0.5/N | Numerical stability (internal) |
+
+### Literature Reference
+
+**Andrieu & Moulines (2006)** "On the Ergodicity of Adaptive MCMC Algorithms"
+- Proves adaptive samplers require "diminishing adaptation" to converge
+- Our momentum factor acts as a proxy for this requirement
 
 ---
 
@@ -291,43 +381,44 @@ For HFT: slower is safer (0.1-0.2)
 
 ## Production Considerations
 
-### A. Asymmetric Adaptation Rates (IMPLEMENTED)
+### A. Chatter-Corrected Moment Matching with RLS (IMPLEMENTED)
 
-In trading, volatility spikes arrive **instantly**, but calm returns **slowly**. 
+Breaks the "Adaptive MCMC Death Spiral" where the prior validates itself.
 
-**Corrected Logic**:
-- **chatter > 1.5**: Data has MORE transitions than prior expects → prior too sticky → DECREASE κ (fast)
-- **chatter < 0.5**: Data has FEWER transitions than prior expects → prior not sticky enough → INCREASE κ (slow)
+**Key Insight**: The chatter ratio is an **unbiased error signal**:
+- chatter > 1: Data has more switches than prior expects → κ should decrease
+- chatter < 1: Data has fewer switches than prior expects → κ should increase
 
-**Implementation**: Uses separate rates for decrease vs increase:
-- **kappa_up_rate = 0.3** (fast) — React quickly to regime change (DECREASE κ)
-- **kappa_down_rate = 0.1** (slow) — Gradual return to stability (INCREASE κ)
+**Smoothing**: Recursive Least Squares (RLS) with forgetting factor
+- More principled than EMA (optimal for tracking non-stationary signals)
+- Adaptive gain based on estimation uncertainty P
+- High P → trust new data more; Low P → trust estimate more
 
+**Implementation:**
 ```c
-if (ratio > 1.5f) {
-    // Data has more switches than prior expects
-    // Prior too sticky → DECREASE κ (fast)
-    kappa *= 1.0f - kappa_up_rate * (ratio - 1.0f);
-}
-else if (ratio < 0.5f) {
-    // Data has fewer switches than prior expects
-    // Prior not sticky enough → INCREASE κ (slow)
-    kappa *= 1.0f + kappa_down_rate * (1.0f - 2.0f * ratio);
-}
+// 1. Compute raw chatter
+float raw_chatter = observed_switch_rate / expected_switch_rate;
+
+// 2. RLS update (Kalman filter for scalar)
+float K = P / (lambda + P);              // Adaptive gain
+theta = theta + K * (raw_chatter - theta); // Update estimate
+P = (1/lambda) * (P - K * P);            // Update variance
+
+// 3. Use RLS-smoothed chatter
+float chatter = clamp(theta, 0.3f, 3.0f);
+
+// 4. Corrected target from smoothed chatter
+float target_diag = 1 - expected_switch_rate * chatter;
+
+// 5. Oracle κ from corrected target
+float kappa_oracle = alpha * (target_diag * K - 1) / (1 - target_diag);
+
+// 6. Log-space momentum update
+float log_kappa = 0.8f * logf(kappa) + 0.2f * logf(kappa_oracle);
+kappa = expf(log_kappa);
 ```
 
-**Rationale**: 
-- Fast κ decrease allows quick adaptation to regime changes
-- Slow κ increase prevents oscillation during stable periods
-
-**Configuration**:
-```c
-pgas_mkl_configure_adaptive_kappa(pgas,
-    50.0f,   // kappa_min
-    300.0f,  // kappa_max
-    0.3f,    // up_rate (fast DECREASE)
-    0.1f);   // down_rate (slow INCREASE)
-```
+**Reference**: Ljung & Söderström, "Theory and Practice of Recursive Identification"
 
 ---
 

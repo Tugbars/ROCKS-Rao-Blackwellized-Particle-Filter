@@ -142,6 +142,30 @@ target_compile_definitions(pgas_validation_adaptive PRIVATE ${COMMON_DEFS})
 #target_compile_definitions(benchmark_all PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
+# Tool: PGAS Transition Matrix Learner
+#
+# Learns transition matrix from synthetic data (same as test_mmpf_comparison).
+# Outputs copy-pasteable C code for comparison against tuned matrix.
+#
+# Usage:
+#   ./pgas_learn_trans [seed]
+#   Default seed = 42 (matches tuner)
+#───────────────────────────────────────────────────────────────────────────────
+
+add_executable(pgas_learn_trans
+    pgas_learn_trans.c
+)
+
+target_link_libraries(pgas_learn_trans
+    PRIVATE
+        pgas_mkl
+        MKL::MKL
+)
+
+target_compile_options(pgas_learn_trans PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(pgas_learn_trans PRIVATE ${COMMON_DEFS})
+
+#───────────────────────────────────────────────────────────────────────────────
 # CTest Integration
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -167,4 +191,5 @@ message(STATUS "  test_lifeboat             - Lifeboat integration tests")
 message(STATUS "  pgas_validation_a         - Option A: Ground truth recovery")
 message(STATUS "  pgas_validation_adaptive  - Adaptive κ self-tuning")
 message(STATUS "  benchmark_all             - Full benchmark suite")
+message(STATUS "  pgas_learn_trans          - Learn Π from test_mmpf data")
 message(STATUS "")
