@@ -290,8 +290,8 @@ static LIFEBOAT_THREAD_RETURN lifeboat_worker_thread(void *arg)
          * ═══════════════════════════════════════════════════════════════════*/
         double t_start = get_time_ms();
 
-        pgas_mkl_set_model(pgas, trans_d, mu_vol_d, sigma_vol_d,
-                           (double)phi_f, (double)sigma_h_f);
+        pgas_mkl_set_model(pgas, trans_d, mu_vol_d, sigma_vol_d, (double)phi_f);
+
         pgas_mkl_set_reference(pgas, mgr->worker_ref_regimes, mgr->worker_ref_h_d, T);
         pgas_mkl_load_observations(pgas, mgr->worker_obs_d, T);
 

@@ -11,6 +11,7 @@
  *   pgas_learn_trans [seed]
  *   Default seed = 42 (matches your tuner)
  *
+ * Updated for per-regime sigma_vol API (ALIGNED WITH RBPF)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 #include <stdio.h>
@@ -35,7 +36,6 @@
 static const double TUNED_MU_VOL[N_REGIMES] = {-4.50, -3.67, -2.83, -2.00};
 static const double TUNED_SIGMA_VOL[N_REGIMES] = {0.080, 0.267, 0.453, 0.640};
 static const double TUNED_PHI = 0.97;
-static const double TUNED_SIGMA_H = 0.15;
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * PCG32 RNG - EXACT COPY FROM test_mmpf_comparison.c
@@ -53,7 +53,7 @@ static uint32_t pcg32_random(pcg32_t *rng)
     rng->state = oldstate * 6364136223846793005ULL + rng->inc;
     uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
     uint32_t rot = (uint32_t)(oldstate >> 59u);
-    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+    return (xorshifted >> rot) | (xorshifted << ((0u - rot) & 31));
 }
 
 static double pcg32_double(pcg32_t *rng)
@@ -244,7 +244,6 @@ static void init_reference_from_observations(
     int K,
     const double *mu_vol, /* regime means */
     double phi,
-    double sigma_h,
     int *out_regimes,
     double *out_h)
 {
@@ -378,8 +377,8 @@ int main(int argc, char **argv)
         }
     }
 
-    pgas_mkl_set_model(pgas, init_trans, TUNED_MU_VOL, TUNED_SIGMA_VOL,
-                       TUNED_PHI, TUNED_SIGMA_H);
+    /* Updated API: no sigma_h argument (per-regime sigma_vol is used) */
+    pgas_mkl_set_model(pgas, init_trans, TUNED_MU_VOL, TUNED_SIGMA_VOL, TUNED_PHI);
 
     /* Set transition prior: κ=50 + adaptive (capped at 150) */
     pgas_mkl_set_transition_prior(pgas, 1.0f, 50.0f);
@@ -390,7 +389,7 @@ int main(int argc, char **argv)
            TUNED_MU_VOL[0], TUNED_MU_VOL[1], TUNED_MU_VOL[2], TUNED_MU_VOL[3]);
     printf("  sigma_vol = {%.3f, %.3f, %.3f, %.3f}\n",
            TUNED_SIGMA_VOL[0], TUNED_SIGMA_VOL[1], TUNED_SIGMA_VOL[2], TUNED_SIGMA_VOL[3]);
-    printf("  phi=%.2f, sigma_h=%.2f\n", TUNED_PHI, TUNED_SIGMA_H);
+    printf("  phi=%.2f\n", TUNED_PHI);
     printf("  κ=50 (adaptive, max=150)\n\n");
 
     /* Load observations */
@@ -402,7 +401,7 @@ int main(int argc, char **argv)
     double *init_h = (double *)malloc(N_TICKS * sizeof(double));
 
     init_reference_from_observations(data->log_sq_returns, N_TICKS, N_REGIMES,
-                                     TUNED_MU_VOL, TUNED_PHI, TUNED_SIGMA_H,
+                                     TUNED_MU_VOL, TUNED_PHI,
                                      init_regimes, init_h);
 
     pgas_mkl_set_reference(pgas, init_regimes, init_h, N_TICKS);

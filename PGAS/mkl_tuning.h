@@ -48,7 +48,7 @@
 #include <intrin.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <mmsystem.h>  /* ← ADD THIS for timeBeginPeriod/timeEndPeriod */
+#include <mmsystem.h>  /* for timeBeginPeriod/timeEndPeriod */
 #pragma comment(lib, "winmm.lib") /* For timeBeginPeriod */
 #else
 #include <xmmintrin.h>

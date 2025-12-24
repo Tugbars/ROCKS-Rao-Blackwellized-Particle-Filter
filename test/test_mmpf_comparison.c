@@ -474,10 +474,10 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
      * ═══════════════════════════════════════════════════════════════════════════*/
 
     /* Regime params (θ, μ, σ) - linearly interpolated */
-    rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.644f, 0.080f); /* Calm */
-rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.589f, 0.267f); /* Mild */
-rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.733f, 0.453f); /* Trend */
-rbpf_ext_set_regime_params(ext, 3, 0.1200f, -1.997f, 0.640f); /* Crisis */
+    rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.299f, 0.080f); // Calm
+    rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.465f, 0.267f); // Mild
+    rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.954f, 0.453f); // Trend
+    rbpf_ext_set_regime_params(ext, 3, 0.1200f, -2.171f, 0.640f); // Crisis
 
     /*
 rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.644f, 0.080f); // Calm 
@@ -494,30 +494,8 @@ rbpf_ext_set_regime_params(ext, 3, 0.1200f, -1.997f, 0.640f); // Crisis
         0.004f, 0.020f, 0.056f, 0.920f};
     rbpf_ext_build_transition_lut(ext, trans);
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * ENABLE DIRICHLET TRANSITION LEARNING
-     *
-     * IMPORTANT: Call set_transition_learning_params() to re-initialize
-     * the geometry-aware prior with the CORRECT mu_vol values.
-     * ═══════════════════════════════════════════════════════════════════════*/
-    /*
-    rbpf_ksc_set_transition_learning_params(ext->rbpf,
-                                            30.0f,   // stickiness
-                                            1.0f,    // distance_scale
-                                            0.999f); // gamma
-    rbpf_ksc_enable_transition_learning(ext->rbpf, 1);
-    */
-
     /* Enable adaptive forgetting in REGIME mode (uses fixed λ, no surprise modulation) */
     rbpf_ext_enable_adaptive_forgetting_mode(ext, ADAPT_SIGNAL_REGIME);
-    // rbpf_ext_enable_adaptive_forgetting(ext);
-
-    /* Set YOUR tuned λ values (not the defaults). Delete these if you want to make it completely adaptive
-    rbpf_ext_set_regime_lambda(ext, 0, 0.9990f);
-    rbpf_ext_set_regime_lambda(ext, 1, 0.9970f);
-    rbpf_ext_set_regime_lambda(ext, 2, 0.9950f);
-    rbpf_ext_set_regime_lambda(ext, 3, 0.9930f);
-    */
 
     /* Enable circuit breaker */
     rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);
