@@ -760,9 +760,28 @@ void pgas_paris_regime_prior_init(PGASParisRegimePrior *prior, int K)
     prior->sigma_prior_shape = 3.0f;
     prior->sigma_prior_scale = 0.1f;
 
+    /* Default σ_h prior: InvGamma(3, 0.03)
+     * Mode ≈ 0.03/(3+1) = 0.0075, giving σ_h ~ 0.1-0.2 range */
+    prior->sigma_h_prior_shape = 3.0f;
+    prior->sigma_h_prior_scale = 0.03f;
+
+    /* Default φ prior: Beta(20, 1.5) on [0.8, 0.995]
+     * Mode ≈ (20-1)/(20+1.5-2) = 0.974, concentrated around 0.97 */
+    prior->phi_prior_a = 20.0f;
+    prior->phi_prior_b = 1.5f;
+    prior->phi_proposal_std = 0.1f; /* MH step on logit scale */
+    prior->phi_min = 0.80f;
+    prior->phi_max = 0.995f;
+
     /* Learning disabled by default */
     prior->learn_mu = 0;
     prior->learn_sigma = 0;
+    prior->learn_sigma_h = 0;
+    prior->learn_phi = 0;
+
+    /* MH diagnostics */
+    prior->phi_mh_accepts = 0;
+    prior->phi_mh_total = 0;
 
     /* Ordering enforced by default (prevents label switching) */
     prior->enforce_ordering = 1;
@@ -775,6 +794,76 @@ void pgas_paris_set_mu_prior(PGASParisRegimePrior *prior, int k,
         return;
     prior->mu_prior_mean[k] = mean;
     prior->mu_prior_var[k] = variance;
+}
+
+void pgas_paris_set_sigma_vol_prior(PGASParisRegimePrior *prior,
+                                    float shape, float scale)
+{
+    if (!prior)
+        return;
+    if (shape <= 0.0f)
+        shape = 3.0f; /* Sensible default */
+    if (scale <= 0.0f)
+        scale = 0.1f;
+    prior->sigma_prior_shape = shape;
+    prior->sigma_prior_scale = scale;
+}
+
+void pgas_paris_set_sigma_h_prior(PGASParisRegimePrior *prior,
+                                  float shape, float scale)
+{
+    if (!prior)
+        return;
+    if (shape <= 0.0f)
+        shape = 3.0f;
+    if (scale <= 0.0f)
+        scale = 0.03f;
+    prior->sigma_h_prior_shape = shape;
+    prior->sigma_h_prior_scale = scale;
+}
+
+void pgas_paris_set_phi_prior(PGASParisRegimePrior *prior,
+                              float a, float b,
+                              float phi_min, float phi_max,
+                              float proposal_std)
+{
+    if (!prior)
+        return;
+
+    /* Validate and set Beta parameters */
+    if (a <= 0.0f)
+        a = 20.0f;
+    if (b <= 0.0f)
+        b = 1.5f;
+    prior->phi_prior_a = a;
+    prior->phi_prior_b = b;
+
+    /* Validate and set bounds */
+    if (phi_min < 0.0f)
+        phi_min = 0.0f;
+    if (phi_max > 1.0f)
+        phi_max = 1.0f;
+    if (phi_min >= phi_max)
+    {
+        phi_min = 0.80f;
+        phi_max = 0.995f;
+    }
+    prior->phi_min = phi_min;
+    prior->phi_max = phi_max;
+
+    /* Validate proposal std */
+    if (proposal_std <= 0.0f)
+        proposal_std = 0.1f;
+    if (proposal_std > 1.0f)
+        proposal_std = 1.0f;
+    prior->phi_proposal_std = proposal_std;
+}
+
+float pgas_paris_get_phi_acceptance_rate(const PGASParisRegimePrior *prior)
+{
+    if (!prior || prior->phi_mh_total == 0)
+        return 0.0f;
+    return (float)prior->phi_mh_accepts / (float)prior->phi_mh_total;
 }
 
 void pgas_paris_collect_regime_stats(PGASParisState *state,
@@ -791,7 +880,7 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
 
     stats->K = K;
 
-    /* Zero initialize */
+    /* Zero initialize per-regime stats */
     for (int k = 0; k < K; k++)
     {
         stats->n_k[k] = 0.0;
@@ -800,6 +889,15 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
         stats->sum_resid_k[k] = 0.0;
         stats->sum_resid_sq_k[k] = 0.0;
     }
+
+    /* Zero initialize global stats */
+    stats->total_T = 0.0;
+    stats->sum_h_all = 0.0;
+    stats->sum_h_sq_all = 0.0;
+    stats->sum_h_lag_all = 0.0;
+    stats->sum_h_prev_sq_all = 0.0;
+    stats->sum_resid_all = 0.0;
+    stats->sum_resid_sq_all = 0.0;
 
     /* Accumulate statistics from cached trajectory data
      * OPTIMIZATION: Use h_traj_cache instead of re-fetching from PARIS */
@@ -815,6 +913,10 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
         stats->sum_h_k[z_0] += h_0;
         stats->sum_h_sq_k[z_0] += h_0 * h_0;
 
+        /* Also accumulate to global */
+        stats->sum_h_all += h_0;
+        stats->sum_h_sq_all += h_0 * h_0;
+
         /* Remaining timesteps - with residuals */
         float h_prev = h_0;
         for (int t = 1; t < T; t++)
@@ -822,6 +924,7 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
             int z_t = traj[t];
             float h_t = h_cache[t];
 
+            /* Per-regime stats */
             stats->n_k[z_t] += 1.0;
             stats->sum_h_k[z_t] += h_t;
             stats->sum_h_sq_k[z_t] += h_t * h_t;
@@ -830,6 +933,15 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
             float resid = h_t - phi * h_prev;
             stats->sum_resid_k[z_t] += resid;
             stats->sum_resid_sq_k[z_t] += resid * resid;
+
+            /* Global stats for σ_h and φ learning */
+            stats->sum_h_all += h_t;
+            stats->sum_h_sq_all += h_t * h_t;
+            stats->sum_h_lag_all += h_t * h_prev;
+            stats->sum_h_prev_sq_all += h_prev * h_prev;
+            stats->sum_resid_all += resid;
+            stats->sum_resid_sq_all += resid * resid;
+            stats->total_T += 1.0;
 
             h_prev = h_t;
         }
@@ -845,6 +957,15 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
         stats->sum_resid_k[k] *= inv_M;
         stats->sum_resid_sq_k[k] *= inv_M;
     }
+
+    /* Normalize global stats */
+    stats->total_T *= inv_M;
+    stats->sum_h_all *= inv_M;
+    stats->sum_h_sq_all *= inv_M;
+    stats->sum_h_lag_all *= inv_M;
+    stats->sum_h_prev_sq_all *= inv_M;
+    stats->sum_resid_all *= inv_M;
+    stats->sum_resid_sq_all *= inv_M;
 }
 
 void pgas_paris_sample_mu_vol(PGASParisState *state,
@@ -994,6 +1115,258 @@ void pgas_paris_sample_sigma_vol(PGASParisState *state,
     }
 }
 
+/*═══════════════════════════════════════════════════════════════════════════════
+ * σ_h LEARNING (SHARED AR INNOVATION)
+ *
+ * Model: h_t = μ_{z_t}(1-φ) + φ*h_{t-1} + σ_h*ε_t
+ *
+ * Given {h, z, μ, φ}, the innovations are:
+ *   ε_t = (h_t - μ_{z_t}(1-φ) - φ*h_{t-1}) / σ_h
+ *
+ * The sum of squared innovations follows:
+ *   Σε² = Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})² / σ_h²
+ *
+ * Conjugate: σ_h² | rest ~ InvGamma(a_post, b_post)
+ *   a_post = a₀ + (T-1)/2
+ *   b_post = b₀ + 0.5 * Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})²
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+void pgas_paris_sample_sigma_h(PGASParisState *state,
+                               const PGASParisRegimeStats *stats,
+                               PGASParisRegimePrior *prior)
+{
+    if (!state || !state->pgas || !stats || !prior)
+        return;
+    if (!prior->learn_sigma_h)
+        return;
+
+    PGASMKLState *pgas = state->pgas;
+    const int K = pgas->K;
+    const int T = pgas->T;
+    const int M = state->n_trajectories;
+    const float phi = pgas->model.phi;
+    const float one_minus_phi = 1.0f - phi;
+
+    VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
+
+    /* Prior parameters */
+    float a0 = prior->sigma_h_prior_shape;
+    float b0 = prior->sigma_h_prior_scale;
+
+    /* Compute sum of squared residuals: Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})²
+     * This requires iterating through trajectories since we need regime-specific μ */
+    double ss = 0.0;
+    double n_total = 0.0;
+
+    for (int m = 0; m < M; m++)
+    {
+        const int *traj = &state->traj.trajectories[m * T];
+        const float *h_cache = &state->h_traj_cache[m * T];
+
+        float h_prev = h_cache[0];
+        for (int t = 1; t < T; t++)
+        {
+            int z_t = traj[t];
+            float h_t = h_cache[t];
+            float mu_z = pgas->model.mu_vol[z_t];
+
+            /* True residual accounting for regime-specific μ */
+            float target = mu_z * one_minus_phi + phi * h_prev;
+            float resid = h_t - target;
+            ss += resid * resid;
+            n_total += 1.0;
+
+            h_prev = h_t;
+        }
+    }
+
+    /* Average across M trajectories */
+    ss /= M;
+    n_total /= M;
+
+    if (n_total < 2.0)
+        return; /* Not enough data */
+
+    /* Posterior parameters */
+    double a_post = a0 + n_total / 2.0;
+    double b_post = b0 + ss / 2.0;
+
+    /* Sample from InvGamma(a_post, b_post) = 1/Gamma(a_post, 1/b_post) */
+    double gamma_sample;
+    vdRngGamma(VSL_RNG_METHOD_GAMMA_GNORM, stream, 1,
+               &gamma_sample, a_post, 0.0, 1.0 / b_post);
+
+    double sigma_h_sq = 1.0 / gamma_sample;
+    float sigma_h = sqrtf((float)sigma_h_sq);
+
+    /* Clamp to reasonable range */
+    if (sigma_h < 0.01f)
+        sigma_h = 0.01f;
+    if (sigma_h > 1.0f)
+        sigma_h = 1.0f;
+
+    pgas->model.sigma_h = sigma_h;
+    pgas->model.inv_sigma_h_sq = 1.0f / (sigma_h * sigma_h);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * φ LEARNING VIA METROPOLIS-HASTINGS
+ *
+ * Model: h_t = μ_{z_t}(1-φ) + φ*h_{t-1} + σ_h*ε_t
+ *
+ * φ is not conjugate, so we use random walk MH on logit scale.
+ *
+ * Prior: φ ~ Beta(a, b) on [phi_min, phi_max]
+ * Proposal: logit(φ') = logit(φ) + N(0, σ_prop²)
+ *
+ * Acceptance ratio includes:
+ *   - Likelihood ratio: exp(-0.5/σ_h² * [SS(φ') - SS(φ)])
+ *   - Prior ratio: Beta density ratio
+ *   - Jacobian: from logit transform
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+/* Helper: logit transform */
+static inline float logit(float p, float pmin, float pmax)
+{
+    float p_scaled = (p - pmin) / (pmax - pmin);
+    p_scaled = fmaxf(1e-6f, fminf(1.0f - 1e-6f, p_scaled));
+    return logf(p_scaled / (1.0f - p_scaled));
+}
+
+/* Helper: inverse logit */
+static inline float inv_logit(float x, float pmin, float pmax)
+{
+    float p_scaled = 1.0f / (1.0f + expf(-x));
+    return pmin + p_scaled * (pmax - pmin);
+}
+
+/* Helper: log Beta density (unnormalized) */
+static inline double log_beta_density(float p, float pmin, float pmax, float a, float b)
+{
+    float p_scaled = (p - pmin) / (pmax - pmin);
+    p_scaled = fmaxf(1e-6f, fminf(1.0f - 1e-6f, p_scaled));
+    return (a - 1.0) * log(p_scaled) + (b - 1.0) * log(1.0 - p_scaled);
+}
+
+void pgas_paris_sample_phi(PGASParisState *state,
+                           const PGASParisRegimeStats *stats,
+                           PGASParisRegimePrior *prior)
+{
+    if (!state || !state->pgas || !stats || !prior)
+        return;
+    if (!prior->learn_phi)
+        return;
+
+    PGASMKLState *pgas = state->pgas;
+    const int K = pgas->K;
+    const int T = pgas->T;
+    const int M = state->n_trajectories;
+    const float sigma_h = pgas->model.sigma_h;
+    const float inv_sigma_h_sq = 1.0f / (sigma_h * sigma_h);
+
+    VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
+
+    float phi_curr = pgas->model.phi;
+    float phi_min = prior->phi_min;
+    float phi_max = prior->phi_max;
+
+    /* Propose new φ via random walk on logit scale */
+    float logit_curr = logit(phi_curr, phi_min, phi_max);
+    float noise;
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1,
+                  &noise, 0.0f, prior->phi_proposal_std);
+    float logit_prop = logit_curr + noise;
+    float phi_prop = inv_logit(logit_prop, phi_min, phi_max);
+
+    /* Compute sum of squared residuals for current and proposed φ */
+    double ss_curr = 0.0, ss_prop = 0.0;
+
+    for (int m = 0; m < M; m++)
+    {
+        const int *traj = &state->traj.trajectories[m * T];
+        const float *h_cache = &state->h_traj_cache[m * T];
+
+        float h_prev = h_cache[0];
+        for (int t = 1; t < T; t++)
+        {
+            int z_t = traj[t];
+            float h_t = h_cache[t];
+            float mu_z = pgas->model.mu_vol[z_t];
+
+            /* Current φ residual */
+            float target_curr = mu_z * (1.0f - phi_curr) + phi_curr * h_prev;
+            float resid_curr = h_t - target_curr;
+            ss_curr += resid_curr * resid_curr;
+
+            /* Proposed φ residual */
+            float target_prop = mu_z * (1.0f - phi_prop) + phi_prop * h_prev;
+            float resid_prop = h_t - target_prop;
+            ss_prop += resid_prop * resid_prop;
+
+            h_prev = h_t;
+        }
+    }
+
+    /* Average across M trajectories */
+    ss_curr /= M;
+    ss_prop /= M;
+
+    /* Log acceptance ratio */
+    double log_lik_ratio = -0.5 * inv_sigma_h_sq * (ss_prop - ss_curr);
+
+    double log_prior_curr = log_beta_density(phi_curr, phi_min, phi_max,
+                                             prior->phi_prior_a, prior->phi_prior_b);
+    double log_prior_prop = log_beta_density(phi_prop, phi_min, phi_max,
+                                             prior->phi_prior_a, prior->phi_prior_b);
+    double log_prior_ratio = log_prior_prop - log_prior_curr;
+
+    /* Jacobian for logit transform: |d(inv_logit)/d(logit)| = p*(1-p)*(pmax-pmin)
+     * Log Jacobian ratio = log(J_prop) - log(J_curr) */
+    float p_scaled_curr = (phi_curr - phi_min) / (phi_max - phi_min);
+    float p_scaled_prop = (phi_prop - phi_min) / (phi_max - phi_min);
+    double log_jacobian_ratio = log(p_scaled_prop * (1.0 - p_scaled_prop)) - log(p_scaled_curr * (1.0 - p_scaled_curr));
+
+    double log_alpha = log_lik_ratio + log_prior_ratio + log_jacobian_ratio;
+
+    /* Accept/reject */
+    prior->phi_mh_total++;
+
+    float u;
+    vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, 1, &u, 0.0f, 1.0f);
+
+    if (log(u) < log_alpha)
+    {
+        /* Accept */
+        pgas->model.phi = phi_prop;
+        prior->phi_mh_accepts++;
+
+        /* Update precomputed mu_shift values */
+        float one_minus_phi = 1.0f - phi_prop;
+        for (int k = 0; k < K; k++)
+        {
+            pgas->model.mu_shift[k] = pgas->model.mu_vol[k] * one_minus_phi;
+        }
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * GETTERS FOR SHARED PARAMETERS
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+float pgas_paris_get_sigma_h(const PGASParisState *state)
+{
+    if (!state || !state->pgas)
+        return 0.0f;
+    return state->pgas->model.sigma_h;
+}
+
+float pgas_paris_get_phi(const PGASParisState *state)
+{
+    if (!state || !state->pgas)
+        return 0.0f;
+    return state->pgas->model.phi;
+}
+
 void pgas_paris_enforce_mu_ordering(PGASParisState *state)
 {
     if (!state || !state->pgas)
@@ -1108,7 +1481,7 @@ void pgas_paris_get_sigma_vol(const PGASParisState *state, float *sigma_out, int
 }
 
 float pgas_paris_gibbs_sweep_full(PGASParisState *state,
-                                  const PGASParisRegimePrior *prior)
+                                  PGASParisRegimePrior *prior)
 {
     if (!state || !state->pgas)
         return 0.0f;
@@ -1131,11 +1504,14 @@ float pgas_paris_gibbs_sweep_full(PGASParisState *state,
     /* 6. Sample Π from Dirichlet posterior */
     pgas_paris_sample_trans_matrix(state);
 
-    /* 7. Regime parameter learning (if prior provided and enabled) */
-    if (prior && (prior->learn_mu || prior->learn_sigma))
+    /* 7. Regime parameter learning (if prior provided and any learning enabled) */
+    if (prior && (prior->learn_mu || prior->learn_sigma ||
+                  prior->learn_sigma_h || prior->learn_phi))
     {
         PGASParisRegimeStats stats;
         pgas_paris_collect_regime_stats(state, &stats);
+
+        /* Sample per-regime parameters first (depend on current φ, σ_h) */
 
         /* Sample μ_vol */
         if (prior->learn_mu)
@@ -1143,10 +1519,24 @@ float pgas_paris_gibbs_sweep_full(PGASParisState *state,
             pgas_paris_sample_mu_vol(state, &stats, prior);
         }
 
-        /* Sample σ_vol */
+        /* Sample σ_vol (per-regime emission spread) */
         if (prior->learn_sigma)
         {
             pgas_paris_sample_sigma_vol(state, &stats, prior);
+        }
+
+        /* Sample shared parameters (depend on current μ) */
+
+        /* Sample σ_h (shared AR innovation std) */
+        if (prior->learn_sigma_h)
+        {
+            pgas_paris_sample_sigma_h(state, &stats, prior);
+        }
+
+        /* Sample φ via MH (shared AR persistence) */
+        if (prior->learn_phi)
+        {
+            pgas_paris_sample_phi(state, &stats, prior);
         }
 
         /* Enforce ordering to prevent label switching */

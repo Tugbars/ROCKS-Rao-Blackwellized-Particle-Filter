@@ -231,6 +231,30 @@ add_test(NAME pgas_vs_paris_test COMMAND test_pgas_vs_paris)
 add_test(NAME regime_learning_test COMMAND test_regime_learning)
 
 #───────────────────────────────────────────────────────────────────────────────
+# Test: Full Parameter Learning (μ_vol, σ_h, φ)
+#
+# Tests PGAS-PARIS learning of all model parameters including shared
+# AR dynamics (σ_h via Inv-Gamma, φ via Metropolis-Hastings).
+#───────────────────────────────────────────────────────────────────────────────
+
+add_executable(test_full_learning
+    test_full_learning.c
+)
+
+target_link_libraries(test_full_learning
+    PRIVATE
+        pgas_paris
+        pgas_mkl
+        paris_mkl
+        MKL::MKL
+)
+
+target_compile_options(test_full_learning PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(test_full_learning PRIVATE ${COMMON_DEFS})
+
+add_test(NAME full_learning_test COMMAND test_full_learning)
+
+#───────────────────────────────────────────────────────────────────────────────
 # Benchmark: Transition Matrix Learning (PGAS vs PGAS-PARIS)
 #
 # Compares speed and accuracy of Π estimation for runtime Lifeboat updates.
@@ -295,6 +319,7 @@ message(STATUS "  pgas_validation_a         - Option A: Ground truth recovery")
 message(STATUS "  pgas_validation_adaptive  - Adaptive κ self-tuning")
 message(STATUS "  test_pgas_vs_paris        - PGAS vs PGAS-PARIS comparison")
 message(STATUS "  test_regime_learning      - μ_vol learning: PGAS vs PGAS-PARIS")
+message(STATUS "  test_full_learning        - Full learning: μ_vol + σ_h + φ")
 message(STATUS "  benchmark_trans_learning  - Π learning speed/accuracy benchmark")
 message(STATUS "  benchmark_all             - Full benchmark suite")
 message(STATUS "  pgas_learn_trans          - Learn Π from test_mmpf data")

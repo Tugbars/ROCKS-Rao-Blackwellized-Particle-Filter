@@ -359,12 +359,30 @@ extern "C"
         float sigma_prior_shape; /**< Shape parameter (a) for all regimes */
         float sigma_prior_scale; /**< Scale parameter (b) for all regimes */
 
+        /* σ_h prior (shared AR innovation): InvGamma(sigma_h_shape, sigma_h_scale) */
+        float sigma_h_prior_shape; /**< Shape parameter for σ_h prior */
+        float sigma_h_prior_scale; /**< Scale parameter for σ_h prior */
+
+        /* φ prior (AR persistence): Beta(phi_a, phi_b) mapped to [0, 1)
+         * For highly persistent SV, use phi_a=20, phi_b=1.5 → mode ~0.95 */
+        float phi_prior_a;      /**< Beta shape a (higher → more mass near 1) */
+        float phi_prior_b;      /**< Beta shape b (higher → more mass near 0) */
+        float phi_proposal_std; /**< MH random walk std on logit(φ) scale */
+        float phi_min;          /**< Lower bound for φ (e.g., 0.8) */
+        float phi_max;          /**< Upper bound for φ (e.g., 0.995) */
+
         /* Learning control */
-        int learn_mu;    /**< Enable μ_vol learning */
-        int learn_sigma; /**< Enable σ_vol learning */
+        int learn_mu;      /**< Enable μ_vol learning */
+        int learn_sigma;   /**< Enable σ_vol learning */
+        int learn_sigma_h; /**< Enable σ_h learning (shared) */
+        int learn_phi;     /**< Enable φ learning via MH (shared) */
 
         /* Ordering constraint to prevent label switching */
         int enforce_ordering; /**< If 1, enforce μ_0 < μ_1 < ... < μ_{K-1} */
+
+        /* MH diagnostics */
+        int phi_mh_accepts; /**< Cumulative φ MH accepts */
+        int phi_mh_total;   /**< Cumulative φ MH proposals */
     } PGASParisRegimePrior;
 
     /**
@@ -383,6 +401,15 @@ extern "C"
         /* For AR(1) dynamics: compute residuals h_t - φ*h_{t-1} */
         double sum_resid_k[PGAS_MKL_MAX_REGIMES];    /**< Sum of (h_t - φ*h_{t-1}) in regime k */
         double sum_resid_sq_k[PGAS_MKL_MAX_REGIMES]; /**< Sum of (h_t - φ*h_{t-1})² in regime k */
+
+        /* Global statistics for shared parameter learning (σ_h, φ) */
+        double total_T;           /**< Total timesteps (T-1 for transitions) */
+        double sum_h_all;         /**< Sum of all h values */
+        double sum_h_sq_all;      /**< Sum of all h² values */
+        double sum_h_lag_all;     /**< Sum of h_t * h_{t-1} */
+        double sum_h_prev_sq_all; /**< Sum of h_{t-1}² */
+        double sum_resid_all;     /**< Sum of all residuals (for current φ) */
+        double sum_resid_sq_all;  /**< Sum of all residuals² (for current φ) */
     } PGASParisRegimeStats;
 
     /**
@@ -390,9 +417,12 @@ extern "C"
      *
      * Defaults:
      *   - μ_k prior: N(-3.0, 2.0²) for all k (weak prior centered at typical vol)
-     *   - σ_k prior: InvGamma(3, 0.1) (weak prior on emission spread)
-     *   - Learning disabled by default
-     *   - Ordering enforced by default
+     *   - σ_vol prior: InvGamma(3, 0.1) (weak prior on per-regime spread)
+     *   - σ_h prior: InvGamma(3, 0.03) → σ_h ~ 0.1-0.2
+     *   - φ prior: Beta(20, 1.5) on [0.8, 0.995] → mode ~ 0.97
+     *   - φ MH proposal_std: 0.1 (on logit scale)
+     *   - All learning disabled by default
+     *   - Ordering enforced by default (prevents label switching)
      *
      * @param prior  Prior struct to initialize
      * @param K      Number of regimes
@@ -409,6 +439,74 @@ extern "C"
      */
     void pgas_paris_set_mu_prior(PGASParisRegimePrior *prior, int k,
                                  float mean, float variance);
+
+    /**
+     * Set σ_vol prior (per-regime emission spread)
+     *
+     * Prior: σ²_vol[k] ~ InvGamma(shape, scale)
+     * Mode = scale / (shape + 1)
+     *
+     * Example: shape=3, scale=0.1 → mode ≈ 0.025, giving σ_vol ~ 0.15
+     *
+     * @param prior  Prior struct
+     * @param shape  Inv-Gamma shape parameter (a > 0)
+     * @param scale  Inv-Gamma scale parameter (b > 0)
+     */
+    void pgas_paris_set_sigma_vol_prior(PGASParisRegimePrior *prior,
+                                        float shape, float scale);
+
+    /**
+     * Set σ_h prior (shared AR innovation std)
+     *
+     * Prior: σ²_h ~ InvGamma(shape, scale)
+     * Mode = scale / (shape + 1)
+     *
+     * Example: shape=3, scale=0.03 → mode ≈ 0.0075, giving σ_h ~ 0.1
+     *
+     * @param prior  Prior struct
+     * @param shape  Inv-Gamma shape parameter (a > 0)
+     * @param scale  Inv-Gamma scale parameter (b > 0)
+     */
+    void pgas_paris_set_sigma_h_prior(PGASParisRegimePrior *prior,
+                                      float shape, float scale);
+
+    /**
+     * Set φ prior (AR persistence coefficient)
+     *
+     * Prior: φ ~ Beta(a, b) on [phi_min, phi_max]
+     * Mode = (a - 1) / (a + b - 2) scaled to [phi_min, phi_max]
+     *
+     * For highly persistent SV models:
+     *   - a=20, b=1.5 → mode ≈ 0.974
+     *   - phi_min=0.85, phi_max=0.995 keeps φ in realistic range
+     *
+     * The proposal_std controls MH random walk step size on logit scale:
+     *   - Too small (< 0.05): slow mixing, high autocorrelation
+     *   - Too large (> 0.3): low acceptance rate
+     *   - Target: 20-50% acceptance rate
+     *
+     * @param prior         Prior struct
+     * @param a             Beta shape a (higher → more mass near phi_max)
+     * @param b             Beta shape b (higher → more mass near phi_min)
+     * @param phi_min       Lower bound for φ
+     * @param phi_max       Upper bound for φ
+     * @param proposal_std  MH random walk std on logit(φ) scale
+     */
+    void pgas_paris_set_phi_prior(PGASParisRegimePrior *prior,
+                                  float a, float b,
+                                  float phi_min, float phi_max,
+                                  float proposal_std);
+
+    /**
+     * Get φ MH acceptance rate
+     *
+     * Returns the cumulative acceptance rate for φ proposals.
+     * Target: 20-50% for good mixing. Adjust proposal_std if outside range.
+     *
+     * @param prior  Prior struct (must have been used in sampling)
+     * @return       Acceptance rate in [0, 1], or 0 if no proposals yet
+     */
+    float pgas_paris_get_phi_acceptance_rate(const PGASParisRegimePrior *prior);
 
     /**
      * Collect sufficient statistics from PARIS ensemble
@@ -490,6 +588,57 @@ extern "C"
     void pgas_paris_get_sigma_vol(const PGASParisState *state, float *sigma_out, int K);
 
     /**
+     * Sample σ_h from Inverse-Gamma posterior (shared AR innovation std)
+     *
+     * Model: h_t = μ_{z_t}(1-φ) + φ*h_{t-1} + σ_h*ε_t
+     *
+     * Posterior: σ²_h | data ~ InvGamma(a_post, b_post)
+     * where:
+     *   a_post = a₀ + (T-1)/2
+     *   b_post = b₀ + 0.5 * Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})²
+     *
+     * @param state  PGAS-PARIS state
+     * @param stats  Sufficient statistics
+     * @param prior  Prior configuration
+     */
+    void pgas_paris_sample_sigma_h(PGASParisState *state,
+                                   const PGASParisRegimeStats *stats,
+                                   PGASParisRegimePrior *prior);
+
+    /**
+     * Sample φ via Metropolis-Hastings (AR persistence coefficient)
+     *
+     * Non-conjugate, so we use random walk MH on logit(φ) scale.
+     * Prior: φ ~ Beta(a, b) on [phi_min, phi_max]
+     *
+     * Proposal: logit(φ') = logit(φ) + N(0, proposal_std²)
+     * Accept with Metropolis ratio including Jacobian.
+     *
+     * @param state  PGAS-PARIS state
+     * @param stats  Sufficient statistics
+     * @param prior  Prior configuration (updated with MH diagnostics)
+     */
+    void pgas_paris_sample_phi(PGASParisState *state,
+                               const PGASParisRegimeStats *stats,
+                               PGASParisRegimePrior *prior);
+
+    /**
+     * Get learned σ_h value
+     *
+     * @param state  PGAS-PARIS state
+     * @return       Current σ_h value
+     */
+    float pgas_paris_get_sigma_h(const PGASParisState *state);
+
+    /**
+     * Get learned φ value
+     *
+     * @param state  PGAS-PARIS state
+     * @return       Current φ value
+     */
+    float pgas_paris_get_phi(const PGASParisState *state);
+
+    /**
      * Full Gibbs sweep with regime parameter learning
      *
      * Extended sweep:
@@ -499,14 +648,16 @@ extern "C"
      *   4. Count transitions → Sample Π
      *   5. Collect regime stats → Sample μ_vol (if enabled)
      *   6. Sample σ_vol (if enabled)
-     *   7. Enforce μ-ordering (if enabled)
+     *   7. Sample σ_h (if enabled)
+     *   8. Sample φ via MH (if enabled)
+     *   9. Enforce μ-ordering (if enabled)
      *
      * @param state  PGAS-PARIS state
      * @param prior  Regime learning prior (NULL to skip regime learning)
      * @return       CSMC acceptance rate
      */
     float pgas_paris_gibbs_sweep_full(PGASParisState *state,
-                                      const PGASParisRegimePrior *prior);
+                                      PGASParisRegimePrior *prior);
 
 #ifdef __cplusplus
 }
