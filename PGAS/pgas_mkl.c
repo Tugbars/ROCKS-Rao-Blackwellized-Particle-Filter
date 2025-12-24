@@ -916,7 +916,7 @@ static void csmc_init_mkl(PGASMKLState *state)
     viRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, N, rand_regimes, 0, K);
 
     /* Generate random h values */
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, N,
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, N,
                   state->ws_normal, 0.0f, state->model.sigma_h);
 
     /* Initialize particles at t=0 (stride = Np) */
@@ -1065,7 +1065,7 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
         curr_ancestors[ref_idx] = state->ref_ancestors[t];
 
         /* Generate random numbers for propagation */
-        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, N,
+        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, N,
                       state->ws_normal, 0.0f, m->sigma_h);
 
         /* Propagate particles */
