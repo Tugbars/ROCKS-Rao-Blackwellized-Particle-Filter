@@ -70,6 +70,12 @@ extern "C"
 
     /**
      * Model parameters
+     *
+     * ALIGNED WITH RBPF: Uses per-regime sigma_vol[k] for AR process noise.
+     * This is more expressive than shared sigma_h - crisis regimes have
+     * higher process noise, which is physically correct.
+     *
+     * AR dynamics: h_t = μ_k(1-φ) + φ*h_{t-1} + σ_vol[k]*ε_t
      */
     typedef struct
     {
@@ -78,12 +84,13 @@ extern "C"
         float log_trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
         float log_trans_T[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES]; /**< Transposed for column access */
         float mu_vol[PGAS_MKL_MAX_REGIMES];
-        float sigma_vol[PGAS_MKL_MAX_REGIMES];
-        float mu_shift[PGAS_MKL_MAX_REGIMES]; /**< mu_vol[k] * (1 - phi) for Rank-1 optimization */
+        float sigma_vol[PGAS_MKL_MAX_REGIMES]; /**< Per-regime AR process noise */
+        float mu_shift[PGAS_MKL_MAX_REGIMES];  /**< mu_vol[k] * (1 - phi) for Rank-1 optimization */
         float phi;
-        float sigma_h;
-        float inv_sigma_h_sq;
-        float neg_half_inv_sigma_h_sq; /**< -0.5 / sigma_h² precomputed */
+
+        /* Per-regime precomputed constants for AR likelihood */
+        float inv_sigma_vol_sq[PGAS_MKL_MAX_REGIMES];          /**< 1 / σ_vol[k]² */
+        float neg_half_inv_sigma_vol_sq[PGAS_MKL_MAX_REGIMES]; /**< -0.5 / σ_vol[k]² */
     } PGASMKLModel;
 
     /**
@@ -197,9 +204,8 @@ extern "C"
         int T;
         float trans[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
         float mu_vol[PGAS_MKL_MAX_REGIMES];
-        float sigma_vol[PGAS_MKL_MAX_REGIMES];
+        float sigma_vol[PGAS_MKL_MAX_REGIMES]; /**< Per-regime AR process noise */
         float phi;
-        float sigma_h;
 
         int *final_regimes;   /**< [N] at time T-1 */
         float *final_h;       /**< [N] at time T-1 */
@@ -231,13 +237,18 @@ extern "C"
 
     /**
      * @brief Set model parameters
+     *
+     * @param state      PGAS state
+     * @param trans      Transition matrix [K×K]
+     * @param mu_vol     Per-regime log-vol means [K]
+     * @param sigma_vol  Per-regime AR process noise [K] (aligned with RBPF)
+     * @param phi        AR persistence (shared across regimes)
      */
     void pgas_mkl_set_model(PGASMKLState *state,
                             const double *trans,
                             const double *mu_vol,
                             const double *sigma_vol,
-                            double phi,
-                            double sigma_h);
+                            double phi);
 
     /**
      * @brief Set reference trajectory
@@ -317,33 +328,10 @@ extern "C"
      *
      * Uses CHATTER-CORRECTED MOMENT MATCHING with RLS SMOOTHING.
      * Disabled by default — enable explicitly with pgas_mkl_enable_adaptive_kappa().
-     *
-     * The Problem: "Adaptive MCMC Death Spiral"
-     *   - Naive moment-matching uses obs_diag from PGAS counts
-     *   - But PGAS counts are BIASED by current κ
-     *   - High κ → sticky trajectory → high obs_diag → higher κ (feedback!)
-     *
-     * The Solution: Use CHATTER RATIO as negative feedback
-     *   - chatter = observed_switches / expected_switches
-     *   - If chatter > 1: data fights prior → decrease κ
-     *   - If chatter < 1: data calmer than prior → increase κ
-     *
-     * Smoothing: Recursive Least Squares (RLS) with forgetting factor
-     *   - More principled than EMA
-     *   - Adaptive gain based on estimation uncertainty
-     *   - Tracks non-stationary signals optimally
-     *
-     * Reference: Ljung & Söderström, "Theory and Practice of RLS"
      *═══════════════════════════════════════════════════════════════════════════════*/
 
     /**
      * @brief Enable adaptive kappa adjustment
-     *
-     * When enabled, PGAS will adjust sticky_kappa after each Gibbs sweep
-     * based on the observed chatter ratio.
-     *
-     * @param state   PGAS state
-     * @param enable  1=enabled, 0=disabled
      */
     static inline void pgas_mkl_enable_adaptive_kappa(PGASMKLState *state, int enable)
     {
@@ -355,14 +343,6 @@ extern "C"
 
     /**
      * @brief Configure adaptive kappa bounds
-     *
-     * Uses RLS-smoothed chatter-corrected moment matching.
-     *
-     * @param state         PGAS state
-     * @param kappa_min     Lower bound for κ (default: 20.0)
-     * @param kappa_max     Upper bound for κ (default: 500.0)
-     * @param up_rate       (Legacy) Not used in current implementation
-     * @param down_rate     (Legacy) Not used in current implementation
      */
     static inline void pgas_mkl_configure_adaptive_kappa(PGASMKLState *state,
                                                          float kappa_min,
@@ -381,13 +361,6 @@ extern "C"
 
     /**
      * @brief Set RLS forgetting factor for adaptive kappa
-     *
-     * λ = 0.95 → ~20 sweep effective window (faster adaptation)
-     * λ = 0.97 → ~33 sweep effective window (default)
-     * λ = 0.99 → ~100 sweep effective window (slower, more stable)
-     *
-     * @param state         PGAS state
-     * @param forgetting    Forgetting factor λ ∈ (0.9, 1.0)
      */
     static inline void pgas_mkl_set_rls_forgetting(PGASMKLState *state,
                                                    float forgetting)
@@ -400,9 +373,6 @@ extern "C"
 
     /**
      * @brief Get RLS estimation variance (for diagnostics)
-     *
-     * Low P → confident in chatter estimate
-     * High P → uncertain, adapting faster
      */
     static inline float pgas_mkl_get_rls_variance(const PGASMKLState *state)
     {
@@ -411,9 +381,6 @@ extern "C"
 
     /**
      * @brief Get current chatter ratio
-     *
-     * @param state  PGAS state
-     * @return       Ratio of observed to expected transitions (1.0 = perfect)
      */
     static inline float pgas_mkl_get_chatter_ratio(const PGASMKLState *state)
     {
@@ -422,9 +389,6 @@ extern "C"
 
     /**
      * @brief Get current sticky kappa
-     *
-     * @param state  PGAS state
-     * @return       Current κ value
      */
     static inline float pgas_mkl_get_sticky_kappa(const PGASMKLState *state)
     {
@@ -433,10 +397,6 @@ extern "C"
 
     /**
      * @brief Get learned transition matrix
-     *
-     * @param state      PGAS state
-     * @param trans_out  Output array [K × K]
-     * @param K          Number of regimes
      */
     static inline void pgas_mkl_get_transitions(const PGASMKLState *state,
                                                 float *trans_out, int K)
@@ -455,10 +415,6 @@ extern "C"
 
     /**
      * @brief Get transition counts from last trajectory
-     *
-     * @param state      PGAS state
-     * @param counts_out Output array [K × K]
-     * @param K          Number of regimes
      */
     static inline void pgas_mkl_get_transition_counts(const PGASMKLState *state,
                                                       int *counts_out, int K)
@@ -481,11 +437,6 @@ extern "C"
 
     /**
      * @brief Run MKL-accelerated PARIS backward smoothing on PGAS state
-     *
-     * Uses:
-     *   - vsExp for batch exponential
-     *   - VSL RNG for sampling
-     *   - OpenMP for particle parallelism
      */
     void pgas_paris_backward_smooth(PGASMKLState *state);
 

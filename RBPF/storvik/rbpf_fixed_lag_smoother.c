@@ -185,14 +185,25 @@ void fls_reset(RBPF_FixedLagSmoother *fls)
  * CONFIGURATION
  *═══════════════════════════════════════════════════════════════════════════*/
 
+/**
+ * Set model parameters for PARIS backward smoothing
+ * 
+ * ALIGNED WITH RBPF: Uses per-regime sigma_vol[k] for AR process noise.
+ * 
+ * @param fls        Fixed-lag smoother
+ * @param trans      Transition matrix [K×K] row-major
+ * @param mu_vol     Per-regime log-vol means [K]
+ * @param sigma_vol  Per-regime AR process noise [K]
+ * @param phi        AR(1) persistence
+ */
 void fls_set_model(RBPF_FixedLagSmoother *fls,
                    const double *trans,
                    const double *mu_vol,
-                   double phi,
-                   double sigma_h)
+                   const double *sigma_vol,
+                   double phi)
 {
     if (!fls || !fls->paris) return;
-    paris_mkl_set_model(fls->paris, trans, mu_vol, phi, sigma_h);
+    paris_mkl_set_model(fls->paris, trans, mu_vol, sigma_vol, phi);
 }
 
 void fls_enable(RBPF_FixedLagSmoother *fls, int enable)

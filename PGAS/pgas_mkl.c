@@ -237,12 +237,14 @@ PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed)
             state->model.log_trans_T[j * K + i] = log_unif; /* Transposed */
         }
         state->model.mu_vol[i] = -1.0f + 0.5f * i;
-        state->model.sigma_vol[i] = 0.3f;
+        state->model.sigma_vol[i] = 0.15f; /* Default AR process noise */
+
+        /* Precompute per-regime AR likelihood constants */
+        float sv = state->model.sigma_vol[i];
+        state->model.inv_sigma_vol_sq[i] = 1.0f / (sv * sv);
+        state->model.neg_half_inv_sigma_vol_sq[i] = -0.5f / (sv * sv);
     }
     state->model.phi = 0.97f;
-    state->model.sigma_h = 0.15f;
-    state->model.inv_sigma_h_sq = 1.0f / (0.15f * 0.15f);
-    state->model.neg_half_inv_sigma_h_sq = -0.5f * state->model.inv_sigma_h_sq;
 
     /* Precompute mu_shift = mu_vol[k] * (1 - phi) */
     float one_minus_phi = 1.0f - state->model.phi;
@@ -325,12 +327,27 @@ void pgas_mkl_free(PGASMKLState *state)
  * MODEL SETUP
  *═══════════════════════════════════════════════════════════════════════════════*/
 
+/**
+ * Set model parameters
+ *
+ * ALIGNED WITH RBPF: Uses per-regime sigma_vol[k] for AR process noise.
+ *
+ * AR dynamics: h_t = μ_k × (1-φ) + φ × h_{t-1} + σ_vol[k] × ε_t
+ *
+ * The sigma_vol parameter now means AR process noise (NOT emission spread).
+ * This matches the RBPF model where crisis regimes have higher process noise.
+ *
+ * @param state      PGAS state
+ * @param trans      Transition matrix [K×K] row-major (double for API compat)
+ * @param mu_vol     Regime means [K]
+ * @param sigma_vol  Per-regime AR process noise [K]
+ * @param phi        AR(1) persistence (shared across regimes)
+ */
 void pgas_mkl_set_model(PGASMKLState *state,
                         const double *trans,
                         const double *mu_vol,
                         const double *sigma_vol,
-                        double phi,
-                        double sigma_h)
+                        double phi)
 {
     if (!state)
         return;
@@ -338,7 +355,8 @@ void pgas_mkl_set_model(PGASMKLState *state,
     int K = state->K;
     state->model.K = K;
 
-    /* Convert and compute log-trans + transposed version */
+    /* Convert and compute log-trans + transposed version
+     * Transposed matrix enables contiguous column access in ancestor sampling */
     for (int i = 0; i < K; i++)
     {
         for (int j = 0; j < K; j++)
@@ -346,24 +364,34 @@ void pgas_mkl_set_model(PGASMKLState *state,
             float t = (float)trans[i * K + j];
             state->model.trans[i * K + j] = t;
             state->model.log_trans[i * K + j] = logf(t + EPS);
-            /* Transposed: log_trans_T[j * K + i] = log_trans[i * K + j] */
+            /* Transposed: log_trans_T[j * K + i] = log_trans[i * K + j]
+             * This gives contiguous access when iterating over row i for column j */
             state->model.log_trans_T[j * K + i] = logf(t + EPS);
         }
     }
 
-    /* Store phi and sigma_h first (needed for mu_shift) */
+    /* Store phi (AR persistence - shared across regimes) */
     state->model.phi = (float)phi;
-    state->model.sigma_h = (float)sigma_h;
-    state->model.inv_sigma_h_sq = 1.0f / ((float)sigma_h * (float)sigma_h);
-    state->model.neg_half_inv_sigma_h_sq = -0.5f * state->model.inv_sigma_h_sq;
 
-    /* Compute mu_vol and mu_shift = mu_vol[k] * (1 - phi) */
+    /* Compute mu_vol, sigma_vol, mu_shift, and per-regime AR constants
+     *
+     * Rank-1 optimization: Precompute mu_shift = μ_k × (1-φ)
+     * This allows AR mean computation as: mean = mu_shift + φ × h
+     * instead of: mean = μ_k + φ × (h - μ_k)
+     */
     float one_minus_phi = 1.0f - (float)phi;
     for (int i = 0; i < K; i++)
     {
         state->model.mu_vol[i] = (float)mu_vol[i];
         state->model.sigma_vol[i] = (float)sigma_vol[i];
         state->model.mu_shift[i] = (float)mu_vol[i] * one_minus_phi;
+
+        /* Precompute per-regime AR likelihood constants
+         * These are used in ancestor sampling and PARIS backward smoothing:
+         *   log P(h_next | h, k) = -0.5 × (h_next - mean)² / σ_vol[k]² */
+        float sv = state->model.sigma_vol[i];
+        state->model.inv_sigma_vol_sq[i] = 1.0f / (sv * sv);
+        state->model.neg_half_inv_sigma_vol_sq[i] = -0.5f / (sv * sv);
     }
 }
 
@@ -499,7 +527,7 @@ static void logsumexp_normalize_mkl(const float *log_weights, int N, int N_padde
                                     float *weights, float *workspace)
 {
     /* Find max using CBLAS (only over valid N elements) */
-    int max_idx = cblas_isamax(N, log_weights, 1);
+    MKL_INT max_idx = cblas_isamax(N, log_weights, 1);
     float max_val = log_weights[max_idx];
 
     /* Guard against all -inf (total collapse) */
@@ -557,43 +585,23 @@ static void logsumexp_normalize_mkl(const float *log_weights, int N, int N_padde
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * EMISSION PROBABILITY - OCSN 10-COMPONENT (OPTIMIZED)
- *
- * Two optimization strategies:
- *   1. MKL VML batch: Compute all 10×N log-components, single vsExp call
- *   2. AVX2 SIMD: Process 8 particles simultaneously with intrinsics
- *
- * Strategy selection:
- *   - N >= 64: Use MKL VML batch (better for large N due to vsExp efficiency)
- *   - N < 64:  Use AVX2 SIMD (lower overhead for small N)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-/* Threshold for switching between AVX2 and MKL VML strategies
- * AVX2 is faster for typical particle counts due to better cache locality
- * MKL batch only wins for very large N where vsExp amortization helps
- */
 #define OCSN_MKL_THRESHOLD 256
 
-/* Thread-local workspace for MKL VML batch (avoid allocation in hot path) */
-#define OCSN_MAX_BATCH_SIZE (PGAS_MKL_MAX_PARTICLES * OCSN_N_COMPONENTS)
-
 /**
- * MKL VML batch strategy: Single vsExp call for all 10×N values
- *
- * Layout: log_comps[j * N_padded + i] = log-component j for particle i
- * This gives contiguous memory access for vsExp
+ * MKL VML batch strategy: Single vsExp call for all 10×N_padded values
  */
 static void compute_log_emission_ocsn_mkl(float y, const float *h, int N, int N_padded,
                                           float *log_lik, float *workspace)
 {
-    /* workspace needs 10 * N_padded floats for log_comps + N_padded for exp_comps */
-    float *log_comps = workspace;                 /* [10 × N_padded] */
-    float *exp_comps = workspace + 10 * N_padded; /* [N_padded] temp */
+    float *log_comps = workspace;
+    float *exp_comps = workspace + 10 * N_padded;
 
     /* Phase 1: Compute all log-components and track max per particle */
-    /* Initialize max to -inf */
     for (int i = 0; i < N_padded; i++)
     {
-        log_lik[i] = NEG_INF; /* Reuse log_lik as max tracker temporarily */
+        log_lik[i] = NEG_INF;
     }
 
     for (int j = 0; j < OCSN_N_COMPONENTS; j++)
@@ -614,14 +622,12 @@ static void compute_log_emission_ocsn_mkl(float y, const float *h, int N, int N_
             float log_comp = log_const_j - inv_2v_j * diff * diff;
             comp_j[i] = log_comp;
 
-            /* Track max per particle */
             if (log_comp > log_lik[i])
             {
                 log_lik[i] = log_comp;
             }
         }
 
-        /* Set padding */
         for (i = N; i < N_padded; i++)
         {
             comp_j[i] = NEG_INF;
@@ -646,7 +652,6 @@ static void compute_log_emission_ocsn_mkl(float y, const float *h, int N, int N_
     vsExp(10 * N_padded, log_comps, log_comps);
 
     /* Phase 4: Sum exp values per particle */
-    /* Initialize sums to 0 */
     for (int i = 0; i < N_padded; i++)
     {
         exp_comps[i] = 0.0f;
@@ -675,7 +680,6 @@ static void compute_log_emission_ocsn_mkl(float y, const float *h, int N, int N_
     for (i = 0; i < N; i++)
     {
         float result = log_lik[i] + exp_comps[i];
-        /* Guard against NaN/Inf - clamp to large negative */
         if (!isfinite(result) || result < -1e20f)
         {
             result = -1e20f;
@@ -683,217 +687,20 @@ static void compute_log_emission_ocsn_mkl(float y, const float *h, int N, int N_
         log_lik[i] = result;
     }
 
-    /* Set padding to NEG_INF */
     for (i = N; i < N_padded; i++)
     {
         log_lik[i] = NEG_INF;
     }
 }
-
-/* Enable AVX2 intrinsics if available
- * GCC/Clang: -mavx2 -mfma sets __AVX2__
- * MSVC: /arch:AVX2 - define PGAS_USE_AVX2 manually or check _MSC_VER + __AVX2__
- */
-#if defined(__AVX2__) || defined(PGAS_USE_AVX2)
-#define PGAS_HAS_AVX2 1
-#include <immintrin.h>
-#ifdef _MSC_VER
-#include <intrin.h> /* For _BitScanForward */
-#endif
-
-/**
- * AVX2 SIMD strategy: Process 8 particles at once
- *
- * Uses polynomial approximation for exp() to avoid MKL call overhead
- * Accuracy: ~1e-5 relative error (sufficient for log-likelihood)
- */
-
-/* Fast exp approximation using AVX2 (Schraudolph-style with refinement) */
-static __m256 fast_exp_avx2(__m256 x)
-{
-    /* Clamp to avoid overflow/underflow */
-    const __m256 min_val = _mm256_set1_ps(-87.0f);
-    const __m256 max_val = _mm256_set1_ps(88.0f);
-    x = _mm256_max_ps(x, min_val);
-    x = _mm256_min_ps(x, max_val);
-
-    /* exp(x) = 2^(x * log2(e)) = 2^(n + f) where n=integer, f=fraction */
-    const __m256 log2e = _mm256_set1_ps(1.44269504089f);
-    const __m256 ln2 = _mm256_set1_ps(0.693147180559945f);
-
-    __m256 t = _mm256_mul_ps(x, log2e);
-    __m256 n = _mm256_floor_ps(t);
-    __m256 f = _mm256_sub_ps(t, n);
-
-    /* 2^f using polynomial: 1 + f*ln2 + (f*ln2)^2/2 + (f*ln2)^3/6 + ... */
-    __m256 f_ln2 = _mm256_mul_ps(f, ln2);
-    const __m256 c2 = _mm256_set1_ps(0.5f);
-    const __m256 c3 = _mm256_set1_ps(0.166666667f);
-    const __m256 c4 = _mm256_set1_ps(0.041666667f);
-    const __m256 c5 = _mm256_set1_ps(0.008333333f);
-
-    __m256 f2 = _mm256_mul_ps(f_ln2, f_ln2);
-    __m256 f3 = _mm256_mul_ps(f2, f_ln2);
-    __m256 f4 = _mm256_mul_ps(f3, f_ln2);
-    __m256 f5 = _mm256_mul_ps(f4, f_ln2);
-
-    __m256 exp_f = _mm256_set1_ps(1.0f);
-    exp_f = _mm256_add_ps(exp_f, f_ln2);
-    exp_f = _mm256_fmadd_ps(f2, c2, exp_f);
-    exp_f = _mm256_fmadd_ps(f3, c3, exp_f);
-    exp_f = _mm256_fmadd_ps(f4, c4, exp_f);
-    exp_f = _mm256_fmadd_ps(f5, c5, exp_f);
-
-    /* Scale by 2^n using integer arithmetic */
-    __m256i ni = _mm256_cvtps_epi32(n);
-    ni = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
-    ni = _mm256_slli_epi32(ni, 23);
-    __m256 scale = _mm256_castsi256_ps(ni);
-
-    return _mm256_mul_ps(exp_f, scale);
-}
-
-/* Fast log approximation using AVX2 */
-static __m256 fast_log_avx2(__m256 x)
-{
-    /* Extract exponent and mantissa */
-    const __m256i exp_mask = _mm256_set1_epi32(0x7F800000);
-    const __m256i mant_mask = _mm256_set1_epi32(0x007FFFFF);
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 ln2 = _mm256_set1_ps(0.693147180559945f);
-
-    __m256i xi = _mm256_castps_si256(x);
-    __m256i exp_i = _mm256_srli_epi32(_mm256_and_si256(xi, exp_mask), 23);
-    exp_i = _mm256_sub_epi32(exp_i, _mm256_set1_epi32(127));
-    __m256 exp_f = _mm256_cvtepi32_ps(exp_i);
-
-    /* Normalized mantissa in [1, 2) */
-    __m256i mant_i = _mm256_or_si256(_mm256_and_si256(xi, mant_mask),
-                                     _mm256_set1_epi32(0x3F800000));
-    __m256 mant = _mm256_castsi256_ps(mant_i);
-
-    /* log(1+f) ≈ f - f²/2 + f³/3 for f = mant - 1 */
-    __m256 f = _mm256_sub_ps(mant, one);
-    __m256 f2 = _mm256_mul_ps(f, f);
-    __m256 f3 = _mm256_mul_ps(f2, f);
-
-    const __m256 c2 = _mm256_set1_ps(-0.5f);
-    const __m256 c3 = _mm256_set1_ps(0.333333333f);
-    const __m256 c4 = _mm256_set1_ps(-0.25f);
-
-    __m256 log_mant = f;
-    log_mant = _mm256_fmadd_ps(f2, c2, log_mant);
-    log_mant = _mm256_fmadd_ps(f3, c3, log_mant);
-    log_mant = _mm256_fmadd_ps(_mm256_mul_ps(f3, f), c4, log_mant);
-
-    /* log(x) = log(2^exp * mant) = exp*ln2 + log(mant) */
-    return _mm256_fmadd_ps(exp_f, ln2, log_mant);
-}
-
-static void compute_log_emission_ocsn_avx2(float y, const float *h, int N, int N_padded,
-                                           float *log_lik)
-{
-    const __m256 y_vec = _mm256_set1_ps(y);
-    const __m256 neg_inf = _mm256_set1_ps(NEG_INF);
-
-    /* Load OCSN constants into registers */
-    __m256 log_const[OCSN_N_COMPONENTS];
-    __m256 inv_2v[OCSN_N_COMPONENTS];
-    __m256 mean[OCSN_N_COMPONENTS];
-
-    for (int j = 0; j < OCSN_N_COMPONENTS; j++)
-    {
-        log_const[j] = _mm256_set1_ps(OCSN_LOG_CONST[j]);
-        inv_2v[j] = _mm256_set1_ps(OCSN_INV_2V[j]);
-        mean[j] = _mm256_set1_ps(OCSN_MEAN[j]);
-    }
-
-    /* Process 8 particles at a time */
-    int i;
-    for (i = 0; i + 8 <= N; i += 8)
-    {
-        __m256 h_vec = _mm256_loadu_ps(&h[i]);
-        __m256 y_base = _mm256_sub_ps(y_vec, h_vec);
-
-        /* Compute all 10 log-components and track max */
-        __m256 max_log = neg_inf;
-        __m256 log_comps[OCSN_N_COMPONENTS];
-
-        for (int j = 0; j < OCSN_N_COMPONENTS; j++)
-        {
-            __m256 diff = _mm256_sub_ps(y_base, mean[j]);
-            __m256 diff_sq = _mm256_mul_ps(diff, diff);
-            log_comps[j] = _mm256_fnmadd_ps(inv_2v[j], diff_sq, log_const[j]);
-            max_log = _mm256_max_ps(max_log, log_comps[j]);
-        }
-
-        /* Subtract max and compute exp */
-        __m256 sum = _mm256_setzero_ps();
-        for (int j = 0; j < OCSN_N_COMPONENTS; j++)
-        {
-            __m256 shifted = _mm256_sub_ps(log_comps[j], max_log);
-            __m256 exp_val = fast_exp_avx2(shifted);
-            sum = _mm256_add_ps(sum, exp_val);
-        }
-
-        /* log(sum) + max = final log-likelihood */
-        __m256 log_sum = fast_log_avx2(sum);
-        __m256 result = _mm256_add_ps(max_log, log_sum);
-
-        _mm256_storeu_ps(&log_lik[i], result);
-    }
-
-    /* Handle remainder with scalar (already has guard) */
-    for (; i < N; i++)
-    {
-        log_lik[i] = ocsn_log_likelihood_single(y, h[i]);
-    }
-
-    /* Clamp extreme values to prevent weight collapse */
-    const float MIN_LOG_LIK = -1e20f;
-    for (i = 0; i < N; i++)
-    {
-        if (!isfinite(log_lik[i]) || log_lik[i] < MIN_LOG_LIK)
-        {
-            log_lik[i] = MIN_LOG_LIK;
-        }
-    }
-
-    /* Set padding to NEG_INF */
-    for (i = N; i < N_padded; i++)
-    {
-        log_lik[i] = NEG_INF;
-    }
-}
-
-#endif /* PGAS_HAS_AVX2 */
 
 /**
  * Compute log emission using OCSN 10-component mixture (dispatcher)
- *
- * Automatically selects best strategy based on N and available SIMD
  */
 static void compute_log_emission_ocsn(float y, const float *h, int N, int N_padded,
                                       float *log_lik, float *workspace)
 {
-    /* Ensure OCSN constants are initialized */
     init_ocsn_constants();
-
-#ifdef PGAS_HAS_AVX2
-    if (N < OCSN_MKL_THRESHOLD)
-    {
-        /* Small N: AVX2 has lower overhead */
-        compute_log_emission_ocsn_avx2(y, h, N, N_padded, log_lik);
-    }
-    else
-    {
-        /* Large N: MKL VML batch is more efficient */
-        compute_log_emission_ocsn_mkl(y, h, N, N_padded, log_lik, workspace);
-    }
-#else
-    /* No AVX2: Always use MKL */
     compute_log_emission_ocsn_mkl(y, h, N, N_padded, log_lik, workspace);
-#endif
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -902,11 +709,17 @@ static void compute_log_emission_ocsn(float y, const float *h, int N, int N_padd
 
 /**
  * Initialize particles at t=0
+ *
+ * ALIGNED WITH RBPF: Uses per-regime sigma_vol[k] for AR process noise.
+ * Each regime has its own volatility-of-volatility, which is physically
+ * correct (crisis regimes have higher process noise).
+ *
+ * Initial distribution: h_0^n ~ N(μ_k, σ_vol[k]²) where k = regime^n
  */
 static void csmc_init_mkl(PGASMKLState *state)
 {
     const int N = state->N;
-    const int Np = state->N_padded; /* Use padded stride! */
+    const int Np = state->N_padded; /* Use padded stride for SIMD alignment */
     const int K = state->K;
     const int ref_idx = state->ref_idx;
     VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
@@ -915,15 +728,17 @@ static void csmc_init_mkl(PGASMKLState *state)
     int *rand_regimes = state->ws_indices;
     viRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, N, rand_regimes, 0, K);
 
-    /* Generate random h values */
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, N,
-                  state->ws_normal, 0.0f, state->model.sigma_h);
+    /* Generate standard normal N(0,1) - will scale by per-regime sigma_vol below
+     * This is more efficient than generating K different distributions */
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, N,
+                  state->ws_normal, 0.0f, 1.0f);
 
-    /* Initialize particles at t=0 (stride = Np) */
+    /* Initialize particles at t=0 (stride = Np for SIMD alignment) */
     for (int n = 0; n < N; n++)
     {
         if (n == ref_idx)
         {
+            /* Reference particle: use conditioned trajectory */
             state->regimes[n] = state->ref_regimes[0];
             state->h[n] = state->ref_h[0];
         }
@@ -931,12 +746,16 @@ static void csmc_init_mkl(PGASMKLState *state)
         {
             int regime = rand_regimes[n];
             state->regimes[n] = regime;
-            state->h[n] = state->model.mu_vol[regime] + state->ws_normal[n];
+
+            /* Per-regime AR process noise (ALIGNED WITH RBPF)
+             * h_0 ~ N(μ_k, σ_vol[k]²) - crisis regimes have higher variance */
+            float sigma_vol_k = state->model.sigma_vol[regime];
+            state->h[n] = state->model.mu_vol[regime] + sigma_vol_k * state->ws_normal[n];
         }
-        state->ancestors[n] = n;
+        state->ancestors[n] = n; /* Self-ancestor at t=0 */
     }
 
-    /* Zero padding */
+    /* Zero padding for SIMD (prevents garbage in vectorized ops) */
     for (int n = N; n < Np; n++)
     {
         state->regimes[n] = 0;
@@ -944,15 +763,30 @@ static void csmc_init_mkl(PGASMKLState *state)
         state->ancestors[n] = 0;
     }
 
-    /* Compute initial weights using OCSN emission */
+    /* Compute initial weights using OCSN emission likelihood */
     compute_log_emission_ocsn(state->observations[0], state->h, N, Np,
                               state->log_weights, state->ws_ocsn);
 
+    /* Normalize weights (log-sum-exp for numerical stability) */
     logsumexp_normalize_mkl(state->log_weights, N, Np, state->weights, state->ws_bw);
 }
 
 /**
- * Ancestor sampling for reference trajectory
+ * Ancestor sampling for reference trajectory (PGAS key innovation)
+ *
+ * ALIGNED WITH RBPF: Uses sigma_vol[ref_regime] for AR likelihood.
+ * This is the process noise of the regime we're transitioning INTO.
+ *
+ * Computes: w̃_n ∝ w_{t-1}^n × P(z_t=k|z_{t-1}=j) × P(h_t|h_{t-1}^n, z_t=k)
+ *
+ * Optimizations:
+ *   - Rank-1 AR(1): Uses precomputed mu_shift = μ_k × (1-φ)
+ *   - Contiguous column access via transposed log_trans_T
+ *   - SIMD-friendly loop structure
+ *
+ * @param state  PGAS state
+ * @param t      Current time step
+ * @return       Sampled ancestor index
  */
 static int ancestor_sample_mkl(PGASMKLState *state, int t)
 {
@@ -965,22 +799,26 @@ static int ancestor_sample_mkl(PGASMKLState *state, int t)
     int ref_regime = state->ref_regimes[t];
     float ref_h = state->ref_h[t];
 
-    /* Use precomputed mu_shift instead of mu_k + phi * (h - mu_k) */
+    /* Use precomputed mu_shift = μ_k × (1-φ) for Rank-1 optimization */
     float mu_shift_k = m->mu_shift[ref_regime];
     float phi = m->phi;
-    float neg_half_inv_var = m->neg_half_inv_sigma_h_sq;
+
+    /* Per-regime AR likelihood (ALIGNED WITH RBPF)
+     * Use sigma_vol of the NEXT regime (ref_regime) - the regime we're transitioning INTO
+     * This is critical: the process noise depends on the destination regime */
+    float neg_half_inv_var = m->neg_half_inv_sigma_vol_sq[ref_regime];
 
     float *log_as = state->ws_log_bw;
 
-    /* Previous time data (stride = Np) */
+    /* Previous time data (stride = Np for SIMD alignment) */
     float *prev_log_w = &state->log_weights[(t - 1) * Np];
     float *prev_h = &state->h[(t - 1) * Np];
     int *prev_regimes = &state->regimes[(t - 1) * Np];
 
-    /* Use transposed log_trans for contiguous column access */
+    /* Use transposed log_trans for contiguous column access (cache-friendly) */
     const float *log_trans_col = &m->log_trans_T[ref_regime * K];
 
-    /* Compute AS log-weights */
+    /* Compute ancestor sampling log-weights */
     int n;
 #ifndef _MSC_VER
 #pragma omp simd
@@ -990,31 +828,42 @@ static int ancestor_sample_mkl(PGASMKLState *state, int t)
         int regime_n = prev_regimes[n];
         float h_n = prev_h[n];
 
-        /* Contiguous access */
+        /* Contiguous access via transposed matrix */
         float log_trans = log_trans_col[regime_n];
 
-        /* Rank-1 arithmetic: mean = mu_shift + phi * h_n */
+        /* Rank-1 AR(1) arithmetic: mean = mu_shift + φ × h_n
+         * Equivalent to: μ_k + φ × (h_n - μ_k) = μ_k × (1-φ) + φ × h_n */
         float mean = mu_shift_k + phi * h_n;
         float diff = ref_h - mean;
+
+        /* log P(h_next | h_n, regime_next) = -0.5 × (h_next - mean)² / σ²
+         * Uses precomputed neg_half_inv_var = -0.5 / σ_vol[k]² */
         float log_h_trans = neg_half_inv_var * diff * diff;
 
         log_as[n] = prev_log_w[n] + log_trans + log_h_trans;
     }
 
-    /* Set padding to NEG_INF */
+    /* Set padding to NEG_INF (ensures zero weight after exp) */
     for (n = N; n < Np; n++)
     {
         log_as[n] = NEG_INF;
     }
 
-    /* Normalize and sample */
+    /* Normalize and sample ancestor */
     logsumexp_normalize_mkl(log_as, N, Np, state->ws_bw, state->ws_uniform);
 
     return sample_categorical_single(state->ws_bw, N, state->ws_cumsum, stream);
 }
 
 /**
- * One CSMC sweep
+ * One CSMC sweep (Conditional Sequential Monte Carlo)
+ *
+ * PGAS algorithm: Samples a new trajectory conditioned on the reference.
+ *
+ * ALIGNED WITH RBPF: AR dynamics use per-regime sigma_vol[k]:
+ *   h_t = μ_k × (1-φ) + φ × h_{t-1} + σ_vol[k] × ε_t
+ *
+ * @return Ancestor acceptance rate (mixing diagnostic)
  */
 float pgas_mkl_csmc_sweep(PGASMKLState *state)
 {
@@ -1024,7 +873,6 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
     const int N = state->N;
     const int Np = state->N_padded;
     const int T = state->T;
-    const int K = state->model.K;
     const int ref_idx = state->ref_idx;
     const PGASMKLModel *m = &state->model;
     VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
@@ -1032,13 +880,15 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
     state->ancestor_proposals = 0;
     state->ancestor_accepts = 0;
 
-    /* Initialize at t=0 */
+    /* Initialize particles at t=0 */
     csmc_init_mkl(state);
 
-    /* Forward pass */
+    /* ═══════════════════════════════════════════════════════════════════
+     * FORWARD PASS: Propagate particles with PGAS ancestor sampling
+     * ═══════════════════════════════════════════════════════════════════*/
     for (int t = 1; t < T; t++)
     {
-        /* Previous time data (stride = Np!) */
+        /* Previous time data (stride = Np for SIMD alignment!) */
         float *prev_weights = &state->weights[(t - 1) * Np];
         float *prev_h = &state->h[(t - 1) * Np];
         int *prev_regimes = &state->regimes[(t - 1) * Np];
@@ -1048,11 +898,11 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
         int *curr_regimes = &state->regimes[t * Np];
         int *curr_ancestors = &state->ancestors[t * Np];
 
-        /* Resample ancestors for non-reference particles */
+        /* Resample ancestors for non-reference particles (multinomial) */
         sample_categorical_mkl(prev_weights, N, curr_ancestors, N,
                                state->ws_uniform, state->ws_cumsum, stream);
 
-        /* Ancestor sampling for reference */
+        /* PGAS ancestor sampling for reference particle */
         int old_ref_anc = state->ref_ancestors[t];
         int new_ref_anc = ancestor_sample_mkl(state, t);
 
@@ -1064,15 +914,17 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
         }
         curr_ancestors[ref_idx] = state->ref_ancestors[t];
 
-        /* Generate random numbers for propagation */
-        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, N,
-                      state->ws_normal, 0.0f, m->sigma_h);
+        /* Generate standard normal N(0,1) - scale by per-regime sigma_vol below
+         * More efficient than K separate vsRngGaussian calls */
+        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, N,
+                      state->ws_normal, 0.0f, 1.0f);
 
         /* Propagate particles */
         for (int n = 0; n < N; n++)
         {
             if (n == ref_idx)
             {
+                /* Reference particle: use conditioned trajectory */
                 curr_regimes[n] = state->ref_regimes[t];
                 curr_h[n] = state->ref_h[t];
             }
@@ -1082,18 +934,22 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
                 int prev_regime = prev_regimes[anc];
                 float prev_h_anc = prev_h[anc];
 
-                /* Sample regime */
+                /* Sample regime transition */
                 curr_regimes[n] = sample_regime_mkl(m, prev_regime,
                                                     state->ws_cumsum, stream);
 
-                /* Sample h */
-                float mu_k = m->mu_vol[curr_regimes[n]];
+                /* Sample h from AR(1) with per-regime process noise
+                 * ALIGNED WITH RBPF: h_t = μ_k + φ × (h_{t-1} - μ_k) + σ_vol[k] × ε_t
+                 * Crisis regimes (higher k) have larger σ_vol for faster adaptation */
+                int curr_regime = curr_regimes[n];
+                float mu_k = m->mu_vol[curr_regime];
+                float sigma_vol_k = m->sigma_vol[curr_regime];
                 float mean = mu_k + m->phi * (prev_h_anc - mu_k);
-                curr_h[n] = mean + state->ws_normal[n];
+                curr_h[n] = mean + sigma_vol_k * state->ws_normal[n];
             }
         }
 
-        /* Zero padding */
+        /* Zero padding for SIMD alignment */
         for (int n = N; n < Np; n++)
         {
             curr_regimes[n] = 0;
@@ -1101,19 +957,22 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
             curr_ancestors[n] = 0;
         }
 
-        /* Compute weights using OCSN emission (stride = Np!) */
+        /* Compute weights using OCSN 10-component emission (stride = Np!) */
         compute_log_emission_ocsn(state->observations[t], curr_h, N, Np,
                                   &state->log_weights[t * Np], state->ws_ocsn);
 
+        /* Normalize weights */
         logsumexp_normalize_mkl(&state->log_weights[t * Np], N, Np,
                                 &state->weights[t * Np], state->ws_bw);
     }
 
-    /* Sample final trajectory and update reference */
+    /* ═══════════════════════════════════════════════════════════════════
+     * TRAJECTORY SAMPLING: Sample final particle and trace back
+     * ═══════════════════════════════════════════════════════════════════*/
     int final_idx = sample_categorical_single(&state->weights[(T - 1) * Np], N,
                                               state->ws_cumsum, stream);
 
-    /* Trace back (stride = Np!) */
+    /* Trace back through ancestors to get full trajectory (stride = Np!) */
     int idx = final_idx;
     for (int t = T - 1; t >= 0; t--)
     {
@@ -1125,6 +984,7 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
         }
     }
 
+    /* Compute acceptance rate (mixing diagnostic) */
     state->acceptance_rate = (state->ancestor_proposals > 0) ? (float)state->ancestor_accepts / state->ancestor_proposals : 0.0f;
 
     state->current_sweep++;
@@ -1143,7 +1003,6 @@ int pgas_mkl_run_adaptive(PGASMKLState *state)
 
     state->current_sweep = 0;
 
-    /* Minimum sweeps */
     for (int s = 0; s < MIN_SWEEPS; s++)
     {
         pgas_mkl_csmc_sweep(state);
@@ -1154,7 +1013,6 @@ int pgas_mkl_run_adaptive(PGASMKLState *state)
         return 0;
     }
 
-    /* Continue until target or max */
     while (state->current_sweep < MAX_SWEEPS)
     {
         pgas_mkl_csmc_sweep(state);
@@ -1174,14 +1032,9 @@ int pgas_mkl_run_adaptive(PGASMKLState *state)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * TRANSITION MATRIX LEARNING (NEW)
+ * TRANSITION MATRIX LEARNING
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-/**
- * Sample transition matrix from Dirichlet posterior
- *
- * π_i ~ Dirichlet(α + n_{i1}, ..., α + n_{iK} + κ·I(j=i))
- */
 void pgas_mkl_sample_transitions(PGASMKLState *state)
 {
     if (!state || state->T < 2)
@@ -1191,7 +1044,6 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
     const int T = state->T;
     VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
 
-    /* Count transitions from reference trajectory */
     memset(state->n_trans, 0, K * K * sizeof(int));
     for (int t = 1; t < T; t++)
     {
@@ -1202,17 +1054,6 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
             state->n_trans[s_prev * K + s_curr]++;
         }
     }
-
-    /* ═══════════════════════════════════════════════════════════════════
-     * CHATTER RATIO COMPUTATION
-     *
-     * Chatter ratio = observed_off_diagonal / expected_off_diagonal
-     *
-     * Expected off-diagonal based on current kappa:
-     *   expected_diag ≈ (kappa + alpha) / (kappa + K*alpha)
-     *   expected_off_diag_rate = 1 - expected_diag
-     *   expected_off_diag_count = (T-1) * expected_off_diag_rate
-     * ═══════════════════════════════════════════════════════════════════*/
 
     int off_diag_count = 0;
     int total_count = 0;
@@ -1228,16 +1069,13 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         }
     }
 
-    /* Store for diagnostics */
     state->last_off_diag_count = off_diag_count;
     state->last_total_count = total_count;
 
-    /* Compute expected off-diagonal rate from prior */
     float expected_diag = (state->sticky_kappa + state->prior_alpha) /
                           (state->sticky_kappa + K * state->prior_alpha);
     float expected_off_diag_count = (float)(T - 1) * (1.0f - expected_diag);
 
-    /* Chatter ratio: >1 means more switching than prior expects */
     if (expected_off_diag_count > 0.1f)
     {
         state->last_chatter_ratio = (float)off_diag_count / expected_off_diag_count;
@@ -1247,114 +1085,70 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         state->last_chatter_ratio = 1.0f;
     }
 
-    /* ═══════════════════════════════════════════════════════════════════
-     * ADAPTIVE KAPPA UPDATE (if enabled)
-     *
-     * Method: CHATTER-CORRECTED MOMENT MATCHING with RLS SMOOTHING
-     *
-     * Key insight: Single-sweep chatter is NOISY (OCSN σ≈2.2).
-     * Solution: Use Recursive Least Squares (RLS) with forgetting factor
-     *           to estimate the "true" underlying chatter ratio.
-     *
-     * RLS is a Kalman filter for tracking a slowly-varying parameter:
-     *   K = P / (λ + P)                    // Adaptive gain
-     *   θ̂ = θ̂ + K * (y - θ̂)              // Update estimate
-     *   P = (1/λ) * (P - K*P)              // Update variance
-     *
-     * λ = forgetting factor (0.97 → ~33 sweep effective window)
-     *
-     * Benefits over EMA:
-     *   - Adaptive gain (trusts estimate more when confident)
-     *   - Principled (optimal for tracking non-stationary signals)
-     *   - Tracks estimation uncertainty
-     *
-     * Reference: Ljung & Söderström, "Theory and Practice of RLS"
-     * ═══════════════════════════════════════════════════════════════════*/
-
     if (state->adaptive_kappa_enabled && state->last_total_count >= 10)
     {
-        const int K = state->K;
         const float alpha = state->prior_alpha;
 
-        /* 1. Get current diagnostics */
         int total_switches = state->last_off_diag_count;
         int total_obs = state->last_total_count;
 
-        /* 2. Expected switch rate from current prior */
-        float expected_diag = (state->sticky_kappa + alpha) /
-                              (state->sticky_kappa + K * alpha);
-        float expected_switch_rate = 1.0f - expected_diag;
+        float expected_diag_local = (state->sticky_kappa + alpha) /
+                                    (state->sticky_kappa + K * alpha);
+        float expected_switch_rate = 1.0f - expected_diag_local;
 
-        /* 3. Observed switch rate */
         float observed_switch_rate = (float)total_switches / (float)total_obs;
 
-        /* 4. Raw Chatter Ratio (with Laplace smoothing) */
         float laplace = 0.5f / (float)total_obs;
         float raw_chatter = (observed_switch_rate + laplace) /
                             (expected_switch_rate + laplace);
 
-        /* 5. RLS Update for chatter estimate
-         * This is optimal for tracking a slowly-varying signal */
-        float lambda = state->rls_forgetting; /* 0.97 default */
+        float lambda = state->rls_forgetting;
         float P = state->rls_variance;
         float theta = state->rls_chatter_estimate;
 
-        /* Kalman gain */
         float rls_gain = P / (lambda + P);
 
-        /* Update estimate */
         float innovation = raw_chatter - theta;
         theta = theta + rls_gain * innovation;
 
-        /* Update variance (with forgetting) */
         P = (1.0f / lambda) * (P - rls_gain * P);
 
-        /* Prevent variance collapse (maintain adaptivity) */
         if (P < 0.01f)
             P = 0.01f;
         if (P > 10.0f)
             P = 10.0f;
 
-        /* Store RLS state */
         state->rls_chatter_estimate = theta;
         state->rls_variance = P;
-        state->last_chatter_ratio = theta; /* For diagnostics */
+        state->last_chatter_ratio = theta;
 
-        /* 6. Clamp smoothed chatter to prevent extreme swings */
         float chatter = theta;
         if (chatter < 0.3f)
             chatter = 0.3f;
         if (chatter > 3.0f)
             chatter = 3.0f;
 
-        /* 7. Calculate Corrected Target Diagonal */
         float target_switch_rate = expected_switch_rate * chatter;
         float target_diag = 1.0f - target_switch_rate;
 
-        /* Clamp to valid range [1/K + ε, 0.999] */
         float min_diag = 1.0f / K + 0.01f;
         if (target_diag < min_diag)
             target_diag = min_diag;
         if (target_diag > 0.999f)
             target_diag = 0.999f;
 
-        /* 8. Map target_diag back to Kappa (The Oracle) */
         float kappa_oracle = alpha * (target_diag * K - 1.0f) / (1.0f - target_diag);
 
-        /* Clamp oracle to bounds before log */
         if (kappa_oracle < state->kappa_min)
             kappa_oracle = state->kappa_min;
         if (kappa_oracle > state->kappa_max)
             kappa_oracle = state->kappa_max;
 
-        /* 9. Log-Space Momentum Update
-         * Moderate momentum (0.8) since RLS already smooths */
         float momentum = 0.8f;
         float log_kappa_new = momentum * logf(state->sticky_kappa) +
                               (1.0f - momentum) * logf(kappa_oracle);
         float kappa_new = expf(log_kappa_new);
 
-        /* 10. Clamp to user bounds */
         if (kappa_new < state->kappa_min)
             kappa_new = state->kappa_min;
         if (kappa_new > state->kappa_max)
@@ -1363,7 +1157,6 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         state->sticky_kappa = kappa_new;
     }
 
-    /* Sample each row from Dirichlet (via Gamma samples) */
     float gamma_samples[PGAS_MKL_MAX_K];
 
     for (int i = 0; i < K; i++)
@@ -1372,24 +1165,20 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
 
         for (int j = 0; j < K; j++)
         {
-            /* Dirichlet parameter = prior + counts + sticky bonus */
             float alpha_j = state->prior_alpha + (float)state->n_trans[i * K + j];
             if (i == j)
             {
-                alpha_j += state->sticky_kappa; /* Sticky prior */
+                alpha_j += state->sticky_kappa;
             }
 
-            /* Ensure alpha > 0 */
             if (alpha_j < 0.01f)
                 alpha_j = 0.01f;
 
-            /* Sample Gamma(alpha, 1) */
             vsRngGamma(VSL_RNG_METHOD_GAMMA_GNORM, stream, 1,
                        &gamma_samples[j], alpha_j, 0.0f, 1.0f);
             row_sum += gamma_samples[j];
         }
 
-        /* Normalize to get Dirichlet sample */
         float inv_sum = 1.0f / (row_sum + EPS);
         for (int j = 0; j < K; j++)
         {
@@ -1401,233 +1190,44 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
     }
 }
 
-/**
- * Full Gibbs sweep: CSMC for states + Dirichlet for transitions
- */
 float pgas_mkl_gibbs_sweep(PGASMKLState *state)
 {
     if (!state || state->T < 2)
         return 0.0f;
 
-    /* 1. Sample states given transitions (CSMC) */
     float accept = pgas_mkl_csmc_sweep(state);
 
-    /* 2. Sample transitions given states (Dirichlet) */
     pgas_mkl_sample_transitions(state);
 
     return accept;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * PARIS BACKWARD SMOOTHING (PHASE 2 OPTIMIZATIONS)
+ * PARIS BACKWARD SMOOTHING
  *
- * Fixes applied:
- *   1. Inlined AVX2 logsumexp - eliminates 4 MKL calls per particle
- *   2. Walker's Alias Sampling - O(1) branchless sampling
- *   3. Batch RNG per timestep - reduces dispatcher calls
- *   4. schedule(static) - eliminates dynamic work-stealing overhead
+ * ALIGNED WITH RBPF: Uses per-regime sigma_vol[k] for backward kernel.
+ *
+ * Algorithm: For t = T-2 down to 0, for each particle n:
+ *   1. Get smoothed state (regime_next, h_next) at t+1
+ *   2. Compute backward weights:
+ *      w̃_i ∝ w_t^i × P(z_{t+1}|z_t^i) × P(h_{t+1}|h_t^i, z_{t+1})
+ *   3. Sample ancestor proportional to w̃
+ *
+ * Critical: The AR likelihood uses sigma_vol[regime_next] - the process noise
+ * of the regime we're transitioning INTO, not the regime at time t.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 /* Workload threshold: below this, sequential is faster than parallel overhead */
 #define PARIS_PARALLEL_THRESHOLD 4096 /* N * T */
 
-#ifdef PGAS_HAS_AVX2
-
 /**
- * Inlined AVX2 logsumexp + normalize
+ * PARIS backward smoothing pass
  *
- * Replaces logsumexp_normalize_mkl to avoid 4 MKL function calls
- * All computation stays in AVX2 registers
- */
-static inline void logsumexp_normalize_avx2(const float *log_weights, int N, int N_padded,
-                                            float *weights)
-{
-    /* Phase 1: Find max using AVX2 */
-    __m256 max_vec = _mm256_set1_ps(NEG_INF);
-    int i;
-    for (i = 0; i + 8 <= N; i += 8)
-    {
-        __m256 v = _mm256_loadu_ps(&log_weights[i]);
-        max_vec = _mm256_max_ps(max_vec, v);
-    }
-
-    /* Horizontal max reduction */
-    __m128 hi = _mm256_extractf128_ps(max_vec, 1);
-    __m128 lo = _mm256_castps256_ps128(max_vec);
-    __m128 max128 = _mm_max_ps(hi, lo);
-    max128 = _mm_max_ps(max128, _mm_shuffle_ps(max128, max128, _MM_SHUFFLE(1, 0, 3, 2)));
-    max128 = _mm_max_ps(max128, _mm_shuffle_ps(max128, max128, _MM_SHUFFLE(2, 3, 0, 1)));
-    float max_val = _mm_cvtss_f32(max128);
-
-    /* Handle remainder */
-    for (; i < N; i++)
-    {
-        if (log_weights[i] > max_val)
-            max_val = log_weights[i];
-    }
-
-    /* SAFETY: Check for total collapse */
-    if (max_val < -1e30f || !isfinite(max_val))
-    {
-        float unif = 1.0f / N;
-        for (i = 0; i < N; i++)
-            weights[i] = unif;
-        for (i = N; i < N_padded; i++)
-            weights[i] = 0.0f;
-        return;
-    }
-
-    /* Phase 2: Subtract max, exp, and accumulate sum */
-    __m256 neg_max = _mm256_set1_ps(-max_val);
-    __m256 sum_vec = _mm256_setzero_ps();
-
-    for (i = 0; i + 8 <= N; i += 8)
-    {
-        __m256 v = _mm256_loadu_ps(&log_weights[i]);
-        __m256 shifted = _mm256_add_ps(v, neg_max);
-        __m256 exp_v = fast_exp_avx2(shifted);
-        _mm256_storeu_ps(&weights[i], exp_v);
-        sum_vec = _mm256_add_ps(sum_vec, exp_v);
-    }
-
-    /* Horizontal sum reduction */
-    hi = _mm256_extractf128_ps(sum_vec, 1);
-    lo = _mm256_castps256_ps128(sum_vec);
-    __m128 sum128 = _mm_add_ps(hi, lo);
-    sum128 = _mm_add_ps(sum128, _mm_shuffle_ps(sum128, sum128, _MM_SHUFFLE(1, 0, 3, 2)));
-    sum128 = _mm_add_ps(sum128, _mm_shuffle_ps(sum128, sum128, _MM_SHUFFLE(2, 3, 0, 1)));
-    float sum = _mm_cvtss_f32(sum128);
-
-    /* Handle remainder */
-    for (; i < N; i++)
-    {
-        float exp_v = expf(log_weights[i] - max_val);
-        weights[i] = exp_v;
-        sum += exp_v;
-    }
-
-    /* SAFETY: Check for zero sum */
-    if (sum < 1e-30f || !isfinite(sum))
-    {
-        float unif = 1.0f / N;
-        for (i = 0; i < N; i++)
-            weights[i] = unif;
-        for (i = N; i < N_padded; i++)
-            weights[i] = 0.0f;
-        return;
-    }
-
-    /* Phase 3: Normalize */
-    float inv_sum = 1.0f / sum;
-    __m256 inv_sum_vec = _mm256_set1_ps(inv_sum);
-
-    for (i = 0; i + 8 <= N; i += 8)
-    {
-        __m256 v = _mm256_loadu_ps(&weights[i]);
-        v = _mm256_mul_ps(v, inv_sum_vec);
-        _mm256_storeu_ps(&weights[i], v);
-    }
-
-    for (; i < N; i++)
-    {
-        weights[i] *= inv_sum;
-    }
-
-    /* Zero padding */
-    for (i = N; i < N_padded; i++)
-    {
-        weights[i] = 0.0f;
-    }
-}
-
-/**
- * Walker's Alias Table for O(1) categorical sampling
+ * ALIGNED WITH RBPF: Uses per-regime sigma_vol[k] for AR transition likelihood.
  *
- * Build phase: O(N) - done once per particle
- * Sample phase: O(1) - branchless table lookup
+ * Backward kernel: P(h_next | h_i, regime_next) uses σ_vol[regime_next]²
+ * This is the process noise of the destination regime (regime_next).
  */
-typedef struct
-{
-    float *prob; /* [N] probability table */
-    int *alias;  /* [N] alias indices */
-    int N;
-} AliasTable;
-
-/**
- * Build alias table from normalized weights
- * Uses Vose's algorithm (numerically stable)
- */
-static void alias_build(AliasTable *table, const float *weights, int N,
-                        int *small_stack, int *large_stack)
-{
-    table->N = N;
-    float n_f = (float)N;
-
-    /* Initialize prob = weights * N, classify as small or large */
-    int n_small = 0, n_large = 0;
-
-    for (int i = 0; i < N; i++)
-    {
-        float p = weights[i] * n_f;
-        table->prob[i] = p;
-        table->alias[i] = i;
-
-        if (p < 1.0f)
-        {
-            small_stack[n_small++] = i;
-        }
-        else
-        {
-            large_stack[n_large++] = i;
-        }
-    }
-
-    /* Pair small with large until done */
-    while (n_small > 0 && n_large > 0)
-    {
-        int s = small_stack[--n_small];
-        int l = large_stack[--n_large];
-
-        table->alias[s] = l;
-        table->prob[l] = table->prob[l] + table->prob[s] - 1.0f;
-
-        if (table->prob[l] < 1.0f)
-        {
-            small_stack[n_small++] = l;
-        }
-        else
-        {
-            large_stack[n_large++] = l;
-        }
-    }
-
-    /* Handle numerical edge cases */
-    while (n_large > 0)
-    {
-        table->prob[large_stack[--n_large]] = 1.0f;
-    }
-    while (n_small > 0)
-    {
-        table->prob[small_stack[--n_small]] = 1.0f;
-    }
-}
-
-/**
- * O(1) branchless sample from alias table
- */
-static inline int alias_sample(const AliasTable *table, float u1, float u2)
-{
-    int idx = (int)(u1 * table->N);
-    if (idx >= table->N)
-        idx = table->N - 1; /* Safety clamp */
-
-    /* Branchless select: if u2 < prob[idx], return idx, else return alias[idx] */
-    int use_alias = (u2 >= table->prob[idx]);
-    return use_alias ? table->alias[idx] : idx;
-}
-
-#endif /* PGAS_HAS_AVX2 */
-
 void pgas_paris_backward_smooth(PGASMKLState *state)
 {
     if (!state || state->T < 2)
@@ -1639,58 +1239,53 @@ void pgas_paris_backward_smooth(PGASMKLState *state)
     const int K = state->model.K;
     const PGASMKLModel *m = &state->model;
 
-    /* Precomputed constants */
+    /* Precomputed AR constant */
     const float phi = m->phi;
-    const float neg_half_inv_var = m->neg_half_inv_sigma_h_sq;
 
-    /* Initialize at final time (stride = Np!) */
+    /* Initialize at final time (identity mapping) */
     for (int n = 0; n < N; n++)
     {
         state->smoothed[(T - 1) * Np + n] = n;
     }
 
-#ifdef PGAS_HAS_AVX2
-    /* ═══════════════════════════════════════════════════════════════════
-     * OPTIMIZED PATH: AVX2 logsumexp + Walker's alias sampling
-     * ═══════════════════════════════════════════════════════════════════*/
-
-    /* Setup alias table (reuses workspace) */
-    AliasTable alias_table;
-    alias_table.prob = state->ws_alias_prob;
-    alias_table.alias = state->ws_alias_idx;
+    /* VML Enhanced Performance mode (trades accuracy for speed) */
+    vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
 
     float *local_log_bw = state->ws_log_bw;
     float *local_bw = state->ws_bw;
+    float *local_workspace = state->ws_uniform;
     VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
 
-    /* Pre-generate random numbers for this timestep batch */
-    float *rand_u1 = state->ws_uniform;
-    float *rand_u2 = state->ws_normal;
-
+    /* ═══════════════════════════════════════════════════════════════════
+     * BACKWARD PASS: Sample ancestors for each particle trajectory
+     * ═══════════════════════════════════════════════════════════════════*/
     int t, n, i;
     for (t = T - 2; t >= 0; t--)
     {
+        /* Data at time t (stride = Np for SIMD alignment) */
         const float *h_t = &state->h[t * Np];
         const float *log_w_t = &state->log_weights[t * Np];
         const int *regimes_t = &state->regimes[t * Np];
 
-        /* Generate 2*N uniform random numbers for all particles at this timestep */
-        vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, N, rand_u1, 0.0f, 1.0f);
-        vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, N, rand_u2, 0.0f, 1.0f);
-
         for (n = 0; n < N; n++)
         {
+            /* Get smoothed state at t+1 for trajectory n */
             int idx_next = state->smoothed[(t + 1) * Np + n];
             int regime_next = state->regimes[(t + 1) * Np + idx_next];
             float h_next = state->h[(t + 1) * Np + idx_next];
 
-            /* Use precomputed mu_shift */
+            /* Rank-1 precomputed: mu_shift = μ_k × (1-φ) */
             float mu_shift_k = m->mu_shift[regime_next];
 
-            /* Get log_trans column from TRANSPOSED matrix */
+            /* Contiguous column access via transposed matrix */
             const float *log_trans_col = &m->log_trans_T[regime_next * K];
 
-            /* Compute backward log-weights with SIMD */
+            /* Per-regime AR likelihood (ALIGNED WITH RBPF)
+             * Use sigma_vol of the NEXT regime (regime_next) - the regime we're
+             * transitioning INTO. This is critical for model consistency. */
+            float neg_half_inv_var = m->neg_half_inv_sigma_vol_sq[regime_next];
+
+            /* Compute backward log-weights (SIMD-friendly loop) */
 #ifndef _MSC_VER
 #pragma omp simd
 #endif
@@ -1699,157 +1294,34 @@ void pgas_paris_backward_smooth(PGASMKLState *state)
                 int regime_i = regimes_t[i];
                 float h_i = h_t[i];
 
+                /* Transition probability */
                 float log_trans = log_trans_col[regime_i];
+
+                /* AR(1) likelihood: log P(h_next | h_i, regime_next)
+                 * Rank-1 arithmetic: mean = mu_shift + φ × h_i */
                 float mean = mu_shift_k + phi * h_i;
                 float diff = h_next - mean;
                 float log_h_trans = neg_half_inv_var * diff * diff;
 
+                /* Total backward weight */
                 local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
             }
 
+            /* Set padding to NEG_INF */
             for (i = N; i < Np; i++)
             {
                 local_log_bw[i] = NEG_INF;
             }
 
-            /* Inlined AVX2 logsumexp (eliminates 4 MKL function calls) */
-            logsumexp_normalize_avx2(local_log_bw, N, Np, local_bw);
+            /* Normalize and sample ancestor */
+            logsumexp_normalize_mkl(local_log_bw, N, Np, local_bw, local_workspace);
 
-            /* Build alias table O(N) */
-            alias_build(&alias_table, local_bw, N,
-                        state->ws_alias_small, state->ws_alias_large);
-
-            /* O(1) branchless sample */
-            state->smoothed[t * Np + n] = alias_sample(&alias_table,
-                                                       rand_u1[n], rand_u2[n]);
+            state->smoothed[t * Np + n] = sample_categorical_single(
+                local_bw, N, state->ws_cumsum, stream);
         }
     }
 
-#else
-    /* ═══════════════════════════════════════════════════════════════════
-     * FALLBACK PATH: MKL-based (when AVX2 not available)
-     * ═══════════════════════════════════════════════════════════════════*/
-
-    /* Decide parallel vs sequential based on workload */
-    const int use_parallel = (N * T > PARIS_PARALLEL_THRESHOLD);
-
-#ifdef _OPENMP
-    if (use_parallel)
-    {
-#pragma omp parallel
-        {
-            int tid = omp_get_thread_num();
-
-            vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
-
-            VSLStreamStatePtr local_stream = (VSLStreamStatePtr)state->thread_rng_streams[tid];
-            float *local_log_bw = state->thread_ws[tid].log_bw;
-            float *local_bw = state->thread_ws[tid].bw;
-            float *local_workspace = state->thread_ws[tid].workspace;
-            float *local_cumsum = state->thread_ws[tid].cumsum;
-
-            int t, n;
-            for (t = T - 2; t >= 0; t--)
-            {
-                const float *h_t = &state->h[t * Np];
-                const float *log_w_t = &state->log_weights[t * Np];
-                const int *regimes_t = &state->regimes[t * Np];
-
-#pragma omp for schedule(static)
-                for (n = 0; n < N; n++)
-                {
-                    int idx_next = state->smoothed[(t + 1) * Np + n];
-                    int regime_next = state->regimes[(t + 1) * Np + idx_next];
-                    float h_next = state->h[(t + 1) * Np + idx_next];
-
-                    float mu_shift_k = m->mu_shift[regime_next];
-                    const float *log_trans_col = &m->log_trans_T[regime_next * K];
-
-                    int i;
-#ifndef _MSC_VER
-#pragma omp simd
-#endif
-                    for (i = 0; i < N; i++)
-                    {
-                        int regime_i = regimes_t[i];
-                        float h_i = h_t[i];
-                        float log_trans = log_trans_col[regime_i];
-                        float mean = mu_shift_k + phi * h_i;
-                        float diff = h_next - mean;
-                        float log_h_trans = neg_half_inv_var * diff * diff;
-                        local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
-                    }
-
-                    for (i = N; i < Np; i++)
-                    {
-                        local_log_bw[i] = NEG_INF;
-                    }
-
-                    logsumexp_normalize_mkl(local_log_bw, N, Np, local_bw, local_workspace);
-
-                    state->smoothed[t * Np + n] = sample_categorical_single(
-                        local_bw, N, local_cumsum, local_stream);
-                }
-            }
-
-            vmlSetMode(VML_HA);
-        }
-    }
-    else
-#endif
-    {
-        vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
-
-        float *local_log_bw = state->ws_log_bw;
-        float *local_bw = state->ws_bw;
-        float *local_workspace = state->ws_uniform;
-        VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
-
-        int t, n, i;
-        for (t = T - 2; t >= 0; t--)
-        {
-            const float *h_t = &state->h[t * Np];
-            const float *log_w_t = &state->log_weights[t * Np];
-            const int *regimes_t = &state->regimes[t * Np];
-
-            for (n = 0; n < N; n++)
-            {
-                int idx_next = state->smoothed[(t + 1) * Np + n];
-                int regime_next = state->regimes[(t + 1) * Np + idx_next];
-                float h_next = state->h[(t + 1) * Np + idx_next];
-
-                float mu_shift_k = m->mu_shift[regime_next];
-                const float *log_trans_col = &m->log_trans_T[regime_next * K];
-
-#ifndef _MSC_VER
-#pragma omp simd
-#endif
-                for (i = 0; i < N; i++)
-                {
-                    int regime_i = regimes_t[i];
-                    float h_i = h_t[i];
-                    float log_trans = log_trans_col[regime_i];
-                    float mean = mu_shift_k + phi * h_i;
-                    float diff = h_next - mean;
-                    float log_h_trans = neg_half_inv_var * diff * diff;
-                    local_log_bw[i] = log_w_t[i] + log_trans + log_h_trans;
-                }
-
-                for (i = N; i < Np; i++)
-                {
-                    local_log_bw[i] = NEG_INF;
-                }
-
-                logsumexp_normalize_mkl(local_log_bw, N, Np, local_bw, local_workspace);
-
-                state->smoothed[t * Np + n] = sample_categorical_single(
-                    local_bw, N, state->ws_cumsum, stream);
-            }
-        }
-
-        vmlSetMode(VML_HA);
-    }
-#endif /* PGAS_HAS_AVX2 */
+    vmlSetMode(VML_HA);
 }
 
 void pgas_paris_get_smoothed(const PGASMKLState *state, int t,
@@ -1888,7 +1360,6 @@ void pgas_mkl_generate_lifeboat(const PGASMKLState *state, LifeboatPacketMKL *pa
     memcpy(packet->mu_vol, state->model.mu_vol, state->K * sizeof(float));
     memcpy(packet->sigma_vol, state->model.sigma_vol, state->K * sizeof(float));
     packet->phi = state->model.phi;
-    packet->sigma_h = state->model.sigma_h;
 
     if (!packet->final_regimes)
     {

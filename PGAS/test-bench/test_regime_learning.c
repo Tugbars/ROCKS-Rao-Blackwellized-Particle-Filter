@@ -32,7 +32,6 @@
 
 #include "pgas_mkl.h"
 #include "pgas_paris.h"
-#include "mkl_tuning.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +49,7 @@
 #define DEFAULT_SEED 42
 #define T_DATA 2000
 #define K_REGIMES 4
-#define N_PARTICLES 32
+#define N_PARTICLES 64
 
 /* MCMC settings */
 #define N_SWEEPS 500
@@ -59,13 +58,13 @@
 
 /* Ground truth parameters
  *
- * NOTE: OCSN Mixture (Omori et al. 2007)
- * The model is: y_t = log(r_t²) = h_t + log(η_t²)
- * where η_t ~ N(0,1), so E[log(η²)] ≈ -1.27
+ * OCSN Likelihood Calibration (Omori et al. 2007):
+ * The SV model is: y_t = h_t + ε_t, where ε_t ~ log(χ²₁)
+ * E[log(χ²₁)] ≈ -1.27, approximated by 10-component Gaussian mixture.
  *
- * OCSN mixture means are pre-adjusted for this offset.
- * Our synthetic generator produces h_t directly, and the OCSN
- * likelihood correctly handles the log(η²) distribution.
+ * Our synthetic generator uses sample_ocsn_noise() which draws from
+ * the EXACT same 10-component mixture used in pgas_mkl.c OCSN likelihood.
+ * This ensures perfect Likelihood Match (Geweke's Test prerequisite).
  */
 static const float TRUE_MU_VOL[4] = {-4.50f, -3.67f, -2.83f, -2.00f};
 static const float TRUE_SIGMA_VOL[4] = {0.08f, 0.267f, 0.453f, 0.64f};
@@ -80,15 +79,63 @@ static const double TRUE_TRANS[16] = {
     0.01, 0.02, 0.03, 0.94};
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * SYNTHETIC DATA GENERATION
+ * OCSN-CALIBRATED SYNTHETIC DATA GENERATION
+ *
+ * The OCSN 10-component mixture approximates log(χ²₁) with mean ≈ -1.27.
+ * To ensure Likelihood Match between generator and sampler, we sample
+ * observation noise from the EXACT same mixture used in pgas_mkl.c.
+ *
+ * This eliminates the "Mean Offset Bias" that occurs when using N(0,1) noise.
  *═══════════════════════════════════════════════════════════════════════════════*/
+
+/**
+ * Sample from the OCSN 10-component mixture (approximates log(χ²₁))
+ * This ensures synthetic noise exactly matches the OCSN likelihood.
+ */
+static float sample_ocsn_noise(VSLStreamStatePtr stream)
+{
+    /* OCSN (Omori et al. 2007) mixture weights */
+    static const float Q[10] = {
+        0.00609f, 0.04775f, 0.13057f, 0.20674f, 0.22715f,
+        0.18842f, 0.12047f, 0.05591f, 0.01575f, 0.00115f};
+    /* OCSN mixture means */
+    static const float M[10] = {
+        1.92677f, 1.34744f, 0.73504f, 0.02266f, -0.85173f,
+        -1.97278f, -3.46788f, -5.55246f, -8.68384f, -14.65000f};
+    /* OCSN mixture standard deviations */
+    static const float S[10] = {
+        0.33563f, 0.42175f, 0.51737f, 0.63728f, 0.79183f,
+        0.99289f, 1.25487f, 1.59530f, 2.04106f, 2.70806f};
+
+    /* 1. Sample component index using weights Q */
+    float u;
+    vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, 1, &u, 0.0f, 1.0f);
+
+    int j = 9;
+    float cumsum = 0.0f;
+    for (int k = 0; k < 10; k++)
+    {
+        cumsum += Q[k];
+        if (u < cumsum)
+        {
+            j = k;
+            break;
+        }
+    }
+
+    /* 2. Sample from selected Gaussian component */
+    float z;
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, M[j], S[j]);
+
+    return z;
+}
 
 typedef struct
 {
     int T;
     int *true_regimes; /* Ground truth regimes */
     float *true_h;     /* Ground truth log-volatility */
-    float *y;          /* Observations */
+    float *y;          /* Observations: y_t = h_t + OCSN_noise */
 } SyntheticData;
 
 static void generate_synthetic_data(SyntheticData *data, int T, uint32_t seed)
@@ -107,13 +154,11 @@ static void generate_synthetic_data(SyntheticData *data, int T, uint32_t seed)
 
     float *uniform = (float *)malloc(T * sizeof(float));
     float *normal = (float *)malloc(T * sizeof(float));
-    float *obs_noise = (float *)malloc(T * sizeof(float));
 
     vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, T, uniform, 0.0f, 1.0f);
     vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, T, normal, 0.0f, TRUE_SIGMA_H);
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, T, obs_noise, 0.0f, 1.0f);
 
-    /* Generate sequence */
+    /* Generate regime and h sequence */
     for (int t = 1; t < T; t++)
     {
         /* Sample regime transition */
@@ -138,16 +183,16 @@ static void generate_synthetic_data(SyntheticData *data, int T, uint32_t seed)
         data->true_h[t] = mu_k * (1.0f - TRUE_PHI) + TRUE_PHI * data->true_h[t - 1] + normal[t];
     }
 
-    /* Generate observations */
+    /* Generate observations using OCSN-calibrated noise
+     * y_t = h_t + ε_t, where ε_t ~ OCSN(10-component)
+     * This ensures EXACT likelihood match with the sampler */
     for (int t = 0; t < T; t++)
     {
-        float vol = expf(0.5f * data->true_h[t]);
-        data->y[t] = vol * obs_noise[t];
+        data->y[t] = data->true_h[t] + sample_ocsn_noise(stream);
     }
 
     free(uniform);
     free(normal);
-    free(obs_noise);
     vslDeleteStream(&stream);
 }
 
@@ -285,8 +330,6 @@ static void pgas_sample_mu_vol_single(
 {
     const int K = pgas->K;
     const float phi = pgas->model.phi;
-    const float sigma_h = pgas->model.sigma_h;
-    const float sigma_h_sq = sigma_h * sigma_h;
     const float one_minus_phi = 1.0f - phi;
     const float one_minus_phi_sq = one_minus_phi * one_minus_phi;
 
@@ -299,6 +342,10 @@ static void pgas_sample_mu_vol_single(
 
     for (int k = 0; k < K; k++)
     {
+        /* Per-regime sigma_vol (aligned with RBPF) */
+        const float sigma_vol_k = pgas->model.sigma_vol[k];
+        const float sigma_vol_k_sq = sigma_vol_k * sigma_vol_k;
+
         float m0 = prior->mu_prior_mean[k];
         float s0_sq = prior->mu_prior_var[k];
 
@@ -313,11 +360,11 @@ static void pgas_sample_mu_vol_single(
         }
 
         double precision_prior = 1.0 / s0_sq;
-        double precision_data = n_k[k] * one_minus_phi_sq / sigma_h_sq;
+        double precision_data = n_k[k] * one_minus_phi_sq / sigma_vol_k_sq;
         double precision_post = precision_prior + precision_data;
         double var_post = 1.0 / precision_post;
 
-        double data_contribution = one_minus_phi * sum_resid_k[k] / sigma_h_sq;
+        double data_contribution = one_minus_phi * sum_resid_k[k] / sigma_vol_k_sq;
         double prior_contribution = m0 / s0_sq;
         double mean_post = var_post * (prior_contribution + data_contribution);
 
@@ -474,8 +521,6 @@ static void print_trans_comparison(const char *name, const RegimeLearningAccumul
 
 int main(int argc, char **argv)
 {
-
-    mkl_tuning_init(8, 0);  /* 8 P-cores, quiet mode */
     uint32_t seed = DEFAULT_SEED;
     if (argc > 1)
     {
@@ -512,13 +557,12 @@ int main(int argc, char **argv)
     double init_trans[16];
     double mu_vol_d[4], sigma_vol_d[4];
 
-    /* FIX 1: Log-transform observations for OCSN
-     * PGAS expects y = log(r²), not raw returns
-     * Without this, model sees ~0.01 instead of ~-9.2 */
+    /* Convert for API
+     * With OCSN-calibrated generator, y_t = h_t + OCSN_noise
+     * No log-transform needed - data is already in correct form */
     for (int t = 0; t < T_DATA; t++)
     {
-        float r = data.y[t];
-        obs_d[t] = log(r * r + 1e-10); /* log(r²) with epsilon for safety */
+        obs_d[t] = (double)data.y[t];
     }
 
     /* Initial transition matrix (rows sum to 1.0) */
@@ -531,8 +575,8 @@ int main(int argc, char **argv)
     }
     for (int k = 0; k < 4; k++)
     {
-        mu_vol_d[k] = -3.0; /* Start with uninformative init */
-        sigma_vol_d[k] = TRUE_SIGMA_VOL[k];
+        mu_vol_d[k] = -3.0;            /* Start with uninformative init */
+        sigma_vol_d[k] = TRUE_SIGMA_H; /* Per-regime AR process noise (uniform for test) */
     }
 
     /* Initialize reference trajectory */
@@ -552,7 +596,7 @@ int main(int argc, char **argv)
     printf("═══════════════════════════════════════════════════════════════════\n");
 
     PGASMKLState *pgas_A = pgas_mkl_alloc(N_PARTICLES, T_DATA, K_REGIMES, seed);
-    pgas_mkl_set_model(pgas_A, init_trans, mu_vol_d, sigma_vol_d, TRUE_PHI, TRUE_SIGMA_H);
+    pgas_mkl_set_model(pgas_A, init_trans, mu_vol_d, sigma_vol_d, TRUE_PHI);
     pgas_mkl_set_transition_prior(pgas_A, 1.0f, 50.0f);
     pgas_mkl_enable_adaptive_kappa(pgas_A, 1);
     pgas_mkl_configure_adaptive_kappa(pgas_A, 20.0f, 150.0f, 0.0f, 0.0f);
@@ -621,7 +665,7 @@ int main(int argc, char **argv)
 
     /* Fresh PGAS state with same seed */
     PGASMKLState *pgas_B = pgas_mkl_alloc(N_PARTICLES, T_DATA, K_REGIMES, seed);
-    pgas_mkl_set_model(pgas_B, init_trans, mu_vol_d, sigma_vol_d, TRUE_PHI, TRUE_SIGMA_H);
+    pgas_mkl_set_model(pgas_B, init_trans, mu_vol_d, sigma_vol_d, TRUE_PHI);
     pgas_mkl_set_transition_prior(pgas_B, 1.0f, 50.0f);
     pgas_mkl_enable_adaptive_kappa(pgas_B, 1);
     pgas_mkl_configure_adaptive_kappa(pgas_B, 20.0f, 150.0f, 0.0f, 0.0f);

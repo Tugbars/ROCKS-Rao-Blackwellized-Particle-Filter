@@ -359,9 +359,10 @@ extern "C"
         float sigma_prior_shape; /**< Shape parameter (a) for all regimes */
         float sigma_prior_scale; /**< Scale parameter (b) for all regimes */
 
-        /* σ_h prior (shared AR innovation): InvGamma(sigma_h_shape, sigma_h_scale) */
-        float sigma_h_prior_shape; /**< Shape parameter for σ_h prior */
-        float sigma_h_prior_scale; /**< Scale parameter for σ_h prior */
+        /* σ_h prior - DEPRECATED: sigma_vol is now per-regime (aligned with RBPF)
+         * These fields kept for API compatibility but are ignored */
+        float sigma_h_prior_shape; /**< DEPRECATED: Shape parameter for σ_h prior */
+        float sigma_h_prior_scale; /**< DEPRECATED: Scale parameter for σ_h prior */
 
         /* φ prior (AR persistence): Beta(phi_a, phi_b) mapped to [0, 1)
          * For highly persistent SV, use phi_a=20, phi_b=1.5 → mode ~0.95 */
@@ -374,7 +375,7 @@ extern "C"
         /* Learning control */
         int learn_mu;      /**< Enable μ_vol learning */
         int learn_sigma;   /**< Enable σ_vol learning */
-        int learn_sigma_h; /**< Enable σ_h learning (shared) */
+        int learn_sigma_h; /**< DEPRECATED: sigma_vol is per-regime now */
         int learn_phi;     /**< Enable φ learning via MH (shared) */
 
         /* Ordering constraint to prevent label switching */
@@ -456,16 +457,15 @@ extern "C"
                                         float shape, float scale);
 
     /**
-     * Set σ_h prior (shared AR innovation std)
+     * Set σ_h prior - DEPRECATED
      *
-     * Prior: σ²_h ~ InvGamma(shape, scale)
-     * Mode = scale / (shape + 1)
-     *
-     * Example: shape=3, scale=0.03 → mode ≈ 0.0075, giving σ_h ~ 0.1
+     * This function is kept for API compatibility but has no effect.
+     * sigma_vol is now per-regime (aligned with RBPF).
+     * Use grid search or calibration to set sigma_vol[k].
      *
      * @param prior  Prior struct
-     * @param shape  Inv-Gamma shape parameter (a > 0)
-     * @param scale  Inv-Gamma scale parameter (b > 0)
+     * @param shape  Ignored
+     * @param scale  Ignored
      */
     void pgas_paris_set_sigma_h_prior(PGASParisRegimePrior *prior,
                                       float shape, float scale);
@@ -588,18 +588,15 @@ extern "C"
     void pgas_paris_get_sigma_vol(const PGASParisState *state, float *sigma_out, int K);
 
     /**
-     * Sample σ_h from Inverse-Gamma posterior (shared AR innovation std)
+     * Sample σ_h - DEPRECATED
      *
-     * Model: h_t = μ_{z_t}(1-φ) + φ*h_{t-1} + σ_h*ε_t
+     * This function is kept for API compatibility but does nothing.
+     * sigma_vol is now per-regime (aligned with RBPF).
+     * Use grid search or calibration to set sigma_vol[k].
      *
-     * Posterior: σ²_h | data ~ InvGamma(a_post, b_post)
-     * where:
-     *   a_post = a₀ + (T-1)/2
-     *   b_post = b₀ + 0.5 * Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})²
-     *
-     * @param state  PGAS-PARIS state
-     * @param stats  Sufficient statistics
-     * @param prior  Prior configuration
+     * @param state  PGAS-PARIS state (ignored)
+     * @param stats  Sufficient statistics (ignored)
+     * @param prior  Prior configuration (ignored)
      */
     void pgas_paris_sample_sigma_h(PGASParisState *state,
                                    const PGASParisRegimeStats *stats,
@@ -614,6 +611,8 @@ extern "C"
      * Proposal: logit(φ') = logit(φ) + N(0, proposal_std²)
      * Accept with Metropolis ratio including Jacobian.
      *
+     * Now uses per-regime sigma_vol[k] (aligned with RBPF).
+     *
      * @param state  PGAS-PARIS state
      * @param stats  Sufficient statistics
      * @param prior  Prior configuration (updated with MH diagnostics)
@@ -623,10 +622,13 @@ extern "C"
                                PGASParisRegimePrior *prior);
 
     /**
-     * Get learned σ_h value
+     * Get σ_h value - DEPRECATED
+     *
+     * This function returns the average of sigma_vol[k] for backward
+     * compatibility. Use pgas_paris_get_sigma_vol() for per-regime values.
      *
      * @param state  PGAS-PARIS state
-     * @return       Current σ_h value
+     * @return       Average of sigma_vol[k] across regimes
      */
     float pgas_paris_get_sigma_h(const PGASParisState *state);
 

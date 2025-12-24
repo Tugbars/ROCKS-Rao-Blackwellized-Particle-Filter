@@ -191,23 +191,20 @@ extern "C"
     /*═══════════════════════════════════════════════════════════════════════════
      * CONFIGURATION
      *═══════════════════════════════════════════════════════════════════════════*/
-
     /**
-     * Set PARIS model parameters
+     * Set model parameters
      *
-     * Must match RBPF regime parameters for correct smoothing.
-     *
-     * @param fls       Smoother handle
-     * @param trans     Transition matrix [K×K] row-major
-     * @param mu_vol    Per-regime μ_vol [K]
-     * @param phi       AR(1) persistence
-     * @param sigma_h   Vol-of-vol
+     * @param fls        Fixed-lag smoother
+     * @param trans      Transition matrix [K×K] row-major
+     * @param mu_vol     Per-regime log-vol means [K]
+     * @param sigma_vol  Per-regime AR process noise [K]
+     * @param phi        AR(1) persistence
      */
     void fls_set_model(RBPF_FixedLagSmoother *fls,
                        const double *trans,
                        const double *mu_vol,
-                       double phi,
-                       double sigma_h);
+                       const double *sigma_vol,
+                       double phi);
 
     /**
      * Enable/disable smoother

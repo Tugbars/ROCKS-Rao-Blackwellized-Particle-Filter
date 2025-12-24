@@ -14,6 +14,8 @@
  *   - κ moves in correct direction
  *   - Chatter ratio converges toward 1.0
  *   - Final matrix error < fixed-κ error
+ *
+ * Updated for per-regime sigma_vol API (ALIGNED WITH RBPF)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 #include <stdio.h>
@@ -81,20 +83,19 @@ static double sample_ocsn(VSLStreamStatePtr stream)
 typedef struct
 {
     int K, T;
-    double trans[16], mu_vol[4], sigma_vol[4], phi, sigma_h;
+    double trans[16], mu_vol[4], sigma_vol[4], phi;
     int *true_regimes;
     float *true_h, *observations;
 } SyntheticData;
 
 SyntheticData *generate_synthetic_data(int K, int T, const double *trans,
                                        const double *mu_vol, const double *sigma_vol,
-                                       double phi, double sigma_h, uint32_t seed)
+                                       double phi, uint32_t seed)
 {
     SyntheticData *data = (SyntheticData *)calloc(1, sizeof(SyntheticData));
     data->K = K;
     data->T = T;
     data->phi = phi;
-    data->sigma_h = sigma_h;
     memcpy(data->trans, trans, K * K * sizeof(double));
     memcpy(data->mu_vol, mu_vol, K * sizeof(double));
     memcpy(data->sigma_vol, sigma_vol, K * sizeof(double));
@@ -107,8 +108,9 @@ SyntheticData *generate_synthetic_data(int K, int T, const double *trans,
     vslNewStream(&stream, VSL_BRNG_MT19937, seed);
 
     data->true_regimes[0] = seed % K;
-    double h_mean = mu_vol[data->true_regimes[0]];
-    double h_var = (sigma_h * sigma_h) / (1.0 - phi * phi);
+    int init_regime = data->true_regimes[0];
+    double h_mean = mu_vol[init_regime];
+    double h_var = (sigma_vol[init_regime] * sigma_vol[init_regime]) / (1.0 - phi * phi);
     double z;
     vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, 0.0, sqrt(h_var));
     data->true_h[0] = (float)(h_mean + z);
@@ -120,7 +122,7 @@ SyntheticData *generate_synthetic_data(int K, int T, const double *trans,
         data->true_regimes[t] = sample_categorical(&trans[prev * K], K, stream);
         int curr = data->true_regimes[t];
         double mean_h = mu_vol[curr] * (1.0 - phi) + phi * data->true_h[t - 1];
-        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, 0.0, sigma_h);
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, 0.0, sigma_vol[curr]);
         data->true_h[t] = (float)(mean_h + z);
         data->observations[t] = data->true_h[t] + (float)sample_ocsn(stream);
     }
@@ -196,11 +198,10 @@ void run_adaptive_test(const AdaptiveScenario *scenario, uint32_t seed)
     const int N_burnin = 100;
     const int N_adaptive = 500;
 
-    /* TRUE parameters */
+    /* TRUE parameters - per-regime sigma_vol */
     double mu_vol[4] = {-2.25, -0.75, 0.75, 2.25};
     double sigma_vol[4] = {0.2, 0.2, 0.2, 0.2};
     double phi = 0.97;
-    double sigma_h = 0.15;
 
     double diag = scenario->true_diag;
     double off_diag = (1.0 - diag) / (K - 1);
@@ -212,7 +213,7 @@ void run_adaptive_test(const AdaptiveScenario *scenario, uint32_t seed)
     /* Generate data */
     printf("Generating synthetic data (diag=%.2f)...\n", diag);
     SyntheticData *data = generate_synthetic_data(K, T, trans_true, mu_vol,
-                                                  sigma_vol, phi, sigma_h, seed);
+                                                  sigma_vol, phi, seed);
     if (!data)
     {
         printf("ERROR: Failed to generate synthetic data\n");
@@ -249,7 +250,8 @@ void run_adaptive_test(const AdaptiveScenario *scenario, uint32_t seed)
     for (int i = 0; i < K * K; i++)
         init_trans[i] = 1.0 / K;
 
-    pgas_mkl_set_model(pgas, init_trans, mu_vol, sigma_vol, phi, sigma_h);
+    /* Updated API: no sigma_h argument */
+    pgas_mkl_set_model(pgas, init_trans, mu_vol, sigma_vol, phi);
     pgas_mkl_set_transition_prior(pgas, 1.0f, scenario->initial_kappa);
 
     /* Enable adaptive kappa */
@@ -457,11 +459,10 @@ void run_comparison_test(uint32_t seed)
     const int N = 128;
     const int N_sweeps = 500;
 
-    /* TRUE parameters with diag=0.90 */
+    /* TRUE parameters with diag=0.90 - per-regime sigma_vol */
     double mu_vol[4] = {-2.25, -0.75, 0.75, 2.25};
     double sigma_vol[4] = {0.2, 0.2, 0.2, 0.2};
     double phi = 0.97;
-    double sigma_h = 0.15;
     double diag = 0.90;
     double off_diag = (1.0 - diag) / (K - 1);
 
@@ -473,7 +474,7 @@ void run_comparison_test(uint32_t seed)
     /* Generate data ONCE */
     printf("Generating synthetic data (diag=0.90)...\n");
     SyntheticData *data = generate_synthetic_data(K, T, trans_true, mu_vol,
-                                                  sigma_vol, phi, sigma_h, seed);
+                                                  sigma_vol, phi, seed);
 
     double *obs_double = (double *)malloc(T * sizeof(double));
     for (int i = 0; i < T; i++)
@@ -489,7 +490,8 @@ void run_comparison_test(uint32_t seed)
     printf("\n[1] Running with FIXED κ=100...\n");
 
     PGASMKLState *pgas_fixed = pgas_mkl_alloc(N, T, K, seed + 1000);
-    pgas_mkl_set_model(pgas_fixed, init_trans, mu_vol, sigma_vol, phi, sigma_h);
+    /* Updated API: no sigma_h argument */
+    pgas_mkl_set_model(pgas_fixed, init_trans, mu_vol, sigma_vol, phi);
     pgas_mkl_set_transition_prior(pgas_fixed, 1.0f, 100.0f);
     pgas_mkl_load_observations(pgas_fixed, obs_double, T);
     pgas_mkl_csmc_sweep(pgas_fixed);
@@ -523,7 +525,8 @@ void run_comparison_test(uint32_t seed)
     printf("\n[2] Running with ADAPTIVE κ (start=100)...\n");
 
     PGASMKLState *pgas_adapt = pgas_mkl_alloc(N, T, K, seed + 1000);
-    pgas_mkl_set_model(pgas_adapt, init_trans, mu_vol, sigma_vol, phi, sigma_h);
+    /* Updated API: no sigma_h argument */
+    pgas_mkl_set_model(pgas_adapt, init_trans, mu_vol, sigma_vol, phi);
     pgas_mkl_set_transition_prior(pgas_adapt, 1.0f, 100.0f);
     pgas_mkl_enable_adaptive_kappa(pgas_adapt, 1);
     pgas_mkl_configure_adaptive_kappa(pgas_adapt, 30.0f, 300.0f, 0.3f, 0.1f);

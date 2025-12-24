@@ -209,6 +209,7 @@ void pgas_paris_copy_particles(PGASParisState *state)
     /* Update PARIS model parameters to match PGAS */
     double trans_d[PGAS_MKL_MAX_REGIMES * PGAS_MKL_MAX_REGIMES];
     double mu_vol_d[PGAS_MKL_MAX_REGIMES];
+    double sigma_vol_d[PGAS_MKL_MAX_REGIMES];
 
     for (int i = 0; i < pgas->K * pgas->K; i++)
     {
@@ -217,10 +218,12 @@ void pgas_paris_copy_particles(PGASParisState *state)
     for (int k = 0; k < pgas->K; k++)
     {
         mu_vol_d[k] = (double)pgas->model.mu_vol[k];
+        sigma_vol_d[k] = (double)pgas->model.sigma_vol[k];
     }
 
-    paris_mkl_set_model(state->paris, trans_d, mu_vol_d,
-                        (double)pgas->model.phi, (double)pgas->model.sigma_h);
+    /* Pass per-regime sigma_vol (aligned with RBPF) */
+    paris_mkl_set_model(state->paris, trans_d, mu_vol_d, sigma_vol_d,
+                        (double)pgas->model.phi);
 
     /* Load particles into PARIS */
     paris_mkl_load_particles(state->paris,
@@ -980,8 +983,6 @@ void pgas_paris_sample_mu_vol(PGASParisState *state,
     PGASMKLState *pgas = state->pgas;
     const int K = pgas->K;
     const float phi = pgas->model.phi;
-    const float sigma_h = pgas->model.sigma_h;
-    const float sigma_h_sq = sigma_h * sigma_h;
     const float one_minus_phi = 1.0f - phi;
     const float one_minus_phi_sq = one_minus_phi * one_minus_phi;
 
@@ -989,13 +990,17 @@ void pgas_paris_sample_mu_vol(PGASParisState *state,
 
     for (int k = 0; k < K; k++)
     {
+        /* Per-regime AR process noise (aligned with RBPF) */
+        const float sigma_vol_k = pgas->model.sigma_vol[k];
+        const float sigma_vol_k_sq = sigma_vol_k * sigma_vol_k;
+
         /* Prior parameters */
         float m0 = prior->mu_prior_mean[k];
         float s0_sq = prior->mu_prior_var[k];
 
         /* Data likelihood contribution
-         * From: h_t = μ_k*(1-φ) + φ*h_{t-1} + σ_h*ε
-         * Rearranging: residual = h_t - φ*h_{t-1} = μ_k*(1-φ) + σ_h*ε
+         * From: h_t = μ_k*(1-φ) + φ*h_{t-1} + σ_vol[k]*ε
+         * Rearranging: residual = h_t - φ*h_{t-1} = μ_k*(1-φ) + σ_vol[k]*ε
          * So: E[residual | z=k] = μ_k*(1-φ)
          *     μ_k = E[residual]/(1-φ)
          *
@@ -1014,21 +1019,21 @@ void pgas_paris_sample_mu_vol(PGASParisState *state,
         }
 
         /* Posterior variance:
-         * 1/σ²_post = 1/s₀² + n_k*(1-φ)²/σ_h²
+         * 1/σ²_post = 1/s₀² + n_k*(1-φ)²/σ_vol[k]²
          */
         double precision_prior = 1.0 / s0_sq;
-        double precision_data = n_k * one_minus_phi_sq / sigma_h_sq;
+        double precision_data = n_k * one_minus_phi_sq / sigma_vol_k_sq;
         double precision_post = precision_prior + precision_data;
         double var_post = 1.0 / precision_post;
 
         /* Posterior mean:
-         * μ_post = σ²_post * (m₀/s₀² + (1-φ)*Σresid_k/σ_h²)
+         * μ_post = σ²_post * (m₀/s₀² + (1-φ)*Σresid_k/σ_vol[k]²)
          *
          * Note: sum_resid_k = Σ(h_t - φ*h_{t-1}) for z_t = k
          * We want μ_k such that residual ≈ μ_k*(1-φ)
          * So we use sum_resid_k directly (it's already multiplied by n_k in effect)
          */
-        double data_contribution = one_minus_phi * stats->sum_resid_k[k] / sigma_h_sq;
+        double data_contribution = one_minus_phi * stats->sum_resid_k[k] / sigma_vol_k_sq;
         double prior_contribution = m0 / s0_sq;
         double mean_post = var_post * (prior_contribution + data_contribution);
 
@@ -1116,97 +1121,27 @@ void pgas_paris_sample_sigma_vol(PGASParisState *state,
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * σ_h LEARNING (SHARED AR INNOVATION)
+ * σ_h LEARNING - DEPRECATED
  *
- * Model: h_t = μ_{z_t}(1-φ) + φ*h_{t-1} + σ_h*ε_t
+ * With per-regime sigma_vol[k] (aligned with RBPF), shared sigma_h is obsolete.
+ * This function is kept for API compatibility but does nothing.
  *
- * Given {h, z, μ, φ}, the innovations are:
- *   ε_t = (h_t - μ_{z_t}(1-φ) - φ*h_{t-1}) / σ_h
- *
- * The sum of squared innovations follows:
- *   Σε² = Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})² / σ_h²
- *
- * Conjugate: σ_h² | rest ~ InvGamma(a_post, b_post)
- *   a_post = a₀ + (T-1)/2
- *   b_post = b₀ + 0.5 * Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})²
+ * Note: sigma_vol[k] is the AR process noise for regime k.
+ * It should be set via grid search or calibration, not learned here.
+ * (See test_full_learning.c for 2D grid search over φ × σ_vol)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 void pgas_paris_sample_sigma_h(PGASParisState *state,
                                const PGASParisRegimeStats *stats,
                                PGASParisRegimePrior *prior)
 {
-    if (!state || !state->pgas || !stats || !prior)
-        return;
-    if (!prior->learn_sigma_h)
-        return;
-
-    PGASMKLState *pgas = state->pgas;
-    const int K = pgas->K;
-    const int T = pgas->T;
-    const int M = state->n_trajectories;
-    const float phi = pgas->model.phi;
-    const float one_minus_phi = 1.0f - phi;
-
-    VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
-
-    /* Prior parameters */
-    float a0 = prior->sigma_h_prior_shape;
-    float b0 = prior->sigma_h_prior_scale;
-
-    /* Compute sum of squared residuals: Σ(h_t - μ_{z_t}(1-φ) - φ*h_{t-1})²
-     * This requires iterating through trajectories since we need regime-specific μ */
-    double ss = 0.0;
-    double n_total = 0.0;
-
-    for (int m = 0; m < M; m++)
-    {
-        const int *traj = &state->traj.trajectories[m * T];
-        const float *h_cache = &state->h_traj_cache[m * T];
-
-        float h_prev = h_cache[0];
-        for (int t = 1; t < T; t++)
-        {
-            int z_t = traj[t];
-            float h_t = h_cache[t];
-            float mu_z = pgas->model.mu_vol[z_t];
-
-            /* True residual accounting for regime-specific μ */
-            float target = mu_z * one_minus_phi + phi * h_prev;
-            float resid = h_t - target;
-            ss += resid * resid;
-            n_total += 1.0;
-
-            h_prev = h_t;
-        }
-    }
-
-    /* Average across M trajectories */
-    ss /= M;
-    n_total /= M;
-
-    if (n_total < 2.0)
-        return; /* Not enough data */
-
-    /* Posterior parameters */
-    double a_post = a0 + n_total / 2.0;
-    double b_post = b0 + ss / 2.0;
-
-    /* Sample from InvGamma(a_post, b_post) = 1/Gamma(a_post, 1/b_post) */
-    double gamma_sample;
-    vdRngGamma(VSL_RNG_METHOD_GAMMA_GNORM, stream, 1,
-               &gamma_sample, a_post, 0.0, 1.0 / b_post);
-
-    double sigma_h_sq = 1.0 / gamma_sample;
-    float sigma_h = sqrtf((float)sigma_h_sq);
-
-    /* Clamp to reasonable range */
-    if (sigma_h < 0.01f)
-        sigma_h = 0.01f;
-    if (sigma_h > 1.0f)
-        sigma_h = 1.0f;
-
-    pgas->model.sigma_h = sigma_h;
-    pgas->model.inv_sigma_h_sq = 1.0f / (sigma_h * sigma_h);
+    /* DEPRECATED: sigma_vol is now per-regime, aligned with RBPF.
+     * Shared sigma_h was confounded with OCSN observation noise.
+     * Use grid search over sigma_vol[k] instead. */
+    (void)state;
+    (void)stats;
+    (void)prior;
+    return;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -1261,8 +1196,6 @@ void pgas_paris_sample_phi(PGASParisState *state,
     const int K = pgas->K;
     const int T = pgas->T;
     const int M = state->n_trajectories;
-    const float sigma_h = pgas->model.sigma_h;
-    const float inv_sigma_h_sq = 1.0f / (sigma_h * sigma_h);
 
     VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
 
@@ -1278,8 +1211,9 @@ void pgas_paris_sample_phi(PGASParisState *state,
     float logit_prop = logit_curr + noise;
     float phi_prop = inv_logit(logit_prop, phi_min, phi_max);
 
-    /* Compute sum of squared residuals for current and proposed φ */
-    double ss_curr = 0.0, ss_prop = 0.0;
+    /* Compute sum of squared residuals for current and proposed φ
+     * Using per-regime sigma_vol[k] - weight each residual by 1/σ_vol[k]² */
+    double weighted_ss_curr = 0.0, weighted_ss_prop = 0.0;
 
     for (int m = 0; m < M; m++)
     {
@@ -1292,27 +1226,29 @@ void pgas_paris_sample_phi(PGASParisState *state,
             int z_t = traj[t];
             float h_t = h_cache[t];
             float mu_z = pgas->model.mu_vol[z_t];
+            float sigma_vol_z = pgas->model.sigma_vol[z_t];
+            float inv_sigma_vol_sq = 1.0f / (sigma_vol_z * sigma_vol_z);
 
             /* Current φ residual */
             float target_curr = mu_z * (1.0f - phi_curr) + phi_curr * h_prev;
             float resid_curr = h_t - target_curr;
-            ss_curr += resid_curr * resid_curr;
+            weighted_ss_curr += inv_sigma_vol_sq * resid_curr * resid_curr;
 
             /* Proposed φ residual */
             float target_prop = mu_z * (1.0f - phi_prop) + phi_prop * h_prev;
             float resid_prop = h_t - target_prop;
-            ss_prop += resid_prop * resid_prop;
+            weighted_ss_prop += inv_sigma_vol_sq * resid_prop * resid_prop;
 
             h_prev = h_t;
         }
     }
 
     /* Average across M trajectories */
-    ss_curr /= M;
-    ss_prop /= M;
+    weighted_ss_curr /= M;
+    weighted_ss_prop /= M;
 
-    /* Log acceptance ratio */
-    double log_lik_ratio = -0.5 * inv_sigma_h_sq * (ss_prop - ss_curr);
+    /* Log acceptance ratio (already weighted by per-regime variances) */
+    double log_lik_ratio = -0.5 * (weighted_ss_prop - weighted_ss_curr);
 
     double log_prior_curr = log_beta_density(phi_curr, phi_min, phi_max,
                                              prior->phi_prior_a, prior->phi_prior_b);
@@ -1355,9 +1291,16 @@ void pgas_paris_sample_phi(PGASParisState *state,
 
 float pgas_paris_get_sigma_h(const PGASParisState *state)
 {
+    /* DEPRECATED: Returns average sigma_vol for backward compatibility.
+     * Use pgas_paris_get_sigma_vol() for per-regime values. */
     if (!state || !state->pgas)
         return 0.0f;
-    return state->pgas->model.sigma_h;
+    float avg = 0.0f;
+    for (int k = 0; k < state->pgas->K; k++)
+    {
+        avg += state->pgas->model.sigma_vol[k];
+    }
+    return avg / state->pgas->K;
 }
 
 float pgas_paris_get_phi(const PGASParisState *state)

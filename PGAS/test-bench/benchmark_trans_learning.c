@@ -1,382 +1,335 @@
 /*═══════════════════════════════════════════════════════════════════════════════
- * Transition Matrix Learning Benchmark: PGAS vs PGAS-PARIS
+ * PGAS Transition Matrix Learner
  *
- * Compares speed and accuracy of Π estimation for runtime Lifeboat updates.
- * This is the "fast path" - μ_vol is fixed, only Π is learned.
+ * Purpose: Learn transition matrix from synthetic data, output copy-pasteable C.
  *
- * Metrics:
- *   - Time per sweep (μs)
- *   - Π Frobenius distance from ground truth
- *   - Π diagonal accuracy (stickiness)
- *   - Variance across multiple runs
+ * Data generation: EXACT copy from test_mmpf_comparison.c (8000 ticks, 7 scenarios)
+ * Volatility params: Your tuned values (fixed, not learned)
+ * Output: rbpf_real_t trans[16] = {...};
  *
  * Usage:
- *   ./benchmark_trans_learning [sweeps] [seed]
+ *   pgas_learn_trans [seed]
+ *   Default seed = 42 (matches your tuner)
  *
+ * Updated for per-regime sigma_vol API (ALIGNED WITH RBPF)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-#include "pgas_mkl.h"
-#include "pgas_paris.h"
-#include "mkl_tuning.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
+#include <stdint.h>
 
-#include <mkl.h>
-#include <mkl_vsl.h>
-
-#ifdef _WIN32
-#include <windows.h>
-static double get_time_ms(void) {
-    LARGE_INTEGER freq, counter;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
-}
-#else
-#include <sys/time.h>
-static double get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
-#endif
+#include "pgas_mkl.h"
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * CONFIGURATION
+ * CONFIGURATION - YOUR TUNED VALUES
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-#define DEFAULT_SEED 42
-#define DEFAULT_SWEEPS 100
-#define T_DATA 2000
-#define K_REGIMES 4
-#define M_TRAJECTORIES 8
-#define N_RUNS 5  /* Multiple runs for variance estimation */
+#define N_REGIMES 4
+#define N_PARTICLES 128
+#define N_BURNIN 300
+#define N_SAMPLES 500
+#define N_TICKS 8000
 
-/* Test configurations */
-static const int TEST_N[] = {32, 64};
-#define N_TEST_CONFIGS 2
+/* Your tuned volatility parameters (FIXED - PGAS only learns transitions) */
+static const double TUNED_MU_VOL[N_REGIMES] = {-4.50, -3.67, -2.83, -2.00};
+static const double TUNED_SIGMA_VOL[N_REGIMES] = {0.080, 0.267, 0.453, 0.640};
+static const double TUNED_PHI = 0.97;
 
-/* Ground truth parameters */
-static const float TRUE_MU_VOL[4] = {-4.50f, -3.67f, -2.83f, -2.00f};
-static const float TRUE_SIGMA_VOL[4] = {0.08f, 0.267f, 0.453f, 0.64f};
-static const float TRUE_PHI = 0.97f;
-static const float TRUE_SIGMA_H = 0.15f;
+/*═══════════════════════════════════════════════════════════════════════════════
+ * PCG32 RNG - EXACT COPY FROM test_mmpf_comparison.c
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
-/* True transition matrix (sticky) */
-static const double TRUE_TRANS[16] = {
-    0.95, 0.02, 0.02, 0.01,
-    0.02, 0.94, 0.02, 0.02,
-    0.02, 0.02, 0.94, 0.02,
-    0.01, 0.02, 0.02, 0.95
-};
-
-/* OCSN noise sampler */
-static float sample_ocsn_noise(VSLStreamStatePtr stream)
+typedef struct
 {
-    static const float Q[10] = {
-        0.00609f, 0.04775f, 0.13057f, 0.20674f, 0.22715f,
-        0.18842f, 0.12047f, 0.05591f, 0.01575f, 0.00115f
-    };
-    static const float M[10] = {
-        1.92677f, 1.34744f, 0.73504f, 0.02266f, -0.85173f,
-        -1.97278f, -3.46788f, -5.55246f, -8.68384f, -14.65000f
-    };
-    static const float S[10] = {
-        0.33563f, 0.42175f, 0.51737f, 0.63728f, 0.79183f,
-        0.99289f, 1.25487f, 1.59530f, 2.04106f, 2.70806f
-    };
-    
-    float u;
-    vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, 1, &u, 0.0f, 1.0f);
-    
-    int j = 9;
-    float cumsum = 0.0f;
-    for (int k = 0; k < 10; k++) {
-        cumsum += Q[k];
-        if (u < cumsum) { j = k; break; }
-    }
-    
-    float z;
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, M[j], S[j]);
-    return z;
+    uint64_t state;
+    uint64_t inc;
+} pcg32_t;
+
+static uint32_t pcg32_random(pcg32_t *rng)
+{
+    uint64_t oldstate = rng->state;
+    rng->state = oldstate * 6364136223846793005ULL + rng->inc;
+    uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
+    uint32_t rot = (uint32_t)(oldstate >> 59u);
+    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+}
+
+static double pcg32_double(pcg32_t *rng)
+{
+    return (double)pcg32_random(rng) / 4294967296.0;
+}
+
+static double pcg32_gaussian(pcg32_t *rng)
+{
+    double u1 = pcg32_double(rng);
+    double u2 = pcg32_double(rng);
+    if (u1 < 1e-10)
+        u1 = 1e-10;
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979 * u2);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * SYNTHETIC DATA
+ * HYPOTHESIS PARAMETERS - EXACT COPY FROM test_mmpf_comparison.c
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-typedef struct {
-    int T;
-    int *true_regimes;
-    float *true_h;
-    float *y;
+typedef enum
+{
+    HYPO_CALM = 0,
+    HYPO_TREND = 1,
+    HYPO_CRISIS = 2,
+    N_HYPOTHESES = 3
+} Hypothesis;
+
+typedef struct
+{
+    double mu_vol;
+    double phi;
+    double sigma_eta;
+} HypothesisParams;
+
+static const HypothesisParams TRUE_PARAMS[N_HYPOTHESES] = {
+    /* CALM: Low vol, high persistence, smooth */
+    {.mu_vol = -5.0, .phi = 0.995, .sigma_eta = 0.08},
+    /* TREND: Medium vol, medium persistence */
+    {.mu_vol = -3.5, .phi = 0.95, .sigma_eta = 0.20},
+    /* CRISIS: High vol, fast mean reversion, explosive */
+    {.mu_vol = -1.5, .phi = 0.85, .sigma_eta = 0.50}};
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * DATA GENERATION - EXACT COPY FROM test_mmpf_comparison.c
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+typedef struct
+{
+    double *returns;
+    double *log_sq_returns; /* y_t = log(r_t^2) for PGAS */
+    int n_ticks;
 } SyntheticData;
 
-static void generate_synthetic_data(SyntheticData *data, int T, uint32_t seed)
+static SyntheticData *generate_test_data(int seed)
 {
-    data->T = T;
-    data->true_regimes = (int*)malloc(T * sizeof(int));
-    data->true_h = (float*)malloc(T * sizeof(float));
-    data->y = (float*)malloc(T * sizeof(float));
-    
-    VSLStreamStatePtr stream;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
-    data->true_regimes[0] = 1;
-    data->true_h[0] = TRUE_MU_VOL[1];
-    
-    float *uniform = (float*)malloc(T * sizeof(float));
-    float *normal = (float*)malloc(T * sizeof(float));
-    
-    vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, T, uniform, 0.0f, 1.0f);
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, T, normal, 0.0f, TRUE_SIGMA_H);
-    
-    for (int t = 1; t < T; t++) {
-        int prev_regime = data->true_regimes[t-1];
-        float u = uniform[t];
-        float cumsum = 0.0f;
-        int new_regime = K_REGIMES - 1;
-        
-        for (int k = 0; k < K_REGIMES; k++) {
-            cumsum += (float)TRUE_TRANS[prev_regime * K_REGIMES + k];
-            if (u < cumsum) { new_regime = k; break; }
+    SyntheticData *data = (SyntheticData *)calloc(1, sizeof(SyntheticData));
+
+    int n = N_TICKS;
+    data->n_ticks = n;
+    data->returns = (double *)malloc(n * sizeof(double));
+    data->log_sq_returns = (double *)malloc(n * sizeof(double));
+
+    pcg32_t rng = {seed * 12345ULL + 1, seed * 67890ULL | 1};
+
+    /* Start in CALM */
+    double log_vol = TRUE_PARAMS[HYPO_CALM].mu_vol;
+    int t = 0;
+
+#define EVOLVE_STATE(H)                                                                       \
+    do                                                                                        \
+    {                                                                                         \
+        const HypothesisParams *p = &TRUE_PARAMS[H];                                          \
+        double theta = 1.0 - p->phi;                                                          \
+        log_vol = p->phi * log_vol + theta * p->mu_vol + p->sigma_eta * pcg32_gaussian(&rng); \
+        double vol = exp(log_vol);                                                            \
+        double ret = vol * pcg32_gaussian(&rng);                                              \
+        data->returns[t] = ret;                                                               \
+        /* Convert to OCSN observation: y = log(r^2) */                                       \
+        double r_sq = ret * ret;                                                              \
+        if (r_sq < 1e-20)                                                                     \
+            r_sq = 1e-20;                                                                     \
+        data->log_sq_returns[t] = log(r_sq);                                                  \
+    } while (0)
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * Scenario 1: Extended Calm (0-1499)
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (; t < 1500; t++)
+    {
+        EVOLVE_STATE(HYPO_CALM);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * Scenario 2: Slow Trend (1500-2499)
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (; t < 2500; t++)
+    {
+        Hypothesis h = (t < 1800) ? HYPO_CALM : HYPO_TREND;
+        EVOLVE_STATE(h);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * Scenario 3: Sudden Crisis (2500-2999)
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (; t < 3000; t++)
+    {
+        EVOLVE_STATE(HYPO_CRISIS);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * Scenario 4: Crisis Persistence (3000-3999)
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (; t < 4000; t++)
+    {
+        EVOLVE_STATE(HYPO_CRISIS);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * Scenario 5: Recovery (4000-5199)
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (; t < 5200; t++)
+    {
+        Hypothesis h;
+        if (t < 4400)
+            h = HYPO_CRISIS;
+        else if (t < 4800)
+            h = HYPO_TREND;
+        else
+            h = HYPO_CALM;
+        EVOLVE_STATE(h);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * Scenario 6: Flash Crash (5200-5699)
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (; t < 5700; t++)
+    {
+        Hypothesis h;
+        if (t >= 5350 && t < 5410)
+            h = HYPO_CRISIS;
+        else
+            h = HYPO_CALM;
+        EVOLVE_STATE(h);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * Scenario 7: Choppy (5700-7999)
+     *═══════════════════════════════════════════════════════════════════════*/
+    Hypothesis current_h = HYPO_TREND;
+    int next_switch = 5700 + 80 + (int)(pcg32_double(&rng) * 120);
+
+    for (; t < N_TICKS; t++)
+    {
+        if (t >= next_switch)
+        {
+            int delta = (pcg32_double(&rng) < 0.5) ? -1 : 1;
+            current_h = (Hypothesis)((current_h + delta + N_HYPOTHESES) % N_HYPOTHESES);
+            next_switch = t + 80 + (int)(pcg32_double(&rng) * 150);
         }
-        data->true_regimes[t] = new_regime;
-        
-        float mu_k = TRUE_MU_VOL[new_regime];
-        data->true_h[t] = mu_k * (1.0f - TRUE_PHI) + TRUE_PHI * data->true_h[t-1] + normal[t];
+        EVOLVE_STATE(current_h);
     }
-    
-    for (int t = 0; t < T; t++) {
-        data->y[t] = data->true_h[t] + sample_ocsn_noise(stream);
-    }
-    
-    free(uniform);
-    free(normal);
-    vslDeleteStream(&stream);
+
+#undef EVOLVE_STATE
+
+    return data;
 }
 
-static void free_synthetic_data(SyntheticData *data)
+static void free_data(SyntheticData *data)
 {
-    free(data->true_regimes);
-    free(data->true_h);
-    free(data->y);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════════
- * METRICS
- *═══════════════════════════════════════════════════════════════════════════════*/
-
-static double frobenius_distance(const float *A, const double *B, int K)
-{
-    double sum = 0.0;
-    for (int i = 0; i < K * K; i++) {
-        double diff = (double)A[i] - B[i];
-        sum += diff * diff;
-    }
-    return sqrt(sum);
-}
-
-static double avg_diagonal(const float *trans, int K)
-{
-    double sum = 0.0;
-    for (int k = 0; k < K; k++) {
-        sum += trans[k * K + k];
-    }
-    return sum / K;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════════
- * BENCHMARK RESULTS
- *═══════════════════════════════════════════════════════════════════════════════*/
-
-typedef struct {
-    double time_ms;
-    double time_per_sweep_us;
-    double frobenius;
-    double avg_diag;
-    float trans[16];
-} RunResult;
-
-typedef struct {
-    int N;
-    int sweeps;
-    
-    /* Aggregated over N_RUNS */
-    double avg_time_ms;
-    double std_time_ms;
-    double avg_time_per_sweep_us;
-    double avg_frobenius;
-    double std_frobenius;
-    double avg_diag;
-    
-    RunResult runs[N_RUNS];
-} BenchmarkResult;
-
-/*═══════════════════════════════════════════════════════════════════════════════
- * VANILLA PGAS BENCHMARK
- *═══════════════════════════════════════════════════════════════════════════════*/
-
-static void benchmark_vanilla_pgas(
-    const SyntheticData *data,
-    int N, int sweeps, uint32_t seed,
-    BenchmarkResult *result)
-{
-    result->N = N;
-    result->sweeps = sweeps;
-    
-    double *obs_d = (double*)malloc(T_DATA * sizeof(double));
-    for (int t = 0; t < T_DATA; t++) obs_d[t] = (double)data->y[t];
-    
-    double init_trans[16];
-    for (int i = 0; i < K_REGIMES; i++) {
-        for (int j = 0; j < K_REGIMES; j++) {
-            init_trans[i * K_REGIMES + j] = (i == j) ? 0.85 : 0.05;
-        }
-    }
-    
-    double mu_vol_d[4], sigma_vol_d[4];
-    for (int k = 0; k < 4; k++) {
-        mu_vol_d[k] = TRUE_MU_VOL[k];  /* Fixed - not learning */
-        sigma_vol_d[k] = TRUE_SIGMA_VOL[k];
-    }
-    
-    for (int run = 0; run < N_RUNS; run++) {
-        PGASMKLState *pgas = pgas_mkl_alloc(N, T_DATA, K_REGIMES, seed + run * 1000);
-        pgas_mkl_set_model(pgas, init_trans, mu_vol_d, sigma_vol_d, TRUE_PHI, TRUE_SIGMA_H);
-        pgas_mkl_set_transition_prior(pgas, 1.0f, 50.0f);
-        pgas_mkl_load_observations(pgas, obs_d, T_DATA);
-        
-        /* Initialize reference with true trajectory */
-        double *init_h = (double*)malloc(T_DATA * sizeof(double));
-        for (int t = 0; t < T_DATA; t++) init_h[t] = data->true_h[t];
-        pgas_mkl_set_reference(pgas, data->true_regimes, init_h, T_DATA);
-        
-        double start = get_time_ms();
-        
-        for (int s = 0; s < sweeps; s++) {
-            pgas_mkl_csmc_sweep(pgas);
-            pgas_mkl_sample_transitions(pgas);
-        }
-        
-        double end = get_time_ms();
-        
-        result->runs[run].time_ms = end - start;
-        result->runs[run].time_per_sweep_us = (end - start) * 1000.0 / sweeps;
-        result->runs[run].frobenius = frobenius_distance(pgas->model.trans, TRUE_TRANS, K_REGIMES);
-        result->runs[run].avg_diag = avg_diagonal(pgas->model.trans, K_REGIMES);
-        memcpy(result->runs[run].trans, pgas->model.trans, 16 * sizeof(float));
-        
-        free(init_h);
-        pgas_mkl_free(pgas);
-    }
-    
-    /* Aggregate */
-    double sum_time = 0, sum_time_sq = 0;
-    double sum_frob = 0, sum_frob_sq = 0;
-    double sum_diag = 0;
-    
-    for (int r = 0; r < N_RUNS; r++) {
-        sum_time += result->runs[r].time_ms;
-        sum_time_sq += result->runs[r].time_ms * result->runs[r].time_ms;
-        sum_frob += result->runs[r].frobenius;
-        sum_frob_sq += result->runs[r].frobenius * result->runs[r].frobenius;
-        sum_diag += result->runs[r].avg_diag;
-    }
-    
-    result->avg_time_ms = sum_time / N_RUNS;
-    result->std_time_ms = sqrt(sum_time_sq / N_RUNS - result->avg_time_ms * result->avg_time_ms);
-    result->avg_time_per_sweep_us = result->avg_time_ms * 1000.0 / sweeps;
-    result->avg_frobenius = sum_frob / N_RUNS;
-    result->std_frobenius = sqrt(sum_frob_sq / N_RUNS - result->avg_frobenius * result->avg_frobenius);
-    result->avg_diag = sum_diag / N_RUNS;
-    
-    free(obs_d);
+    if (!data)
+        return;
+    free(data->returns);
+    free(data->log_sq_returns);
+    free(data);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * PGAS-PARIS BENCHMARK
+ * REFERENCE TRAJECTORY INITIALIZATION (from observations only)
+ *
+ * Simple heuristic: assign regime based on observation magnitude
+ * This washes out after burn-in anyway
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-static void benchmark_pgas_paris(
-    const SyntheticData *data,
-    int N, int sweeps, uint32_t seed,
-    BenchmarkResult *result)
+static void init_reference_from_observations(
+    const double *y, /* log-squared returns */
+    int T,
+    int K,
+    const double *mu_vol, /* regime means */
+    double phi,
+    int *out_regimes,
+    double *out_h)
 {
-    result->N = N;
-    result->sweeps = sweeps;
-    
-    double *obs_d = (double*)malloc(T_DATA * sizeof(double));
-    for (int t = 0; t < T_DATA; t++) obs_d[t] = (double)data->y[t];
-    
-    double init_trans[16];
-    for (int i = 0; i < K_REGIMES; i++) {
-        for (int j = 0; j < K_REGIMES; j++) {
-            init_trans[i * K_REGIMES + j] = (i == j) ? 0.85 : 0.05;
+    /*
+     * Simple assignment: Pick regime whose mu_vol is closest to observation
+     * Then set h = observation (crude but burn-in will fix it)
+     */
+    for (int t = 0; t < T; t++)
+    {
+        double obs = y[t];
+
+        /* Find closest regime by mu_vol */
+        int best_k = 0;
+        double best_dist = fabs(obs - mu_vol[0]);
+        for (int k = 1; k < K; k++)
+        {
+            double dist = fabs(obs - mu_vol[k]);
+            if (dist < best_dist)
+            {
+                best_dist = dist;
+                best_k = k;
+            }
         }
+
+        out_regimes[t] = best_k;
+        out_h[t] = mu_vol[best_k]; /* Start at regime mean */
     }
-    
-    double mu_vol_d[4], sigma_vol_d[4];
-    for (int k = 0; k < 4; k++) {
-        mu_vol_d[k] = TRUE_MU_VOL[k];
-        sigma_vol_d[k] = TRUE_SIGMA_VOL[k];
+
+    /* Smooth h with simple AR(1) pass */
+    for (int t = 1; t < T; t++)
+    {
+        out_h[t] = phi * out_h[t - 1] + (1.0 - phi) * mu_vol[out_regimes[t]];
     }
-    
-    for (int run = 0; run < N_RUNS; run++) {
-        PGASMKLState *pgas = pgas_mkl_alloc(N, T_DATA, K_REGIMES, seed + run * 1000);
-        pgas_mkl_set_model(pgas, init_trans, mu_vol_d, sigma_vol_d, TRUE_PHI, TRUE_SIGMA_H);
-        pgas_mkl_set_transition_prior(pgas, 1.0f, 50.0f);
-        pgas_mkl_load_observations(pgas, obs_d, T_DATA);
-        
-        double *init_h = (double*)malloc(T_DATA * sizeof(double));
-        for (int t = 0; t < T_DATA; t++) init_h[t] = data->true_h[t];
-        pgas_mkl_set_reference(pgas, data->true_regimes, init_h, T_DATA);
-        
-        PGASParisState *pp = pgas_paris_alloc(pgas, M_TRAJECTORIES);
-        
-        double start = get_time_ms();
-        
-        for (int s = 0; s < sweeps; s++) {
-            pgas_paris_gibbs_sweep(pp);  /* CSMC + PARIS backward + Π sampling */
-        }
-        
-        double end = get_time_ms();
-        
-        result->runs[run].time_ms = end - start;
-        result->runs[run].time_per_sweep_us = (end - start) * 1000.0 / sweeps;
-        result->runs[run].frobenius = frobenius_distance(pgas->model.trans, TRUE_TRANS, K_REGIMES);
-        result->runs[run].avg_diag = avg_diagonal(pgas->model.trans, K_REGIMES);
-        memcpy(result->runs[run].trans, pgas->model.trans, 16 * sizeof(float));
-        
-        pgas_paris_free(pp);
-        free(init_h);
-        pgas_mkl_free(pgas);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * ENSEMBLE ACCUMULATOR
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+typedef struct
+{
+    int K;
+    int n_samples;
+    double trans_sum[16];
+    double trans_sum_sq[16];
+} Ensemble;
+
+static void ensemble_init(Ensemble *ens, int K)
+{
+    memset(ens, 0, sizeof(Ensemble));
+    ens->K = K;
+}
+
+static void ensemble_accumulate(Ensemble *ens, const float *trans)
+{
+    int K = ens->K;
+    ens->n_samples++;
+    for (int i = 0; i < K * K; i++)
+    {
+        ens->trans_sum[i] += trans[i];
+        ens->trans_sum_sq[i] += trans[i] * trans[i];
     }
-    
-    /* Aggregate */
-    double sum_time = 0, sum_time_sq = 0;
-    double sum_frob = 0, sum_frob_sq = 0;
-    double sum_diag = 0;
-    
-    for (int r = 0; r < N_RUNS; r++) {
-        sum_time += result->runs[r].time_ms;
-        sum_time_sq += result->runs[r].time_ms * result->runs[r].time_ms;
-        sum_frob += result->runs[r].frobenius;
-        sum_frob_sq += result->runs[r].frobenius * result->runs[r].frobenius;
-        sum_diag += result->runs[r].avg_diag;
+}
+
+static void ensemble_get_mean(const Ensemble *ens, float *out)
+{
+    int n = ens->n_samples;
+    if (n == 0)
+        return;
+    for (int i = 0; i < ens->K * ens->K; i++)
+    {
+        out[i] = (float)(ens->trans_sum[i] / n);
     }
-    
-    result->avg_time_ms = sum_time / N_RUNS;
-    result->std_time_ms = sqrt(sum_time_sq / N_RUNS - result->avg_time_ms * result->avg_time_ms);
-    result->avg_time_per_sweep_us = result->avg_time_ms * 1000.0 / sweeps;
-    result->avg_frobenius = sum_frob / N_RUNS;
-    result->std_frobenius = sqrt(sum_frob_sq / N_RUNS - result->avg_frobenius * result->avg_frobenius);
-    result->avg_diag = sum_diag / N_RUNS;
-    
-    free(obs_d);
+}
+
+static double ensemble_get_std(const Ensemble *ens, int i, int j)
+{
+    int n = ens->n_samples;
+    if (n < 2)
+        return 0.0;
+    int idx = i * ens->K + j;
+    double mean = ens->trans_sum[idx] / n;
+    double var = (ens->trans_sum_sq[idx] / n) - (mean * mean);
+    if (var < 0)
+        var = 0;
+    return sqrt(var);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -385,167 +338,204 @@ static void benchmark_pgas_paris(
 
 int main(int argc, char **argv)
 {
-    int sweeps = DEFAULT_SWEEPS;
-    uint32_t seed = DEFAULT_SEED;
-    
-    if (argc > 1) sweeps = atoi(argv[1]);
-    if (argc > 2) seed = (uint32_t)atoi(argv[2]);
-    
-    /* Initialize MKL tuning */
-    mkl_tuning_init(8, 1);
-    
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════\n");
-    printf("  Transition Matrix Learning Benchmark: PGAS vs PGAS-PARIS\n");
-    printf("═══════════════════════════════════════════════════════════════════════════\n\n");
-    
-    printf("Configuration:\n");
-    printf("  T (timesteps):         %d\n", T_DATA);
-    printf("  K (regimes):           %d\n", K_REGIMES);
-    printf("  Sweeps:                %d\n", sweeps);
-    printf("  PARIS trajectories:    %d\n", M_TRAJECTORIES);
-    printf("  Runs per config:       %d\n", N_RUNS);
-    printf("  Seed:                  %u\n", seed);
-    
-    printf("\nTrue Π diagonal:         [0.95, 0.94, 0.94, 0.95]\n");
-    
-    /* Generate data once */
-    printf("\nGenerating synthetic data...\n");
-    SyntheticData data;
-    generate_synthetic_data(&data, T_DATA, seed);
-    
-    /* Results storage */
-    BenchmarkResult pgas_results[N_TEST_CONFIGS];
-    BenchmarkResult paris_results[N_TEST_CONFIGS];
-    
-    /* Run benchmarks */
-    for (int c = 0; c < N_TEST_CONFIGS; c++) {
-        int N = TEST_N[c];
-        
-        printf("\n───────────────────────────────────────────────────────────────────────────\n");
-        printf("  N = %d particles\n", N);
-        printf("───────────────────────────────────────────────────────────────────────────\n");
-        
-        printf("  Running Vanilla PGAS (%d runs)...\n", N_RUNS);
-        benchmark_vanilla_pgas(&data, N, sweeps, seed, &pgas_results[c]);
-        printf("    Avg time: %.1f ms (%.1f μs/sweep)\n", 
-               pgas_results[c].avg_time_ms, pgas_results[c].avg_time_per_sweep_us);
-        
-        printf("  Running PGAS-PARIS (%d runs)...\n", N_RUNS);
-        benchmark_pgas_paris(&data, N, sweeps, seed, &paris_results[c]);
-        printf("    Avg time: %.1f ms (%.1f μs/sweep)\n",
-               paris_results[c].avg_time_ms, paris_results[c].avg_time_per_sweep_us);
+    int seed = 42;
+    if (argc > 1)
+        seed = atoi(argv[1]);
+
+    printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
+    printf("║           PGAS Transition Matrix Learner                             ║\n");
+    printf("╠═══════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Seed: %-5d                                                         ║\n", seed);
+    printf("║  Data: 8000 ticks (same as test_mmpf_comparison)                     ║\n");
+    printf("║  K=4, Particles=%d, Burn-in=%d, Samples=%d                        ║\n",
+           N_PARTICLES, N_BURNIN, N_SAMPLES);
+    printf("╚═══════════════════════════════════════════════════════════════════════╝\n\n");
+
+    /* Generate data */
+    printf("Generating synthetic data (seed=%d)...\n", seed);
+    SyntheticData *data = generate_test_data(seed);
+    printf("  %d ticks generated\n\n", data->n_ticks);
+
+    /* Allocate PGAS */
+    printf("Initializing PGAS...\n");
+    PGASMKLState *pgas = pgas_mkl_alloc(N_PARTICLES, N_TICKS, N_REGIMES, seed + 1000);
+    if (!pgas)
+    {
+        fprintf(stderr, "ERROR: Failed to allocate PGAS\n");
+        free_data(data);
+        return 1;
     }
-    
-    /* Summary table */
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════\n");
-    printf("  RESULTS SUMMARY (%d sweeps, %d runs averaged)\n", sweeps, N_RUNS);
-    printf("═══════════════════════════════════════════════════════════════════════════\n\n");
-    
-    printf("┌────────┬─────────────────────────────────────┬─────────────────────────────────────┐\n");
-    printf("│   N    │          Vanilla PGAS               │            PGAS-PARIS               │\n");
-    printf("├────────┼──────────┬──────────┬───────┬───────┼──────────┬──────────┬───────┬───────┤\n");
-    printf("│        │ Time(ms) │  μs/swp  │ Frob  │ Diag  │ Time(ms) │  μs/swp  │ Frob  │ Diag  │\n");
-    printf("├────────┼──────────┼──────────┼───────┼───────┼──────────┼──────────┼───────┼───────┤\n");
-    
-    for (int c = 0; c < N_TEST_CONFIGS; c++) {
-        printf("│   %2d   │ %7.1f  │ %7.0f  │ %5.3f │ %5.3f │ %7.1f  │ %7.0f  │ %5.3f │ %5.3f │\n",
-               TEST_N[c],
-               pgas_results[c].avg_time_ms,
-               pgas_results[c].avg_time_per_sweep_us,
-               pgas_results[c].avg_frobenius,
-               pgas_results[c].avg_diag,
-               paris_results[c].avg_time_ms,
-               paris_results[c].avg_time_per_sweep_us,
-               paris_results[c].avg_frobenius,
-               paris_results[c].avg_diag);
+
+    /* Set model with YOUR tuned volatility params */
+    /* Start with uniform transitions - PGAS will learn */
+    double init_trans[16];
+    for (int i = 0; i < N_REGIMES; i++)
+    {
+        for (int j = 0; j < N_REGIMES; j++)
+        {
+            init_trans[i * N_REGIMES + j] = (i == j) ? 0.85 : 0.05;
+        }
     }
-    
-    printf("└────────┴──────────┴──────────┴───────┴───────┴──────────┴──────────┴───────┴───────┘\n");
-    
-    /* Speedup and accuracy comparison */
-    printf("\n");
-    printf("┌────────┬────────────────┬────────────────┬─────────────────────────────────────────┐\n");
-    printf("│   N    │ PARIS Slowdown │ Frob Δ (lower  │                 Winner                  │\n");
-    printf("│        │   vs PGAS      │   = better)    │                                         │\n");
-    printf("├────────┼────────────────┼────────────────┼─────────────────────────────────────────┤\n");
-    
-    for (int c = 0; c < N_TEST_CONFIGS; c++) {
-        double slowdown = paris_results[c].avg_time_ms / pgas_results[c].avg_time_ms;
-        double frob_diff = pgas_results[c].avg_frobenius - paris_results[c].avg_frobenius;
-        const char *winner = (frob_diff > 0.01) ? "PARIS (more accurate)" :
-                             (frob_diff < -0.01) ? "PGAS (more accurate)" : "TIE";
-        
-        printf("│   %2d   │     %.2fx       │    %+.3f       │ %-39s │\n",
-               TEST_N[c], slowdown, frob_diff, winner);
+
+    /* Updated API: no sigma_h argument (per-regime sigma_vol is used) */
+    pgas_mkl_set_model(pgas, init_trans, TUNED_MU_VOL, TUNED_SIGMA_VOL, TUNED_PHI);
+
+    /* Set transition prior: κ=50 + adaptive (capped at 150) */
+    pgas_mkl_set_transition_prior(pgas, 1.0f, 50.0f);
+    pgas_mkl_enable_adaptive_kappa(pgas, 1);
+    pgas_mkl_configure_adaptive_kappa(pgas, 30.0f, 150.0f, 0.0f, 0.0f);
+
+    printf("  mu_vol  = {%.2f, %.2f, %.2f, %.2f}\n",
+           TUNED_MU_VOL[0], TUNED_MU_VOL[1], TUNED_MU_VOL[2], TUNED_MU_VOL[3]);
+    printf("  sigma_vol = {%.3f, %.3f, %.3f, %.3f}\n",
+           TUNED_SIGMA_VOL[0], TUNED_SIGMA_VOL[1], TUNED_SIGMA_VOL[2], TUNED_SIGMA_VOL[3]);
+    printf("  phi=%.2f\n", TUNED_PHI);
+    printf("  κ=50 (adaptive, max=150)\n\n");
+
+    /* Load observations */
+    pgas_mkl_load_observations(pgas, data->log_sq_returns, N_TICKS);
+
+    /* Initialize reference trajectory from observations (no ground truth) */
+    printf("Initializing reference trajectory from observations...\n");
+    int *init_regimes = (int *)malloc(N_TICKS * sizeof(int));
+    double *init_h = (double *)malloc(N_TICKS * sizeof(double));
+
+    init_reference_from_observations(data->log_sq_returns, N_TICKS, N_REGIMES,
+                                     TUNED_MU_VOL, TUNED_PHI,
+                                     init_regimes, init_h);
+
+    pgas_mkl_set_reference(pgas, init_regimes, init_h, N_TICKS);
+    free(init_regimes);
+    free(init_h);
+
+    /* Burn-in */
+    printf("\nBurn-in (%d sweeps)...\n", N_BURNIN);
+    for (int i = 0; i < N_BURNIN; i++)
+    {
+        pgas_mkl_gibbs_sweep(pgas);
+        if ((i + 1) % 100 == 0)
+        {
+            printf("  Sweep %d: κ=%.1f, chatter=%.2f, accept=%.3f\n",
+                   i + 1,
+                   pgas_mkl_get_sticky_kappa(pgas),
+                   pgas_mkl_get_chatter_ratio(pgas),
+                   pgas_mkl_get_acceptance_rate(pgas));
+        }
     }
-    
-    printf("└────────┴────────────────┴────────────────┴─────────────────────────────────────────┘\n");
-    
-    /* Variance comparison */
-    printf("\n");
-    printf("Estimation Variance (Frobenius std):\n");
-    for (int c = 0; c < N_TEST_CONFIGS; c++) {
-        printf("  N=%2d: PGAS=%.4f, PARIS=%.4f  %s\n",
-               TEST_N[c],
-               pgas_results[c].std_frobenius,
-               paris_results[c].std_frobenius,
-               paris_results[c].std_frobenius < pgas_results[c].std_frobenius ? 
-               "(PARIS more stable)" : "(PGAS more stable)");
+
+    /* Sampling */
+    printf("\nSampling (%d sweeps)...\n", N_SAMPLES);
+    Ensemble ens;
+    ensemble_init(&ens, N_REGIMES);
+
+    float trans_current[16];
+
+    for (int i = 0; i < N_SAMPLES; i++)
+    {
+        pgas_mkl_gibbs_sweep(pgas);
+        pgas_mkl_get_transitions(pgas, trans_current, N_REGIMES);
+        ensemble_accumulate(&ens, trans_current);
+
+        if ((i + 1) % 100 == 0)
+        {
+            printf("  Sample %d: κ=%.1f, chatter=%.2f\n",
+                   i + 1,
+                   pgas_mkl_get_sticky_kappa(pgas),
+                   pgas_mkl_get_chatter_ratio(pgas));
+        }
     }
-    
-    /* Best learned Π from PARIS */
+
+    /* Get posterior mean */
+    float trans_learned[16];
+    ensemble_get_mean(&ens, trans_learned);
+
+    /* Results */
     printf("\n");
-    printf("Best PARIS Learned Π (N=%d, run 0):\n", TEST_N[0]);
-    for (int i = 0; i < K_REGIMES; i++) {
+    printf("═══════════════════════════════════════════════════════════════════════\n");
+    printf("RESULTS\n");
+    printf("═══════════════════════════════════════════════════════════════════════\n\n");
+
+    printf("Final κ: %.1f\n", pgas_mkl_get_sticky_kappa(pgas));
+    printf("Final chatter: %.2f\n", pgas_mkl_get_chatter_ratio(pgas));
+    printf("Final acceptance: %.3f\n\n", pgas_mkl_get_acceptance_rate(pgas));
+
+    printf("Learned transition matrix (mean ± std):\n");
+    for (int i = 0; i < N_REGIMES; i++)
+    {
         printf("  [");
-        for (int j = 0; j < K_REGIMES; j++) {
-            printf(" %5.3f", paris_results[0].runs[0].trans[i * K_REGIMES + j]);
+        for (int j = 0; j < N_REGIMES; j++)
+        {
+            float mean = trans_learned[i * N_REGIMES + j];
+            double std = ensemble_get_std(&ens, i, j);
+            printf(" %.4f±%.3f", mean, std);
         }
         printf(" ]\n");
     }
-    
-    printf("\nTrue Π:\n");
-    for (int i = 0; i < K_REGIMES; i++) {
-        printf("  [");
-        for (int j = 0; j < K_REGIMES; j++) {
-            printf(" %5.3f", TRUE_TRANS[i * K_REGIMES + j]);
-        }
-        printf(" ]\n");
+
+    printf("\nDiagonal (stickiness): %.4f, %.4f, %.4f, %.4f\n",
+           trans_learned[0], trans_learned[5], trans_learned[10], trans_learned[15]);
+
+    float avg_diag = (trans_learned[0] + trans_learned[5] +
+                      trans_learned[10] + trans_learned[15]) /
+                     4.0f;
+    printf("Average diagonal: %.4f\n", avg_diag);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * COPY-PASTEABLE OUTPUT
+     * ═══════════════════════════════════════════════════════════════════════*/
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════════════\n");
+    printf("COPY-PASTE THIS INTO test_mmpf_comparison.c:\n");
+    printf("═══════════════════════════════════════════════════════════════════════\n\n");
+
+    printf("/* PGAS-learned transition matrix (seed=%d, %d ticks, κ_final=%.1f) */\n",
+           seed, N_TICKS, pgas_mkl_get_sticky_kappa(pgas));
+    printf("rbpf_real_t trans[16] = {\n");
+    printf("    %.4ff, %.4ff, %.4ff, %.4ff,\n",
+           trans_learned[0], trans_learned[1], trans_learned[2], trans_learned[3]);
+    printf("    %.4ff, %.4ff, %.4ff, %.4ff,\n",
+           trans_learned[4], trans_learned[5], trans_learned[6], trans_learned[7]);
+    printf("    %.4ff, %.4ff, %.4ff, %.4ff,\n",
+           trans_learned[8], trans_learned[9], trans_learned[10], trans_learned[11]);
+    printf("    %.4ff, %.4ff, %.4ff, %.4ff\n",
+           trans_learned[12], trans_learned[13], trans_learned[14], trans_learned[15]);
+    printf("};\n");
+
+    printf("\n═══════════════════════════════════════════════════════════════════════\n");
+
+    /* Compare to your tuned matrix for reference */
+    printf("\nFor reference, your TUNED matrix was:\n");
+    printf("rbpf_real_t trans[16] = {\n");
+    printf("    0.920f, 0.056f, 0.020f, 0.004f,\n");
+    printf("    0.032f, 0.920f, 0.036f, 0.012f,\n");
+    printf("    0.012f, 0.036f, 0.920f, 0.032f,\n");
+    printf("    0.004f, 0.020f, 0.056f, 0.920f\n");
+    printf("};\n");
+
+    /* Frobenius distance */
+    float tuned[16] = {
+        0.920f, 0.056f, 0.020f, 0.004f,
+        0.032f, 0.920f, 0.036f, 0.012f,
+        0.012f, 0.036f, 0.920f, 0.032f,
+        0.004f, 0.020f, 0.056f, 0.920f};
+
+    double frob = 0;
+    for (int i = 0; i < 16; i++)
+    {
+        double diff = trans_learned[i] - tuned[i];
+        frob += diff * diff;
     }
-    
-    /* Recommendations */
-    printf("\n═══════════════════════════════════════════════════════════════════════════\n");
-    printf("  RECOMMENDATIONS FOR PRODUCTION\n");
-    printf("═══════════════════════════════════════════════════════════════════════════\n\n");
-    
-    int best_n = TEST_N[0];
-    double best_paris_time = paris_results[0].avg_time_ms;
-    
-    for (int c = 1; c < N_TEST_CONFIGS; c++) {
-        if (paris_results[c].avg_frobenius < paris_results[0].avg_frobenius * 0.9) {
-            /* Significantly better accuracy */
-            best_n = TEST_N[c];
-            best_paris_time = paris_results[c].avg_time_ms;
-        }
-    }
-    
-    printf("  For Lifeboat Π updates (accuracy priority):\n");
-    printf("    → Use PGAS-PARIS with N=%d, %d sweeps\n", best_n, sweeps);
-    printf("    → Expected time: %.0f ms\n", best_paris_time);
-    printf("    → Time per sweep: %.0f μs\n\n", best_paris_time * 1000.0 / sweeps);
-    
-    printf("  For fast Π updates (speed priority):\n");
-    printf("    → Use Vanilla PGAS with N=%d, %d sweeps\n", TEST_N[0], sweeps);
-    printf("    → Expected time: %.0f ms\n", pgas_results[0].avg_time_ms);
-    printf("    → Time per sweep: %.0f μs\n", pgas_results[0].avg_time_per_sweep_us);
-    
-    printf("\n═══════════════════════════════════════════════════════════════════════════\n");
-    
+    frob = sqrt(frob);
+
+    printf("\nFrobenius distance (PGAS vs Tuned): %.4f\n", frob);
+
     /* Cleanup */
-    free_synthetic_data(&data);
-    mkl_tuning_cleanup();
-    
+    pgas_mkl_free(pgas);
+    free_data(data);
+
+    printf("\n╔═══════════════════════════════════════════════════════════════════════╗\n");
+    printf("║  Done! Paste the learned matrix into your test and compare.          ║\n");
+    printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
+
     return 0;
 }

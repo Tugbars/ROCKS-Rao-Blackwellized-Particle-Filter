@@ -288,32 +288,33 @@ int rbpf_ext_enable_smoothed_storvik(RBPF_Extended *ext, int lag)
         return -1;
     }
     
-    /*───────────────────────────────────────────────────────────────────────
+   /*───────────────────────────────────────────────────────────────────────
      * Sync model parameters from RBPF to smoother
      *
-     * PARIS needs: transition matrix, μ_vol per regime, φ, σ_h
+     * PARIS needs: transition matrix, μ_vol per regime, σ_vol per regime, φ
+     * 
+     * ALIGNED WITH RBPF: Uses per-regime sigma_vol[k] for AR process noise.
      *───────────────────────────────────────────────────────────────────────*/
     double mu_vol[RBPF_MAX_REGIMES];
+    double sigma_vol[RBPF_MAX_REGIMES];
     double trans_d[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
-    double phi = 0.0, sigma_h = 0.0;
+    double phi = 0.0;
     
     const int nr = ext->rbpf->n_regimes;
     
     for (int r = 0; r < nr; r++) {
         mu_vol[r] = (double)ext->rbpf->params[r].mu_vol;
-        /* Average phi and sigma_h across regimes (they should be similar) */
+        sigma_vol[r] = (double)ext->rbpf->params[r].sigma_vol;  /* Per-regime! */
         phi += (double)(1.0f - ext->rbpf->params[r].theta);
-        sigma_h += (double)ext->rbpf->params[r].sigma_vol;
     }
-    phi /= nr;
-    sigma_h /= nr;
+    phi /= nr;  /* phi is shared across regimes */
     
     /* Copy base transition matrix */
     for (int i = 0; i < nr * nr; i++) {
         trans_d[i] = (double)ext->base_trans_matrix[i];
     }
     
-    fls_set_model(ext->smoother, trans_d, mu_vol, phi, sigma_h);
+    fls_set_model(ext->smoother, trans_d, mu_vol, sigma_vol, phi);
     
     /* Enable */
     ext->smoothed_storvik_enabled = 1;

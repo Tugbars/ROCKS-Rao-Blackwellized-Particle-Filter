@@ -232,15 +232,14 @@ int main(int argc, char **argv)
     double init_sigma_vol[4];
     for (int k = 0; k < K_REGIMES; k++)
     {
-        init_sigma_vol[k] = TRUE_SIGMA_VOL[k]; /* Use true values */
+        init_sigma_vol[k] = TRUE_SIGMA_VOL[k]; /* Per-regime AR process noise */
     }
 
-    /* Allocate PGAS state - start with WRONG φ and σ_h to test learning */
-    float init_phi = 0.90f;     /* Wrong - true is 0.97 */
-    float init_sigma_h = 0.25f; /* Wrong - true is 0.15 */
+    /* Allocate PGAS state - start with WRONG φ to test learning */
+    float init_phi = 0.90f; /* Wrong - true is 0.97 */
 
     PGASMKLState *pgas = pgas_mkl_alloc(N_PARTICLES, T_DATA, K_REGIMES, seed);
-    pgas_mkl_set_model(pgas, init_trans, init_mu_vol, init_sigma_vol, init_phi, init_sigma_h);
+    pgas_mkl_set_model(pgas, init_trans, init_mu_vol, init_sigma_vol, init_phi);
     pgas_mkl_set_transition_prior(pgas, 1.0f, 50.0f);
     pgas_mkl_enable_adaptive_kappa(pgas, 1);
     pgas_mkl_configure_adaptive_kappa(pgas, 20.0f, 150.0f, 0.0f, 0.0f);
@@ -262,33 +261,31 @@ int main(int argc, char **argv)
     /* FULL LEARNING: Attempt to learn ALL parameters
      *
      * This test explores learning everything to document:
-     *   ✅ μ_vol: Learns well
+     *   ✅ μ_vol: Learns well (PGAS-PARIS conjugate)
      *   ⚠️ φ: Learns but requires MH tuning
-     *   ❌ σ_h: Confounded with OCSN noise
+     *   ❌ σ_h: DEPRECATED - now per-regime sigma_vol (use grid search)
      *
      * Results show why production uses only μ_vol learning.
      */
     prior.learn_mu = 1;
-    prior.learn_sigma = 0;   /* Conflicts with σ_h */
-    prior.learn_sigma_h = 1; /* Try to learn */
+    prior.learn_sigma = 0;   /* sigma_vol is now AR process noise */
+    prior.learn_sigma_h = 0; /* DEPRECATED: sigma_vol is per-regime now */
     prior.learn_phi = 1;     /* Try to learn */
     prior.enforce_ordering = 1;
 
     /* φ prior: Beta(20, 1.5) on [0.85, 0.995] with MH step */
     pgas_paris_set_phi_prior(&prior, 20.0f, 1.5f, 0.85f, 0.995f, 0.35f);
 
-    /* σ_h prior: InvGamma(5, 0.05) - moderately informative */
-    pgas_paris_set_sigma_h_prior(&prior, 5.0f, 0.05f);
-
     /* Storage for post-burnin samples */
     int n_samples = N_SWEEPS - BURNIN;
     float *mu_samples = (float *)malloc(n_samples * K_REGIMES * sizeof(float));
     float *phi_samples = (float *)malloc(n_samples * sizeof(float));
-    float *sigma_h_samples = (float *)malloc(n_samples * sizeof(float));
 
     printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  Running PGAS-PARIS (FULL parameter learning: μ_vol, σ_h, φ)\n");
+    printf("  Running PGAS-PARIS (FULL parameter learning: μ_vol, φ)\n");
     printf("═══════════════════════════════════════════════════════════════════\n");
+    printf("  Note: sigma_vol is now per-regime (aligned with RBPF)\n");
+    printf("        Use grid search for sigma_vol tuning\n\n");
 
     double start_time = get_time_ms();
 
@@ -305,7 +302,6 @@ int main(int argc, char **argv)
                 mu_samples[idx * K_REGIMES + k] = pgas->model.mu_vol[k];
             }
             phi_samples[idx] = pgas->model.phi;
-            sigma_h_samples[idx] = pgas->model.sigma_h;
         }
 
         /* Progress update every 100 sweeps */
@@ -330,7 +326,6 @@ int main(int argc, char **argv)
     /* Compute posterior means and stds */
     float mu_mean[K_REGIMES] = {0}, mu_std[K_REGIMES] = {0};
     float phi_mean = 0, phi_std = 0;
-    float sigma_h_mean = 0, sigma_h_std = 0;
 
     for (int i = 0; i < n_samples; i++)
     {
@@ -339,13 +334,11 @@ int main(int argc, char **argv)
             mu_mean[k] += mu_samples[i * K_REGIMES + k];
         }
         phi_mean += phi_samples[i];
-        sigma_h_mean += sigma_h_samples[i];
     }
 
     for (int k = 0; k < K_REGIMES; k++)
         mu_mean[k] /= n_samples;
     phi_mean /= n_samples;
-    sigma_h_mean /= n_samples;
 
     for (int i = 0; i < n_samples; i++)
     {
@@ -355,15 +348,12 @@ int main(int argc, char **argv)
             mu_std[k] += d * d;
         }
         float d_phi = phi_samples[i] - phi_mean;
-        float d_sh = sigma_h_samples[i] - sigma_h_mean;
         phi_std += d_phi * d_phi;
-        sigma_h_std += d_sh * d_sh;
     }
 
     for (int k = 0; k < K_REGIMES; k++)
         mu_std[k] = sqrtf(mu_std[k] / n_samples);
     phi_std = sqrtf(phi_std / n_samples);
-    sigma_h_std = sqrtf(sigma_h_std / n_samples);
 
     /* Print results */
     printf("═══════════════════════════════════════════════════════════════════\n");
@@ -386,15 +376,13 @@ int main(int argc, char **argv)
     printf("  RMSE: %.4f\n\n", mu_rmse);
 
     float phi_err = phi_mean - TRUE_PHI;
-    float sigma_h_err = sigma_h_mean - TRUE_SIGMA_H;
 
     printf("Structural Parameters:\n");
     printf("  Param    Learned     True        Error       Std\n");
     printf("  ─────────────────────────────────────────────────────\n");
     printf("  φ        %7.4f    %7.4f     %+6.4f     %.4f\n",
            phi_mean, TRUE_PHI, phi_err, phi_std);
-    printf("  σ_h      %7.4f    %7.4f     %+6.4f     %.4f\n",
-           sigma_h_mean, TRUE_SIGMA_H, sigma_h_err, sigma_h_std);
+    printf("  σ_vol    (per-regime, set via calibration)\n");
     printf("  ─────────────────────────────────────────────────────\n");
 
     float phi_accept = pgas_paris_get_phi_acceptance_rate(&prior);
@@ -406,8 +394,7 @@ int main(int argc, char **argv)
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
     int mu_pass = (mu_rmse < 0.20f);
-    int phi_pass = (fabsf(phi_err) < 0.02f);         /* Within 0.02 of true */
-    int sigma_h_pass = (fabsf(sigma_h_err) < 0.05f); /* Within 0.05 of true */
+    int phi_pass = (fabsf(phi_err) < 0.02f); /* Within 0.02 of true */
 
     printf("  ✓/✗  Parameter     Status\n");
     printf("  ─────────────────────────────────────────────────────\n");
@@ -415,73 +402,74 @@ int main(int argc, char **argv)
            mu_pass ? "✓" : "✗", mu_rmse);
     printf("   %s   φ            error=%+.4f (threshold: <0.02)\n",
            phi_pass ? "✓" : "✗", phi_err);
-    printf("   %s   σ_h          error=%+.4f (threshold: <0.05)\n",
-           sigma_h_pass ? "✓" : "✗", sigma_h_err);
+    printf("   -   σ_vol        (per-regime, fixed from calibration)\n");
     printf("  ─────────────────────────────────────────────────────\n\n");
 
-    int all_pass = mu_pass && phi_pass && sigma_h_pass;
+    int all_pass = mu_pass && phi_pass;
 
     if (all_pass)
     {
-        printf("  ★ ALL PARAMETERS LEARNED SUCCESSFULLY ★\n\n");
+        printf("  ★ ALL LEARNABLE PARAMETERS CONVERGED ★\n\n");
     }
     else
     {
-        printf("  Results (expected: μ_vol ✓, φ ⚠, σ_h ✗):\n");
+        printf("  Results (expected: μ_vol ✓, φ ⚠):\n");
         printf("    μ_vol: %s - Works reliably\n", mu_pass ? "PASS" : "FAIL");
-        printf("    φ:     %s - Requires MH tuning\n", phi_pass ? "PASS" : "FAIL");
-        printf("    σ_h:   %s - Confounded with OCSN noise\n\n", sigma_h_pass ? "PASS" : "FAIL");
+        printf("    φ:     %s - Requires MH tuning\n\n", phi_pass ? "PASS" : "FAIL");
     }
 
     /* C code output for production */
     printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  LEARNED VALUES (for reference)\n");
+    printf("  LEARNED VALUES (for RBPF integration)\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
     printf("/* Learned structural parameters */\n");
-    printf("rbpf_ext_set_phi(ext, %.4ff);     /* learned (true: %.4f) */\n", phi_mean, TRUE_PHI);
-    printf("rbpf_ext_set_sigma_h(ext, %.4ff); /* learned (true: %.4f) */\n\n", sigma_h_mean, TRUE_SIGMA_H);
-    printf("/* Learned μ_vol from PGAS-PARIS */\n");
+    printf("float theta = 1.0f - %.4ff;  /* theta = 1 - φ */\n\n", phi_mean);
+    printf("/* Learned μ_vol from PGAS-PARIS + per-regime σ_vol from calibration */\n");
     for (int k = 0; k < K_REGIMES; k++)
     {
-        printf("rbpf_ext_set_regime_params(ext, %d, %.4ff, %.3ff, %.3ff);\n",
-               k, TRUE_SIGMA_VOL[k], mu_mean[k], TRUE_SIGMA_VOL[k]);
+        printf("rbpf_ksc_set_regime_params(rbpf, %d, theta, %.4ff, %.4ff);\n",
+               k, mu_mean[k], TRUE_SIGMA_VOL[k]);
     }
     printf("\n");
 
     printf("═══════════════════════════════════════════════════════════════════\n");
     printf("  RECOMMENDATION\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
-    printf("  For production, use test_regime_learning which learns only μ_vol.\n");
-    printf("  Fix φ=%.3f and σ_h=%.3f from domain knowledge/calibration.\n\n", TRUE_PHI, TRUE_SIGMA_H);
+    printf("  For production:\n");
+    printf("    - μ_vol: Learn via PGAS-PARIS conjugate sampling\n");
+    printf("    - φ: Set via grid search or fix at %.3f\n", TRUE_PHI);
+    printf("    - σ_vol[k]: Set via grid search (per-regime, aligned with RBPF)\n\n");
 
     /* Cleanup first experiment */
     free(mu_samples);
     free(phi_samples);
-    free(sigma_h_samples);
     free(init_h);
     pgas_paris_free(pp);
     pgas_mkl_free(pgas);
 
     /*═══════════════════════════════════════════════════════════════════════════
-     * ALTERNATIVE: 2D GRID SEARCH (φ × σ_h)
+     * ALTERNATIVE: 2D GRID SEARCH (φ × σ_vol)
      *
-     * Instead of learning φ/σ_h with MH/conjugate, search over candidates.
+     * Instead of learning φ/σ_vol with MH, search over candidates.
      * Use μ_vol RMSE as the objective (lower = better fit).
+     *
+     * Note: For simplicity, this search uses uniform σ_vol across regimes.
+     * Production can use per-regime σ_vol from RBPF calibration.
      *═══════════════════════════════════════════════════════════════════════════*/
 
     printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  ALTERNATIVE: 2D Grid Search (φ × σ_h)\n");
+    printf("  ALTERNATIVE: 2D Grid Search (φ × σ_vol)\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
     /* Candidate values */
     float phi_candidates[] = {0.94f, 0.96f, 0.97f, 0.98f};
-    float sigma_h_candidates[] = {0.10f, 0.15f, 0.20f, 0.25f};
+    float sigma_vol_candidates[] = {0.10f, 0.15f, 0.20f, 0.25f};
     int n_phi = sizeof(phi_candidates) / sizeof(phi_candidates[0]);
-    int n_sigma_h = sizeof(sigma_h_candidates) / sizeof(sigma_h_candidates[0]);
+    int n_sigma_vol = sizeof(sigma_vol_candidates) / sizeof(sigma_vol_candidates[0]);
 
     float best_phi = 0.97f;
-    float best_sigma_h = 0.15f;
+    float best_sigma_vol = 0.15f;
     float best_mu_rmse = 1e30f;
     float best_accept = 0.0f;
 
@@ -489,32 +477,38 @@ int main(int argc, char **argv)
     int search_sweeps = 150;
     int search_burnin = 50;
 
-    printf("  φ candidates:   {");
+    printf("  φ candidates:      {");
     for (int i = 0; i < n_phi; i++)
     {
         printf("%.2f%s", phi_candidates[i], i < n_phi - 1 ? ", " : "}\n");
     }
-    printf("  σ_h candidates: {");
-    for (int i = 0; i < n_sigma_h; i++)
+    printf("  σ_vol candidates:  {");
+    for (int i = 0; i < n_sigma_vol; i++)
     {
-        printf("%.2f%s", sigma_h_candidates[i], i < n_sigma_h - 1 ? ", " : "}\n");
+        printf("%.2f%s", sigma_vol_candidates[i], i < n_sigma_vol - 1 ? ", " : "}\n");
     }
-    printf("  Total combinations: %d\n\n", n_phi * n_sigma_h);
+    printf("  Total combinations: %d\n\n", n_phi * n_sigma_vol);
 
-    printf("  φ     σ_h    accept   μ_rmse\n");
+    printf("  φ     σ_vol   accept   μ_rmse\n");
     printf("  ─────────────────────────────────────\n");
 
     for (int i_phi = 0; i_phi < n_phi; i_phi++)
     {
-        for (int i_sh = 0; i_sh < n_sigma_h; i_sh++)
+        for (int i_sv = 0; i_sv < n_sigma_vol; i_sv++)
         {
             float test_phi = phi_candidates[i_phi];
-            float test_sigma_h = sigma_h_candidates[i_sh];
+            float test_sigma_vol = sigma_vol_candidates[i_sv];
+
+            /* Set uniform sigma_vol for grid search */
+            double search_sigma_vol[4];
+            for (int k = 0; k < K_REGIMES; k++)
+            {
+                search_sigma_vol[k] = test_sigma_vol;
+            }
 
             /* Create fresh PGAS state */
             PGASMKLState *search_pgas = pgas_mkl_alloc(N_PARTICLES, T_DATA, K_REGIMES, seed);
-            pgas_mkl_set_model(search_pgas, init_trans, init_mu_vol, init_sigma_vol,
-                               test_phi, test_sigma_h);
+            pgas_mkl_set_model(search_pgas, init_trans, init_mu_vol, search_sigma_vol, test_phi);
             pgas_mkl_set_transition_prior(search_pgas, 1.0f, 50.0f);
             pgas_mkl_enable_adaptive_kappa(search_pgas, 1);
             pgas_mkl_configure_adaptive_kappa(search_pgas, 20.0f, 150.0f, 0.0f, 0.0f);
@@ -571,14 +565,14 @@ int main(int argc, char **argv)
             test_rmse = sqrtf(test_rmse / K_REGIMES);
 
             int is_best = (test_rmse < best_mu_rmse);
-            printf("  %.2f   %.2f   %.3f    %.3f %s\n",
-                   test_phi, test_sigma_h, avg_accept, test_rmse,
+            printf("  %.2f   %.2f    %.3f    %.3f %s\n",
+                   test_phi, test_sigma_vol, avg_accept, test_rmse,
                    is_best ? "← best" : "");
 
             if (is_best)
             {
                 best_phi = test_phi;
-                best_sigma_h = test_sigma_h;
+                best_sigma_vol = test_sigma_vol;
                 best_mu_rmse = test_rmse;
                 best_accept = avg_accept;
             }
@@ -591,8 +585,8 @@ int main(int argc, char **argv)
     }
 
     printf("  ─────────────────────────────────────\n\n");
-    printf("  ★ Best: φ=%.2f, σ_h=%.2f (μ_rmse=%.3f)\n", best_phi, best_sigma_h, best_mu_rmse);
-    printf("    True: φ=%.2f, σ_h=%.2f\n\n", TRUE_PHI, TRUE_SIGMA_H);
+    printf("  ★ Best: φ=%.2f, σ_vol=%.2f (μ_rmse=%.3f)\n", best_phi, best_sigma_vol, best_mu_rmse);
+    printf("    True: φ=%.2f\n\n", TRUE_PHI);
 
     /* Final production code */
     printf("═══════════════════════════════════════════════════════════════════\n");
@@ -600,8 +594,14 @@ int main(int argc, char **argv)
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
     printf("/* Grid-searched structural parameters */\n");
-    printf("rbpf_ext_set_phi(ext, %.2ff);\n", best_phi);
-    printf("rbpf_ext_set_sigma_h(ext, %.2ff);\n\n", best_sigma_h);
+    printf("float theta = 1.0f - %.2ff;  /* θ = 1 - φ */\n\n", best_phi);
+    printf("/* Per-regime setup (uniform σ_vol from grid search) */\n");
+    for (int k = 0; k < K_REGIMES; k++)
+    {
+        printf("rbpf_ksc_set_regime_params(rbpf, %d, theta, mu_learned[%d], %.2ff);\n",
+               k, k, best_sigma_vol);
+    }
+    printf("\n");
 
     /* Cleanup */
     free(obs_d);

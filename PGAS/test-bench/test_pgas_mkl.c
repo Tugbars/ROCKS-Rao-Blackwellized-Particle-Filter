@@ -1,6 +1,8 @@
 /**
  * @file test_pgas_mkl.c
  * @brief Benchmark and correctness test for MKL-optimized PGAS
+ *
+ * Updated for per-regime sigma_vol API (ALIGNED WITH RBPF)
  */
 
 #include <stdio.h>
@@ -42,15 +44,14 @@ static double get_time_ms(void)
 
 static void generate_test_data(int T, int K,
                                double *trans, double *mu_vol, double *sigma_vol,
-                               double *phi, double *sigma_h,
+                               double *phi,
                                double *observations,
                                int *true_regimes, double *true_h)
 {
     /* Model parameters */
     *phi = 0.97;
-    *sigma_h = 0.15;
 
-    /* Sticky transition matrix */
+    /* Sticky transition matrix + per-regime parameters */
     for (int i = 0; i < K; i++)
     {
         for (int j = 0; j < K; j++)
@@ -58,7 +59,8 @@ static void generate_test_data(int T, int K,
             trans[i * K + j] = (i == j) ? 0.95 : 0.05 / (K - 1);
         }
         mu_vol[i] = -2.0 + i * 1.5; /* Spread regimes */
-        sigma_vol[i] = 0.3;
+        /* Per-regime sigma_vol: crisis regimes have higher process noise */
+        sigma_vol[i] = 0.15 + i * 0.05;
     }
 
     /* Generate true trajectory */
@@ -82,9 +84,10 @@ static void generate_test_data(int T, int K,
             }
         }
 
-        /* AR(1) h evolution */
-        double mu_k = mu_vol[true_regimes[t]];
-        double noise = *sigma_h * ((double)rand() / RAND_MAX * 2 - 1) * 1.732;
+        /* AR(1) h evolution with per-regime sigma_vol */
+        int curr_regime = true_regimes[t];
+        double mu_k = mu_vol[curr_regime];
+        double noise = sigma_vol[curr_regime] * ((double)rand() / RAND_MAX * 2 - 1) * 1.732;
         true_h[t] = mu_k + (*phi) * (true_h[t - 1] - mu_k) + noise;
     }
 
@@ -149,7 +152,8 @@ static int test_model_set(void)
         sigma_vol[i] = 0.25 + i * 0.05;
     }
 
-    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, 0.95, 0.20);
+    /* Updated API: no sigma_h argument */
+    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, 0.95);
 
     /* Verify log_trans computed correctly */
     for (int i = 0; i < 4; i++)
@@ -179,15 +183,16 @@ static int test_single_sweep(void)
     int T = 100, N = 50, K = 4;
     PGASMKLState *state = pgas_mkl_alloc(N, T, K, 12345);
 
-    double trans[16], mu_vol[4], sigma_vol[4], phi, sigma_h;
+    double trans[16], mu_vol[4], sigma_vol[4], phi;
     double *obs = malloc(T * sizeof(double));
     int *true_reg = malloc(T * sizeof(int));
     double *true_h = malloc(T * sizeof(double));
 
-    generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi, &sigma_h,
+    generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi,
                        obs, true_reg, true_h);
 
-    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi, sigma_h);
+    /* Updated API: no sigma_h argument */
+    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi);
     pgas_mkl_set_reference(state, true_reg, true_h, T);
     pgas_mkl_load_observations(state, obs, T);
 
@@ -238,15 +243,16 @@ static int test_adaptive_run(void)
     int T = 150, N = 64, K = 4;
     PGASMKLState *state = pgas_mkl_alloc(N, T, K, 54321);
 
-    double trans[16], mu_vol[4], sigma_vol[4], phi, sigma_h;
+    double trans[16], mu_vol[4], sigma_vol[4], phi;
     double *obs = malloc(T * sizeof(double));
     int *true_reg = malloc(T * sizeof(int));
     double *true_h = malloc(T * sizeof(double));
 
-    generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi, &sigma_h,
+    generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi,
                        obs, true_reg, true_h);
 
-    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi, sigma_h);
+    /* Updated API: no sigma_h argument */
+    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi);
     pgas_mkl_set_reference(state, true_reg, true_h, T);
     pgas_mkl_load_observations(state, obs, T);
 
@@ -288,15 +294,16 @@ static int test_reference_preservation(void)
     int T = 100, N = 50, K = 4;
     PGASMKLState *state = pgas_mkl_alloc(N, T, K, 99999);
 
-    double trans[16], mu_vol[4], sigma_vol[4], phi, sigma_h;
+    double trans[16], mu_vol[4], sigma_vol[4], phi;
     double *obs = malloc(T * sizeof(double));
     int *true_reg = malloc(T * sizeof(int));
     double *true_h = malloc(T * sizeof(double));
 
-    generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi, &sigma_h,
+    generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi,
                        obs, true_reg, true_h);
 
-    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi, sigma_h);
+    /* Updated API: no sigma_h argument */
+    pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi);
     pgas_mkl_set_reference(state, true_reg, true_h, T);
     pgas_mkl_load_observations(state, obs, T);
 
@@ -373,12 +380,12 @@ static void benchmark_pgas_mkl(void)
         int K = configs[c][1];
         int N = configs[c][2];
 
-        double trans[64], mu_vol[8], sigma_vol[8], phi, sigma_h;
+        double trans[64], mu_vol[8], sigma_vol[8], phi;
         double *obs = malloc(T * sizeof(double));
         int *true_reg = malloc(T * sizeof(int));
         double *true_h = malloc(T * sizeof(double));
 
-        generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi, &sigma_h,
+        generate_test_data(T, K, trans, mu_vol, sigma_vol, &phi,
                            obs, true_reg, true_h);
 
         double sweep_total = 0, adaptive_total = 0;
@@ -387,7 +394,8 @@ static void benchmark_pgas_mkl(void)
         for (int trial = 0; trial < TRIALS; trial++)
         {
             PGASMKLState *state = pgas_mkl_alloc(N, T, K, trial + 1000);
-            pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi, sigma_h);
+            /* Updated API: no sigma_h argument */
+            pgas_mkl_set_model(state, trans, mu_vol, sigma_vol, phi);
             pgas_mkl_set_reference(state, true_reg, true_h, T);
             pgas_mkl_load_observations(state, obs, T);
 
@@ -433,8 +441,8 @@ static void benchmark_pgas_mkl(void)
 int main(void)
 {
     /* Initialize MKL tuning: P-cores only (adjust for your CPU), verbose=1 */
-    mkl_tuning_init(8, 1);  /* 8 P-cores, verbose */
- /* 0 = auto, change to your P-core count */
+    mkl_tuning_init(8, 1); /* 8 P-cores, verbose */
+                           /* 0 = auto, change to your P-core count */
 
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
     printf("║                    PGAS-MKL TEST SUITE                                ║\n");

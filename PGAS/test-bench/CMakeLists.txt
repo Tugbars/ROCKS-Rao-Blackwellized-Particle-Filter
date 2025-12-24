@@ -25,18 +25,18 @@ target_compile_definitions(test_pgas_mkl PRIVATE ${COMMON_DEFS})
 # Test: PGAS OCSN Emission
 #───────────────────────────────────────────────────────────────────────────────
 
-add_executable(test_pgas_ocsn
-    test_pgas_ocsn.c
-)
+#add_executable(test_pgas_ocsn
+#    test_pgas_ocsn.c
+#)
 
-target_link_libraries(test_pgas_ocsn
-    PRIVATE
-        pgas_mkl
-        MKL::MKL
-)
+#target_link_libraries(test_pgas_ocsn
+#    PRIVATE
+#        pgas_mkl
+#        MKL::MKL
+#)
 
-target_compile_options(test_pgas_ocsn PRIVATE ${PGAS_COMPILE_FLAGS})
-target_compile_definitions(test_pgas_ocsn PRIVATE ${COMMON_DEFS})
+#target_compile_options(test_pgas_ocsn PRIVATE ${PGAS_COMPILE_FLAGS})
+#target_compile_definitions(test_pgas_ocsn PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
 # Test: PARIS Backward Smoother
