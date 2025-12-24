@@ -196,7 +196,7 @@ void paris_mkl_set_model(PARISMKLState *state,
         state->model.mu_vol[i] = (float)mu_vol[i];
         /* Rank-1 AR(1) precomputation: mu_k * (1 - phi) */
         state->model.mu_shifts[i] = (float)mu_vol[i] * one_minus_phi;
-        
+
         /* Per-regime sigma_vol (aligned with RBPF) */
         float sv = (float)sigma_vol[i];
         state->model.sigma_vol[i] = sv;
@@ -343,6 +343,18 @@ static void logsumexp_normalize(const float *log_w, int N, int Np,
 {
     int max_idx = cblas_isamax(N, log_w, 1);
     float max_val = log_w[max_idx];
+
+    /* Guard against all -inf weights */
+    if (!isfinite(max_val) || max_val < -1e30f)
+    {
+        float unif = 1.0f / (float)N;
+        for (int k = 0; k < N; k++)
+        {
+            w[k] = unif;
+        }
+        return;
+    }
+
     float neg_max = -max_val;
     int i;
 
@@ -363,8 +375,20 @@ static void logsumexp_normalize(const float *log_w, int N, int Np,
 
     float sum = cblas_sasum(N, w, 1);
 
-    float inv_sum = 1.0f / sum;
-    cblas_sscal(N, inv_sum, w, 1);
+    /* Guard against collapsed cloud - fall back to uniform */
+    if (sum < 1e-38f || !isfinite(sum))
+    {
+        float unif = 1.0f / (float)N;
+        for (int k = 0; k < N; k++)
+        {
+            w[k] = unif;
+        }
+    }
+    else
+    {
+        float inv_sum = 1.0f / sum;
+        cblas_sscal(N, inv_sum, w, 1);
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -437,6 +461,11 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
 #pragma omp parallel
     {
         int tid = omp_get_thread_num();
+
+        /* Guard against tid exceeding allocated streams */
+        if (tid >= state->n_thread_streams)
+            tid = tid % state->n_thread_streams;
+
         VSLStreamStatePtr local_stream = (VSLStreamStatePtr)state->thread_rng_streams[tid];
 
         if (use_large_path)
@@ -466,7 +495,7 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
                 float h_next = state->h[(t + 1) * Np + idx_next];
                 float mu_shift = m->mu_shifts[regime_next];
                 const float *log_trans_col = &log_trans_T[regime_next * K];
-                
+
                 /* Per-regime sigma_vol (aligned with RBPF) */
                 float neg_half_inv_var = m->neg_half_inv_sigma_vol_sq[regime_next];
 
@@ -512,7 +541,7 @@ void paris_mkl_backward_smooth(PARISMKLState *state)
             float h_next = state->h[(t + 1) * Np + idx_next];
             float mu_shift = m->mu_shifts[regime_next];
             const float *log_trans_col = &log_trans_T[regime_next * K];
-            
+
             /* Per-regime sigma_vol (aligned with RBPF) */
             float neg_half_inv_var = m->neg_half_inv_sigma_vol_sq[regime_next];
 
