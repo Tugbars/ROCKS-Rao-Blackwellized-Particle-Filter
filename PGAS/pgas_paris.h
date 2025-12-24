@@ -97,6 +97,11 @@ extern "C"
         double *h_double;       /* [T × N] h converted to double */
         double *weights_double; /* [T × N] weights converted to double */
 
+        /* OPTIMIZATION: Pre-allocated copy buffers (avoid malloc per sweep) */
+        int *regimes_nopad;   /* [T × N] regimes without padding */
+        int *ancestors_nopad; /* [T × N] ancestors without padding */
+        float *h_traj_cache;  /* [M × T] h values for trajectories */
+
         /* Configuration */
         int n_trajectories;      /* Number of trajectories to sample */
         int use_ensemble_counts; /* 1 = count from M trajectories, 0 = single ref */
