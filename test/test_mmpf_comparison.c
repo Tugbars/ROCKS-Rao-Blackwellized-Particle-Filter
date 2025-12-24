@@ -474,16 +474,16 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
      * ═══════════════════════════════════════════════════════════════════════════*/
 
     /* Regime params (θ, μ, σ) - linearly interpolated */
-    rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.50f, 0.080f); /* Calm */
-    rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.67f, 0.267f); /* Mild */
-    rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.83f, 0.453f); /* Trend */
-    rbpf_ext_set_regime_params(ext, 3, 0.1200f, -2.00f, 0.640f); /* Crisis */
+    rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.644f, 0.080f); /* Calm */
+rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.589f, 0.267f); /* Mild */
+rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.733f, 0.453f); /* Trend */
+rbpf_ext_set_regime_params(ext, 3, 0.1200f, -1.997f, 0.640f); /* Crisis */
 
     /*
-rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.270f, 0.080f);
-rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.450f, 0.267f);
-rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.896f, 0.453f);
-rbpf_ext_set_regime_params(ext, 3, 0.1200f, -2.101f, 0.640f);
+rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.644f, 0.080f); // Calm 
+rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.589f, 0.267f); // Mild 
+rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.733f, 0.453f); // Trend 
+rbpf_ext_set_regime_params(ext, 3, 0.1200f, -1.997f, 0.640f); // Crisis 
     */
 
     /* Transition matrix (stickiness=0.92) */
