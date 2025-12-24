@@ -32,6 +32,7 @@
 
 #include "pgas_mkl.h"
 #include "pgas_paris.h"
+#include "mkl_tuning.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -473,6 +474,8 @@ static void print_trans_comparison(const char *name, const RegimeLearningAccumul
 
 int main(int argc, char **argv)
 {
+
+    mkl_tuning_init(8, 0);  /* 8 P-cores, quiet mode */
     uint32_t seed = DEFAULT_SEED;
     if (argc > 1)
     {
