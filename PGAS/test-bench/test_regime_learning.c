@@ -50,7 +50,7 @@
 #define DEFAULT_SEED 42
 #define T_DATA 2000
 #define K_REGIMES 4
-#define N_PARTICLES 64
+#define N_PARTICLES 32
 
 /* MCMC settings */
 #define N_SWEEPS 500
