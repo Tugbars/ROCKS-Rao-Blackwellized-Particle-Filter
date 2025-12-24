@@ -455,14 +455,156 @@ int main(int argc, char **argv)
     printf("  For production, use test_regime_learning which learns only μ_vol.\n");
     printf("  Fix φ=%.3f and σ_h=%.3f from domain knowledge/calibration.\n\n", TRUE_PHI, TRUE_SIGMA_H);
 
-    /* Cleanup */
+    /* Cleanup first experiment */
     free(mu_samples);
     free(phi_samples);
     free(sigma_h_samples);
     free(init_h);
-    free(obs_d);
     pgas_paris_free(pp);
     pgas_mkl_free(pgas);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * ALTERNATIVE: 2D GRID SEARCH (φ × σ_h)
+     *
+     * Instead of learning φ/σ_h with MH/conjugate, search over candidates.
+     * Use μ_vol RMSE as the objective (lower = better fit).
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    printf("  ALTERNATIVE: 2D Grid Search (φ × σ_h)\n");
+    printf("═══════════════════════════════════════════════════════════════════\n\n");
+
+    /* Candidate values */
+    float phi_candidates[] = {0.94f, 0.96f, 0.97f, 0.98f};
+    float sigma_h_candidates[] = {0.10f, 0.15f, 0.20f, 0.25f};
+    int n_phi = sizeof(phi_candidates) / sizeof(phi_candidates[0]);
+    int n_sigma_h = sizeof(sigma_h_candidates) / sizeof(sigma_h_candidates[0]);
+
+    float best_phi = 0.97f;
+    float best_sigma_h = 0.15f;
+    float best_mu_rmse = 1e30f;
+    float best_accept = 0.0f;
+
+    /* Quick sweeps for search */
+    int search_sweeps = 150;
+    int search_burnin = 50;
+
+    printf("  φ candidates:   {");
+    for (int i = 0; i < n_phi; i++)
+    {
+        printf("%.2f%s", phi_candidates[i], i < n_phi - 1 ? ", " : "}\n");
+    }
+    printf("  σ_h candidates: {");
+    for (int i = 0; i < n_sigma_h; i++)
+    {
+        printf("%.2f%s", sigma_h_candidates[i], i < n_sigma_h - 1 ? ", " : "}\n");
+    }
+    printf("  Total combinations: %d\n\n", n_phi * n_sigma_h);
+
+    printf("  φ     σ_h    accept   μ_rmse\n");
+    printf("  ─────────────────────────────────────\n");
+
+    for (int i_phi = 0; i_phi < n_phi; i_phi++)
+    {
+        for (int i_sh = 0; i_sh < n_sigma_h; i_sh++)
+        {
+            float test_phi = phi_candidates[i_phi];
+            float test_sigma_h = sigma_h_candidates[i_sh];
+
+            /* Create fresh PGAS state */
+            PGASMKLState *search_pgas = pgas_mkl_alloc(N_PARTICLES, T_DATA, K_REGIMES, seed);
+            pgas_mkl_set_model(search_pgas, init_trans, init_mu_vol, init_sigma_vol,
+                               test_phi, test_sigma_h);
+            pgas_mkl_set_transition_prior(search_pgas, 1.0f, 50.0f);
+            pgas_mkl_enable_adaptive_kappa(search_pgas, 1);
+            pgas_mkl_configure_adaptive_kappa(search_pgas, 20.0f, 150.0f, 0.0f, 0.0f);
+            pgas_mkl_load_observations(search_pgas, obs_d, T_DATA);
+
+            /* Reset reference */
+            double *search_h = (double *)malloc(T_DATA * sizeof(double));
+            for (int t = 0; t < T_DATA; t++)
+                search_h[t] = data.true_h[t];
+            pgas_mkl_set_reference(search_pgas, data.true_regimes, search_h, T_DATA);
+
+            PGASParisState *search_pp = pgas_paris_alloc(search_pgas, M_TRAJECTORIES);
+
+            /* μ_vol learning only */
+            PGASParisRegimePrior search_prior;
+            pgas_paris_regime_prior_init(&search_prior, K_REGIMES);
+            search_prior.learn_mu = 1;
+            search_prior.learn_sigma = 0;
+            search_prior.learn_sigma_h = 0;
+            search_prior.learn_phi = 0;
+            search_prior.enforce_ordering = 1;
+
+            /* Accumulate results */
+            double total_accept = 0.0;
+            int n_samples = 0;
+            double mu_accum[4] = {0};
+
+            for (int s = 0; s < search_sweeps; s++)
+            {
+                float accept = pgas_paris_gibbs_sweep_full(search_pp, &search_prior);
+
+                if (s >= search_burnin)
+                {
+                    total_accept += accept;
+                    n_samples++;
+
+                    for (int k = 0; k < K_REGIMES; k++)
+                    {
+                        mu_accum[k] += search_pgas->model.mu_vol[k];
+                    }
+                }
+            }
+
+            float avg_accept = (float)(total_accept / n_samples);
+
+            /* Compute μ_vol RMSE */
+            float test_rmse = 0.0f;
+            for (int k = 0; k < K_REGIMES; k++)
+            {
+                float learned_mu = (float)(mu_accum[k] / n_samples);
+                float diff = learned_mu - TRUE_MU_VOL[k];
+                test_rmse += diff * diff;
+            }
+            test_rmse = sqrtf(test_rmse / K_REGIMES);
+
+            int is_best = (test_rmse < best_mu_rmse);
+            printf("  %.2f   %.2f   %.3f    %.3f %s\n",
+                   test_phi, test_sigma_h, avg_accept, test_rmse,
+                   is_best ? "← best" : "");
+
+            if (is_best)
+            {
+                best_phi = test_phi;
+                best_sigma_h = test_sigma_h;
+                best_mu_rmse = test_rmse;
+                best_accept = avg_accept;
+            }
+
+            /* Cleanup */
+            free(search_h);
+            pgas_paris_free(search_pp);
+            pgas_mkl_free(search_pgas);
+        }
+    }
+
+    printf("  ─────────────────────────────────────\n\n");
+    printf("  ★ Best: φ=%.2f, σ_h=%.2f (μ_rmse=%.3f)\n", best_phi, best_sigma_h, best_mu_rmse);
+    printf("    True: φ=%.2f, σ_h=%.2f\n\n", TRUE_PHI, TRUE_SIGMA_H);
+
+    /* Final production code */
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    printf("  FINAL: Production Code with Grid-Searched Parameters\n");
+    printf("═══════════════════════════════════════════════════════════════════\n\n");
+
+    printf("/* Grid-searched structural parameters */\n");
+    printf("rbpf_ext_set_phi(ext, %.2ff);\n", best_phi);
+    printf("rbpf_ext_set_sigma_h(ext, %.2ff);\n\n", best_sigma_h);
+
+    /* Cleanup */
+    free(obs_d);
     free_synthetic_data(&data);
     mkl_tuning_cleanup();
 
