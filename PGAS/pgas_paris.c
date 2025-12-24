@@ -21,9 +21,14 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include <mkl.h>
 #include <mkl_vsl.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * LIFECYCLE
@@ -62,12 +67,25 @@ PGASParisState *pgas_paris_alloc(PGASMKLState *pgas, int n_trajectories)
     size_t TN = (size_t)pgas->T * pgas->N;
     state->h_double = (double *)mkl_malloc(TN * sizeof(double), 64);
     state->weights_double = (double *)mkl_malloc(TN * sizeof(double), 64);
-    if (!state->h_double || !state->weights_double)
+
+    /* OPTIMIZATION: Pre-allocate copy buffers (avoid malloc per sweep) */
+    state->regimes_nopad = (int *)mkl_malloc(TN * sizeof(int), 64);
+    state->ancestors_nopad = (int *)mkl_malloc(TN * sizeof(int), 64);
+    state->h_traj_cache = (float *)mkl_malloc((size_t)n_trajectories * pgas->T * sizeof(float), 64);
+
+    if (!state->h_double || !state->weights_double ||
+        !state->regimes_nopad || !state->ancestors_nopad || !state->h_traj_cache)
     {
         if (state->h_double)
             mkl_free(state->h_double);
         if (state->weights_double)
             mkl_free(state->weights_double);
+        if (state->regimes_nopad)
+            mkl_free(state->regimes_nopad);
+        if (state->ancestors_nopad)
+            mkl_free(state->ancestors_nopad);
+        if (state->h_traj_cache)
+            mkl_free(state->h_traj_cache);
         paris_mkl_free(state->paris);
         free(state);
         return NULL;
@@ -84,6 +102,9 @@ PGASParisState *pgas_paris_alloc(PGASMKLState *pgas, int n_trajectories)
     {
         mkl_free(state->h_double);
         mkl_free(state->weights_double);
+        mkl_free(state->regimes_nopad);
+        mkl_free(state->ancestors_nopad);
+        mkl_free(state->h_traj_cache);
         paris_mkl_free(state->paris);
         free(state);
         return NULL;
@@ -112,6 +133,18 @@ void pgas_paris_free(PGASParisState *state)
     {
         mkl_free(state->weights_double);
     }
+    if (state->regimes_nopad)
+    {
+        mkl_free(state->regimes_nopad);
+    }
+    if (state->ancestors_nopad)
+    {
+        mkl_free(state->ancestors_nopad);
+    }
+    if (state->h_traj_cache)
+    {
+        mkl_free(state->h_traj_cache);
+    }
     if (state->traj.trajectories)
     {
         mkl_free(state->traj.trajectories);
@@ -121,15 +154,15 @@ void pgas_paris_free(PGASParisState *state)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * PARTICLE COPY: PGAS → PARIS
+ * PARTICLE COPY: PGAS → PARIS (OPTIMIZED)
  *
  * PGAS stores particles as [T × N_padded] with float h and float weights.
  * PARIS load_particles expects [T × N] with double h and double weights.
  *
- * We need to:
- *   1. Convert float → double
- *   2. Remove padding (N_padded → N)
- *   3. Convert normalized weights to PARIS expected format
+ * OPTIMIZATIONS:
+ *   1. Use pre-allocated buffers (no malloc per sweep)
+ *   2. OpenMP parallel for T×N loops
+ *   3. Blocked copy for better cache utilization
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 void pgas_paris_copy_particles(PGASParisState *state)
@@ -142,16 +175,34 @@ void pgas_paris_copy_particles(PGASParisState *state)
     const int N = pgas->N;
     const int Np = pgas->N_padded;
 
-    /* Copy with stride conversion and float→double */
-    for (int t = 0; t < T; t++)
+    /* Use pre-allocated buffers */
+    int *regimes_nopad = state->regimes_nopad;
+    int *ancestors_nopad = state->ancestors_nopad;
+    double *h_double = state->h_double;
+    double *weights_double = state->weights_double;
+
+    /* Parallel copy with stride conversion */
+    int t; /* MSVC OpenMP requires loop var declared outside */
+#pragma omp parallel for schedule(static) if (T > 100)
+    for (t = 0; t < T; t++)
     {
+        const float *h_src = &pgas->h[t * Np];
+        const float *w_src = &pgas->weights[t * Np];
+        const int *r_src = &pgas->regimes[t * Np];
+        const int *a_src = &pgas->ancestors[t * Np];
+
+        double *h_dst = &h_double[t * N];
+        double *w_dst = &weights_double[t * N];
+        int *r_dst = &regimes_nopad[t * N];
+        int *a_dst = &ancestors_nopad[t * N];
+
         for (int n = 0; n < N; n++)
         {
-            int pgas_idx = t * Np + n;
-            int paris_idx = t * N + n;
-
-            state->h_double[paris_idx] = (double)pgas->h[pgas_idx];
-            state->weights_double[paris_idx] = (double)pgas->weights[pgas_idx];
+            h_dst[n] = (double)h_src[n];
+            w_dst[n] = (double)w_src[n];
+            r_dst[n] = r_src[n];
+            /* Clamp ancestor to valid range */
+            a_dst[n] = (a_src[n] < N) ? a_src[n] : N - 1;
         }
     }
 
@@ -171,45 +222,13 @@ void pgas_paris_copy_particles(PGASParisState *state)
     paris_mkl_set_model(state->paris, trans_d, mu_vol_d,
                         (double)pgas->model.phi, (double)pgas->model.sigma_h);
 
-    /* Load particles into PARIS
-     * Note: paris_mkl_load_particles expects:
-     *   - regimes [T×N] int
-     *   - h [T×N] double
-     *   - weights [T×N] double (normalized, will convert to log internally)
-     *   - ancestors [T×N] int
-     */
-
-    /* Prepare regimes and ancestors without padding */
-    int *regimes_nopad = (int *)mkl_malloc((size_t)T * N * sizeof(int), 64);
-    int *ancestors_nopad = (int *)mkl_malloc((size_t)T * N * sizeof(int), 64);
-
-    for (int t = 0; t < T; t++)
-    {
-        for (int n = 0; n < N; n++)
-        {
-            int pgas_idx = t * Np + n;
-            int paris_idx = t * N + n;
-
-            regimes_nopad[paris_idx] = pgas->regimes[pgas_idx];
-            ancestors_nopad[paris_idx] = pgas->ancestors[pgas_idx];
-
-            /* Clamp ancestor to valid range (in case of padding artifacts) */
-            if (ancestors_nopad[paris_idx] >= N)
-            {
-                ancestors_nopad[paris_idx] = N - 1;
-            }
-        }
-    }
-
+    /* Load particles into PARIS */
     paris_mkl_load_particles(state->paris,
                              regimes_nopad,
-                             state->h_double,
-                             state->weights_double,
+                             h_double,
+                             weights_double,
                              ancestors_nopad,
                              T);
-
-    mkl_free(regimes_nopad);
-    mkl_free(ancestors_nopad);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -225,14 +244,42 @@ void pgas_paris_run_backward(PGASParisState *state)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * TRAJECTORY SAMPLING
+ * TRAJECTORY SAMPLING (OPTIMIZED)
  *
  * After PARIS backward pass, state->paris->smoothed[t * Np + n] contains
  * the INDEX of the particle at time t for the n-th smoothed trajectory.
  *
- * We sample M trajectories by picking M different starting particles
- * and extracting their regime sequences.
+ * OPTIMIZATIONS:
+ *   1. Hash-based diversity check O(M×T) instead of O(M²×T)
+ *   2. Cache h values during extraction for regime stats
+ *   3. Direct extraction (avoid paris_mkl_get_trajectory function call)
  *═══════════════════════════════════════════════════════════════════════════════*/
+
+/* FNV-1a hash for fast trajectory comparison */
+static inline uint64_t trajectory_hash_fnv1a(const int *traj, int T)
+{
+    uint64_t hash = 14695981039346656037ULL;
+
+    /* Process 4 ints at a time */
+    int t = 0;
+    for (; t + 3 < T; t += 4)
+    {
+        hash ^= (uint64_t)traj[t];
+        hash *= 1099511628211ULL;
+        hash ^= (uint64_t)traj[t + 1];
+        hash *= 1099511628211ULL;
+        hash ^= (uint64_t)traj[t + 2];
+        hash *= 1099511628211ULL;
+        hash ^= (uint64_t)traj[t + 3];
+        hash *= 1099511628211ULL;
+    }
+    for (; t < T; t++)
+    {
+        hash ^= (uint64_t)traj[t];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
 
 void pgas_paris_sample_trajectories(PGASParisState *state)
 {
@@ -242,39 +289,52 @@ void pgas_paris_sample_trajectories(PGASParisState *state)
     const int T = state->traj.T;
     const int M = state->traj.M;
     const int N = state->pgas->N;
+    const int Np_paris = state->paris->N_padded;
 
     /* Sample M particle indices (evenly spaced for diversity) */
     int stride = (N > M) ? (N / M) : 1;
 
+    /* Hash table for O(M) diversity check */
+    uint64_t hashes[PGAS_PARIS_MAX_TRAJECTORIES];
+
+    /* Extract trajectories with h caching */
     for (int m = 0; m < M; m++)
     {
         int particle_idx = (m * stride) % N;
 
-        /* Extract regime trajectory using paris_mkl_get_trajectory */
         int *traj_regimes = &state->traj.trajectories[m * T];
-        paris_mkl_get_trajectory(state->paris, particle_idx, traj_regimes, NULL);
+        float *traj_h = &state->h_traj_cache[m * T];
+
+        /* Direct extraction - avoid function call overhead */
+        for (int t = 0; t < T; t++)
+        {
+            int smoothed_idx = state->paris->smoothed[t * Np_paris + particle_idx];
+            traj_regimes[t] = state->paris->regimes[t * Np_paris + smoothed_idx];
+            traj_h[t] = state->paris->h[t * Np_paris + smoothed_idx];
+        }
+
+        /* Compute hash */
+        hashes[m] = trajectory_hash_fnv1a(traj_regimes, T);
     }
 
-    /* Compute trajectory diversity */
+    /* Hash-based diversity: O(M²) worst case but O(M) average
+     * Much faster than O(M²×T) element-wise comparison */
     int unique_count = 0;
     for (int m = 0; m < M; m++)
     {
         int is_unique = 1;
         for (int m2 = 0; m2 < m; m2++)
         {
-            int same = 1;
-            for (int t = 0; t < T && same; t++)
+            if (hashes[m] == hashes[m2])
             {
-                if (state->traj.trajectories[m * T + t] !=
-                    state->traj.trajectories[m2 * T + t])
+                /* Hash collision - spot check (3 points, not full T) */
+                const int *t1 = &state->traj.trajectories[m * T];
+                const int *t2 = &state->traj.trajectories[m2 * T];
+                if (t1[0] == t2[0] && t1[T - 1] == t2[T - 1] && t1[T / 2] == t2[T / 2])
                 {
-                    same = 0;
+                    is_unique = 0;
+                    break;
                 }
-            }
-            if (same)
-            {
-                is_unique = 0;
-                break;
             }
         }
         if (is_unique)
@@ -727,7 +787,6 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
     const int K = pgas->K;
     const int T = pgas->T;
     const int M = state->n_trajectories;
-    const int Np = pgas->N_padded;
     const float phi = pgas->model.phi;
 
     stats->K = K;
@@ -742,46 +801,49 @@ void pgas_paris_collect_regime_stats(PGASParisState *state,
         stats->sum_resid_sq_k[k] = 0.0;
     }
 
-    /* Accumulate statistics from each trajectory */
+    /* Accumulate statistics from cached trajectory data
+     * OPTIMIZATION: Use h_traj_cache instead of re-fetching from PARIS */
     for (int m = 0; m < M; m++)
     {
-        int *traj = &state->traj.trajectories[m * T];
+        const int *traj = &state->traj.trajectories[m * T];
+        const float *h_cache = &state->h_traj_cache[m * T];
 
-        for (int t = 0; t < T; t++)
+        /* First timestep - no residual */
+        int z_0 = traj[0];
+        float h_0 = h_cache[0];
+        stats->n_k[z_0] += 1.0;
+        stats->sum_h_k[z_0] += h_0;
+        stats->sum_h_sq_k[z_0] += h_0 * h_0;
+
+        /* Remaining timesteps - with residuals */
+        float h_prev = h_0;
+        for (int t = 1; t < T; t++)
         {
             int z_t = traj[t];
-
-            /* Get h value at this time (from smoothed PARIS index) */
-            int particle_idx = state->paris->smoothed[t * state->paris->N_padded + m];
-            float h_t = state->paris->h[t * state->paris->N_padded + particle_idx];
+            float h_t = h_cache[t];
 
             stats->n_k[z_t] += 1.0;
             stats->sum_h_k[z_t] += h_t;
             stats->sum_h_sq_k[z_t] += h_t * h_t;
 
-            /* Compute residuals for t > 0 */
-            if (t > 0)
-            {
-                int prev_particle_idx = state->paris->smoothed[(t - 1) * state->paris->N_padded + m];
-                float h_prev = state->paris->h[(t - 1) * state->paris->N_padded + prev_particle_idx];
+            /* Residual: h_t - φ*h_{t-1} */
+            float resid = h_t - phi * h_prev;
+            stats->sum_resid_k[z_t] += resid;
+            stats->sum_resid_sq_k[z_t] += resid * resid;
 
-                /* Residual: h_t - φ*h_{t-1} (should equal μ_k*(1-φ) + σ_h*ε) */
-                float resid = h_t - phi * h_prev;
-
-                stats->sum_resid_k[z_t] += resid;
-                stats->sum_resid_sq_k[z_t] += resid * resid;
-            }
+            h_prev = h_t;
         }
     }
 
     /* Normalize by M to get expected counts (Rao-Blackwellization) */
+    float inv_M = 1.0f / M;
     for (int k = 0; k < K; k++)
     {
-        stats->n_k[k] /= M;
-        stats->sum_h_k[k] /= M;
-        stats->sum_h_sq_k[k] /= M;
-        stats->sum_resid_k[k] /= M;
-        stats->sum_resid_sq_k[k] /= M;
+        stats->n_k[k] *= inv_M;
+        stats->sum_h_k[k] *= inv_M;
+        stats->sum_h_sq_k[k] *= inv_M;
+        stats->sum_resid_k[k] *= inv_M;
+        stats->sum_resid_sq_k[k] *= inv_M;
     }
 }
 
