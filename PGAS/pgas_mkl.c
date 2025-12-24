@@ -1092,9 +1092,9 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         int total_switches = state->last_off_diag_count;
         int total_obs = state->last_total_count;
 
-        float expected_diag_local = (state->sticky_kappa + alpha) /
-                                    (state->sticky_kappa + K * alpha);
-        float expected_switch_rate = 1.0f - expected_diag_local;
+        float prior_diag = (state->sticky_kappa + alpha) /
+                           (state->sticky_kappa + K * alpha);
+        float expected_switch_rate = 1.0f - prior_diag;
 
         float observed_switch_rate = (float)total_switches / (float)total_obs;
 
@@ -1128,27 +1128,115 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         if (chatter > 3.0f)
             chatter = 3.0f;
 
-        float target_switch_rate = expected_switch_rate * chatter;
-        float target_diag = 1.0f - target_switch_rate;
+        /*═══════════════════════════════════════════════════════════════════════
+         * ADAPTIVE KAPPA: Chatter-based with learned diagonal correction
+         *
+         * Primary signal: chatter = observed_switches / expected_switches
+         *   - chatter > 1 → more switches than prior expects → decrease κ
+         *   - chatter < 1 → fewer switches than prior expects → increase κ
+         *
+         * Secondary signal: learned_diag from Dirichlet posterior
+         *   - If learned_diag > prior_diag despite high chatter → κ too weak
+         *   - This catches cases where weak κ causes trajectory inflation
+         *
+         * LIMITATION: When κ is severely wrong, both signals can be corrupted.
+         * Adaptive κ works best as fine-tuning around a reasonable starting point.
+         *═══════════════════════════════════════════════════════════════════════*/
 
-        float min_diag = 1.0f / K + 0.01f;
-        if (target_diag < min_diag)
-            target_diag = min_diag;
-        if (target_diag > 0.999f)
-            target_diag = 0.999f;
+        /* Compute learned average diagonal from current transition matrix */
+        float learned_diag = 0.0f;
+        for (int k = 0; k < K; k++)
+        {
+            learned_diag += state->model.trans[k * K + k];
+        }
+        learned_diag /= (float)K;
 
-        float kappa_oracle = alpha * (target_diag * K - 1.0f) / (1.0f - target_diag);
+        /* MLE diagonal from raw counts (what trajectory actually shows) */
+        float mle_diag = 1.0f - observed_switch_rate;
 
-        if (kappa_oracle < state->kappa_min)
-            kappa_oracle = state->kappa_min;
-        if (kappa_oracle > state->kappa_max)
-            kappa_oracle = state->kappa_max;
+        float kappa_new = state->sticky_kappa;
 
-        float momentum = 0.8f;
-        float log_kappa_new = momentum * logf(state->sticky_kappa) +
-                              (1.0f - momentum) * logf(kappa_oracle);
-        float kappa_new = expf(log_kappa_new);
+        /*═══════════════════════════════════════════════════════════════════════
+         * INCREASE κ: Detect when prior is too weak
+         *
+         * Key insight: If MLE_diag > prior_diag, trajectory is stickier than
+         * prior expects, regardless of chatter value. This is a reliable signal
+         * that κ should increase.
+         *═══════════════════════════════════════════════════════════════════════*/
+        float mle_gap = mle_diag - prior_diag;
 
+        if (mle_gap > 0.02f)
+        {
+            /* Data stickier than prior → increase κ */
+            float target_diag = mle_diag;
+            if (target_diag > 0.995f)
+                target_diag = 0.995f;
+
+            float kappa_target = alpha * (target_diag * K - 1.0f) / (1.0f - target_diag);
+
+            if (kappa_target > state->sticky_kappa)
+            {
+                /* Smooth increase toward target */
+                float increase_rate = 0.15f + 0.3f * mle_gap;
+                if (increase_rate > 0.4f)
+                    increase_rate = 0.4f;
+
+                kappa_new = state->sticky_kappa + increase_rate * (kappa_target - state->sticky_kappa);
+            }
+        }
+        else if (chatter > 1.05f && mle_gap < 0.01f)
+        {
+            /*═══════════════════════════════════════════════════════════════════
+             * DECREASE κ: More switches than expected AND MLE confirms
+             *
+             * Both MLE and chatter agree data is less sticky than prior.
+             *═══════════════════════════════════════════════════════════════════*/
+            float target_switch_rate = expected_switch_rate * chatter;
+            float target_diag = 1.0f - target_switch_rate;
+
+            float min_diag = 1.0f / K + 0.01f;
+            if (target_diag < min_diag)
+                target_diag = min_diag;
+
+            float kappa_target = alpha * (target_diag * K - 1.0f) / (1.0f - target_diag);
+
+            if (kappa_target < 1.0f)
+                kappa_target = 1.0f;
+
+            /* Momentum-based decrease */
+            float momentum = 0.7f;
+            float log_curr = logf(state->sticky_kappa > 1.0f ? state->sticky_kappa : 1.0f);
+            float log_targ = logf(kappa_target);
+            float log_kappa_new = momentum * log_curr + (1.0f - momentum) * log_targ;
+            kappa_new = expf(log_kappa_new);
+        }
+        else if (chatter < 0.9f)
+        {
+            /*═══════════════════════════════════════════════════════════════════
+             * INCREASE κ: Fewer switches than expected
+             *
+             * Classic signal that prior is too weak.
+             *═══════════════════════════════════════════════════════════════════*/
+            kappa_new = state->sticky_kappa * (1.0f + 0.05f * (1.0f - chatter));
+        }
+        else
+        {
+            /*═══════════════════════════════════════════════════════════════════
+             * STABLE: Chatter near 1.0, small MLE gap
+             *
+             * Minor drift toward equilibrium.
+             *═══════════════════════════════════════════════════════════════════*/
+            if (chatter > 1.1f)
+            {
+                kappa_new = state->sticky_kappa * 0.98f;
+            }
+            else if (chatter < 0.95f)
+            {
+                kappa_new = state->sticky_kappa * 1.02f;
+            }
+        }
+
+        /* Clamp to bounds */
         if (kappa_new < state->kappa_min)
             kappa_new = state->kappa_min;
         if (kappa_new > state->kappa_max)
