@@ -479,13 +479,19 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.83f, 0.453f); /* Trend */
     rbpf_ext_set_regime_params(ext, 3, 0.1200f, -2.00f, 0.640f); /* Crisis */
 
+    /*
+rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.270f, 0.080f);
+rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.450f, 0.267f);
+rbpf_ext_set_regime_params(ext, 2, 0.0810f, -2.896f, 0.453f);
+rbpf_ext_set_regime_params(ext, 3, 0.1200f, -2.101f, 0.640f);
+    */
+
     /* Transition matrix (stickiness=0.92) */
     rbpf_real_t trans[16] = {
-        0.9877f, 0.0010f, 0.0016f, 0.0098f,
-        0.0226f, 0.9475f, 0.0101f, 0.0198f,
-        0.0213f, 0.0063f, 0.9454f, 0.0271f,
-        0.0478f, 0.0041f, 0.0070f, 0.9411f};
-
+        0.920f, 0.056f, 0.020f, 0.004f,
+        0.032f, 0.920f, 0.036f, 0.012f,
+        0.012f, 0.036f, 0.920f, 0.032f,
+        0.004f, 0.020f, 0.056f, 0.920f};
     rbpf_ext_build_transition_lut(ext, trans);
 
     /* ═══════════════════════════════════════════════════════════════════════
