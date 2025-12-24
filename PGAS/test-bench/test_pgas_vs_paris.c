@@ -15,6 +15,7 @@
  *   - Frobenius > 0.5 → fundamentally different (likely bug)
  *   - Identical matrices → PARIS not actually being used
  *
+ * Updated for per-regime sigma_vol API (ALIGNED WITH RBPF)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 #include <stdio.h>
@@ -42,7 +43,7 @@ static inline uint32_t pcg32_random_r(pcg32_random_t *rng)
     rng->state = oldstate * 6364136223846793005ULL + rng->inc;
     uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
     uint32_t rot = (uint32_t)(oldstate >> 59u);
-    return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
+    return (xorshifted >> rot) | (xorshifted << ((0u - rot) & 31));
 }
 
 static inline void pcg32_srandom_r(pcg32_random_t *rng, uint64_t seed, uint64_t seq)
@@ -93,8 +94,8 @@ static void generate_synthetic_data(SyntheticData *data, int T, uint64_t seed)
     /* Model parameters */
     const int K = 4;
     const float mu_vol[4] = {-4.50f, -3.67f, -2.83f, -2.00f};
+    const float sigma_vol[4] = {0.08f, 0.267f, 0.453f, 0.64f}; /* Per-regime */
     const float phi = 0.97f;
-    const float sigma_h = 0.15f;
 
     /* True transition matrix (what we want PGAS to learn) */
     const float true_trans[16] = {
@@ -124,9 +125,9 @@ static void generate_synthetic_data(SyntheticData *data, int T, uint64_t seed)
         }
         z = new_z;
 
-        /* h dynamics: h_t = mu_z * (1-phi) + phi * h_{t-1} + sigma_h * eps */
+        /* h dynamics: h_t = mu_z * (1-phi) + phi * h_{t-1} + sigma_vol[z] * eps */
         float eps_h = (float)pcg32_normal(&rng);
-        h = mu_vol[z] * (1.0f - phi) + phi * h + sigma_h * eps_h;
+        h = mu_vol[z] * (1.0f - phi) + phi * h + sigma_vol[z] * eps_h;
 
         /* Observation: y_t = log(r_t^2) where r_t = exp(h_t/2) * eps */
         float eps_r = (float)pcg32_normal(&rng);
@@ -268,11 +269,10 @@ int main(void)
         printf(" ]\n");
     }
 
-    /* Model parameters */
+    /* Model parameters - per-regime sigma_vol */
     const double mu_vol_d[4] = {-4.50, -3.67, -2.83, -2.00};
     const double sigma_vol_d[4] = {0.08, 0.267, 0.453, 0.64};
     const double phi_d = 0.97;
-    const double sigma_h_d = 0.15;
 
     /* Initial uniform transition matrix */
     double init_trans[16];
@@ -323,8 +323,8 @@ int main(void)
         return 1;
     }
 
-    /* Configure */
-    pgas_mkl_set_model(pgas_A, init_trans, mu_vol_d, sigma_vol_d, phi_d, sigma_h_d);
+    /* Configure - Updated API: no sigma_h argument */
+    pgas_mkl_set_model(pgas_A, init_trans, mu_vol_d, sigma_vol_d, phi_d);
     pgas_mkl_set_transition_prior(pgas_A, 1.0f, 50.0f);
     pgas_mkl_enable_adaptive_kappa(pgas_A, 1);
     pgas_mkl_configure_adaptive_kappa(pgas_A, 30.0f, 150.0f, 0.0f, 0.0f);
@@ -395,8 +395,8 @@ int main(void)
         return 1;
     }
 
-    /* Same configuration */
-    pgas_mkl_set_model(pgas_B, init_trans, mu_vol_d, sigma_vol_d, phi_d, sigma_h_d);
+    /* Same configuration - Updated API: no sigma_h argument */
+    pgas_mkl_set_model(pgas_B, init_trans, mu_vol_d, sigma_vol_d, phi_d);
     pgas_mkl_set_transition_prior(pgas_B, 1.0f, 50.0f);
     pgas_mkl_enable_adaptive_kappa(pgas_B, 1);
     pgas_mkl_configure_adaptive_kappa(pgas_B, 30.0f, 150.0f, 0.0f, 0.0f);

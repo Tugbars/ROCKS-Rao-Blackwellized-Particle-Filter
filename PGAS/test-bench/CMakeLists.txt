@@ -85,18 +85,18 @@ target_compile_definitions(test_lifeboat PRIVATE ${COMMON_DEFS})
 #   C. PGAS as warm start for tuner
 #───────────────────────────────────────────────────────────────────────────────
 
-add_executable(pgas_validation_a
-    pgas_validation_a.c
-)
+#add_executable(pgas_validation_a
+#    pgas_validation_a.c
+#)
 
-target_link_libraries(pgas_validation_a
-    PRIVATE
-        pgas_mkl
-        MKL::MKL
-)
+#target_link_libraries(pgas_validation_a
+#    PRIVATE
+#        pgas_mkl
+#        MKL::MKL
+#)
 
-target_compile_options(pgas_validation_a PRIVATE ${PGAS_COMPILE_FLAGS})
-target_compile_definitions(pgas_validation_a PRIVATE ${COMMON_DEFS})
+#target_compile_options(pgas_validation_a PRIVATE ${PGAS_COMPILE_FLAGS})
+#target_compile_definitions(pgas_validation_a PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
 # Validation: Adaptive Kappa
