@@ -45,7 +45,106 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * CROSS-PLATFORM ATOMIC TYPES
+ *
+ * MSVC doesn't support C11 <stdatomic.h> in C mode, so we use Windows
+ * Interlocked functions on MSVC and C11 atomics on GCC/Clang.
+ *
+ * On x86/x64, aligned 32/64-bit loads are naturally atomic.
+ * We use volatile to prevent compiler reordering, and explicit barriers
+ * where memory ordering is needed (seqlock pattern requires acquire/release).
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#if defined(_MSC_VER)
+/* MSVC: Use Windows Interlocked functions + volatile for aligned loads */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <intrin.h>
+
+typedef volatile LONG rbpf_atomic_int;
+typedef volatile LONG64 rbpf_atomic_int64;
+typedef volatile LONG rbpf_atomic_uint32;
+
+/*─────────────────────────────────────────────────────────────────────────
+ * LOADS: On x86/x64, aligned volatile reads are atomic.
+ * We add _ReadBarrier() for acquire semantics where needed.
+ *─────────────────────────────────────────────────────────────────────────*/
+
+/* Relaxed load - just atomicity, no ordering guarantee */
+#define RBPF_ATOMIC_LOAD_INT_RELAXED(ptr) (*(volatile LONG *)(ptr))
+#define RBPF_ATOMIC_LOAD_INT64_RELAXED(ptr) (*(volatile LONG64 *)(ptr))
+#define RBPF_ATOMIC_LOAD_UINT32_RELAXED(ptr) ((uint32_t)(*(volatile LONG *)(ptr)))
+
+/* Acquire load - ensures subsequent reads see prior writes */
+static __forceinline LONG rbpf_atomic_load_int_acquire(volatile LONG const *ptr)
+{
+    LONG val = *ptr;
+    _ReadBarrier();
+    return val;
+}
+static __forceinline LONG64 rbpf_atomic_load_int64_acquire(volatile LONG64 const *ptr)
+{
+    LONG64 val = *ptr;
+    _ReadBarrier();
+    return val;
+}
+static __forceinline uint32_t rbpf_atomic_load_uint32_acquire(volatile LONG const *ptr)
+{
+    LONG val = *ptr;
+    _ReadBarrier();
+    return (uint32_t)val;
+}
+
+/* Default loads use acquire semantics (safe for seqlock) */
+#define RBPF_ATOMIC_LOAD_INT(ptr) rbpf_atomic_load_int_acquire((volatile LONG const *)(ptr))
+#define RBPF_ATOMIC_LOAD_INT64(ptr) rbpf_atomic_load_int64_acquire((volatile LONG64 const *)(ptr))
+#define RBPF_ATOMIC_LOAD_UINT32(ptr) rbpf_atomic_load_uint32_acquire((volatile LONG const *)(ptr))
+
+/*─────────────────────────────────────────────────────────────────────────
+ * STORES: Use InterlockedExchange for release semantics.
+ * This ensures prior writes are visible before the store completes.
+ *─────────────────────────────────────────────────────────────────────────*/
+#define RBPF_ATOMIC_STORE_INT(ptr, val) InterlockedExchange((volatile LONG *)(ptr), (val))
+#define RBPF_ATOMIC_STORE_INT64(ptr, val) InterlockedExchange64((volatile LONG64 *)(ptr), (val))
+#define RBPF_ATOMIC_STORE_UINT32(ptr, val) InterlockedExchange((volatile LONG *)(ptr), (LONG)(val))
+
+/*─────────────────────────────────────────────────────────────────────────
+ * READ-MODIFY-WRITE: Full atomic operations
+ *─────────────────────────────────────────────────────────────────────────*/
+#define RBPF_ATOMIC_FETCH_ADD_INT(ptr, val) InterlockedExchangeAdd((volatile LONG *)(ptr), (val))
+#define RBPF_ATOMIC_FETCH_ADD_INT64(ptr, val) InterlockedExchangeAdd64((volatile LONG64 *)(ptr), (val))
+#define RBPF_ATOMIC_FETCH_ADD_UINT32(ptr, val) ((uint32_t)InterlockedExchangeAdd((volatile LONG *)(ptr), (LONG)(val)))
+
+#else
+/* GCC/Clang: Use C11 atomics */
 #include <stdatomic.h>
+
+typedef _Atomic int rbpf_atomic_int;
+typedef _Atomic int64_t rbpf_atomic_int64;
+typedef _Atomic uint32_t rbpf_atomic_uint32;
+
+/* Relaxed loads */
+#define RBPF_ATOMIC_LOAD_INT_RELAXED(ptr) atomic_load_explicit((ptr), memory_order_relaxed)
+#define RBPF_ATOMIC_LOAD_INT64_RELAXED(ptr) atomic_load_explicit((ptr), memory_order_relaxed)
+#define RBPF_ATOMIC_LOAD_UINT32_RELAXED(ptr) atomic_load_explicit((ptr), memory_order_relaxed)
+
+/* Acquire loads (default) */
+#define RBPF_ATOMIC_LOAD_INT(ptr) atomic_load_explicit((ptr), memory_order_acquire)
+#define RBPF_ATOMIC_LOAD_INT64(ptr) atomic_load_explicit((ptr), memory_order_acquire)
+#define RBPF_ATOMIC_LOAD_UINT32(ptr) atomic_load_explicit((ptr), memory_order_acquire)
+
+/* Release stores */
+#define RBPF_ATOMIC_STORE_INT(ptr, val) atomic_store_explicit((ptr), (val), memory_order_release)
+#define RBPF_ATOMIC_STORE_INT64(ptr, val) atomic_store_explicit((ptr), (val), memory_order_release)
+#define RBPF_ATOMIC_STORE_UINT32(ptr, val) atomic_store_explicit((ptr), (val), memory_order_release)
+
+/* Fetch-add with acquire-release semantics */
+#define RBPF_ATOMIC_FETCH_ADD_INT(ptr, val) atomic_fetch_add_explicit((ptr), (val), memory_order_acq_rel)
+#define RBPF_ATOMIC_FETCH_ADD_INT64(ptr, val) atomic_fetch_add_explicit((ptr), (val), memory_order_acq_rel)
+#define RBPF_ATOMIC_FETCH_ADD_UINT32(ptr, val) atomic_fetch_add_explicit((ptr), (val), memory_order_acq_rel)
+#endif
 
 #ifdef __cplusplus
 extern "C"
@@ -95,12 +194,12 @@ extern "C"
         float *h;     /* [T_max] log-vol at each tick */
 
         /* Buffer state - atomic for thread safety */
-        _Atomic int head;            /* Next write position */
-        _Atomic int count;           /* Number of valid entries (up to T_max) */
-        _Atomic int64_t total_ticks; /* Total ticks recorded */
+        rbpf_atomic_int head;          /* Next write position */
+        rbpf_atomic_int count;         /* Number of valid entries (up to T_max) */
+        rbpf_atomic_int64 total_ticks; /* Total ticks recorded */
 
         /* Seqlock for consistent snapshots */
-        _Atomic uint32_t seq; /* Sequence number (odd = write in progress) */
+        rbpf_atomic_uint32 seq; /* Sequence number (odd = write in progress) */
 
         /* RNG state for tempering (xoroshiro128+) */
         uint64_t rng_state[2];

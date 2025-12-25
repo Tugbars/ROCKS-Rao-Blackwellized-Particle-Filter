@@ -3,7 +3,7 @@
  * @brief Trajectory Buffer Implementation
  *
  * THREAD SAFETY:
- * - Uses C11 atomics for head/count/seq
+ * - Uses cross-platform atomics (C11 on GCC/Clang, Interlocked on MSVC)
  * - Seqlock pattern for consistent snapshots
  * - Memory barriers ensure visibility across threads
  */
@@ -15,14 +15,22 @@
 #include <math.h>
 
 /*═══════════════════════════════════════════════════════════════════════════
- * MEMORY BARRIERS
+ * CROSS-PLATFORM MEMORY BARRIERS
  *═══════════════════════════════════════════════════════════════════════════*/
 
-/* Compiler barrier - prevents reordering */
+#if defined(_MSC_VER)
+/* MSVC: Use compiler intrinsics */
+#include <intrin.h>
+#define COMPILER_BARRIER() _ReadWriteBarrier()
+#define MEMORY_FENCE() MemoryBarrier()
+#elif defined(__GNUC__) || defined(__clang__)
+/* GCC/Clang: Use builtins */
 #define COMPILER_BARRIER() __asm__ __volatile__("" ::: "memory")
-
-/* Full memory fence */
-#define MEMORY_FENCE() atomic_thread_fence(memory_order_seq_cst)
+#define MEMORY_FENCE() __sync_synchronize()
+#else
+#define COMPILER_BARRIER()
+#define MEMORY_FENCE()
+#endif
 
 /*═══════════════════════════════════════════════════════════════════════════
  * RNG (xoroshiro128+)
@@ -121,10 +129,10 @@ int rbpf_trajectory_init(RBPFTrajectory *traj, const RBPFTrajectoryConfig *confi
     seed_rng(traj->rng_state, traj->config.seed);
 
     /* Initialize atomic fields */
-    atomic_store(&traj->head, 0);
-    atomic_store(&traj->count, 0);
-    atomic_store(&traj->total_ticks, 0);
-    atomic_store(&traj->seq, 0); /* Even = no write in progress */
+    RBPF_ATOMIC_STORE_INT(&traj->head, 0);
+    RBPF_ATOMIC_STORE_INT(&traj->count, 0);
+    RBPF_ATOMIC_STORE_INT64(&traj->total_ticks, 0);
+    RBPF_ATOMIC_STORE_UINT32(&traj->seq, 0); /* Even = no write in progress */
 
     traj->oldest_tick = 0;
     traj->initialized = true;
@@ -144,24 +152,24 @@ void rbpf_trajectory_reset(RBPFTrajectory *traj)
         return;
 
     /* Acquire seqlock for write */
-    uint32_t seq = atomic_load(&traj->seq);
-    atomic_store(&traj->seq, seq + 1); /* Odd = write in progress */
+    uint32_t seq = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
+    RBPF_ATOMIC_STORE_UINT32(&traj->seq, seq + 1); /* Odd = write in progress */
     MEMORY_FENCE();
 
     int T = traj->config.T_max;
     memset(traj->regimes, 0, T * sizeof(int));
     memset(traj->h, 0, T * sizeof(float));
 
-    atomic_store(&traj->head, 0);
-    atomic_store(&traj->count, 0);
-    atomic_store(&traj->total_ticks, 0);
+    RBPF_ATOMIC_STORE_INT(&traj->head, 0);
+    RBPF_ATOMIC_STORE_INT(&traj->count, 0);
+    RBPF_ATOMIC_STORE_INT64(&traj->total_ticks, 0);
     traj->oldest_tick = 0;
 
     seed_rng(traj->rng_state, traj->config.seed);
 
     /* Release seqlock */
     MEMORY_FENCE();
-    atomic_store(&traj->seq, seq + 2); /* Even = write complete */
+    RBPF_ATOMIC_STORE_UINT32(&traj->seq, seq + 2); /* Even = write complete */
 }
 
 void rbpf_trajectory_free(RBPFTrajectory *traj)
@@ -198,12 +206,12 @@ void rbpf_trajectory_record(RBPFTrajectory *traj, int regime, float h)
     int T_max = traj->config.T_max;
 
     /* Begin write - set seq to odd */
-    uint32_t seq = atomic_load_explicit(&traj->seq, memory_order_relaxed);
-    atomic_store_explicit(&traj->seq, seq + 1, memory_order_release);
+    uint32_t seq = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
+    RBPF_ATOMIC_STORE_UINT32(&traj->seq, seq + 1);
 
     /* Get current position */
-    int head = atomic_load_explicit(&traj->head, memory_order_relaxed);
-    int count = atomic_load_explicit(&traj->count, memory_order_relaxed);
+    int head = RBPF_ATOMIC_LOAD_INT(&traj->head);
+    int count = RBPF_ATOMIC_LOAD_INT(&traj->count);
 
     /* Write data */
     traj->regimes[head] = regime;
@@ -214,9 +222,9 @@ void rbpf_trajectory_record(RBPFTrajectory *traj, int regime, float h)
     int new_count = (count < T_max) ? count + 1 : T_max;
 
     /* Update atomic state */
-    atomic_store_explicit(&traj->head, new_head, memory_order_relaxed);
-    atomic_store_explicit(&traj->count, new_count, memory_order_relaxed);
-    atomic_fetch_add_explicit(&traj->total_ticks, 1, memory_order_relaxed);
+    RBPF_ATOMIC_STORE_INT(&traj->head, new_head);
+    RBPF_ATOMIC_STORE_INT(&traj->count, new_count);
+    RBPF_ATOMIC_FETCH_ADD_INT64(&traj->total_ticks, 1);
 
     if (count >= T_max)
     {
@@ -224,7 +232,7 @@ void rbpf_trajectory_record(RBPFTrajectory *traj, int regime, float h)
     }
 
     /* End write - set seq to even */
-    atomic_store_explicit(&traj->seq, seq + 2, memory_order_release);
+    RBPF_ATOMIC_STORE_UINT32(&traj->seq, seq + 2);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -261,7 +269,7 @@ RBPFTrajectoryExtractResult rbpf_trajectory_extract(
 
     do
     {
-        seq1 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+        seq1 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
 
         /* Wait if write in progress (seq is odd) */
         while (seq1 & 1)
@@ -271,16 +279,16 @@ RBPFTrajectoryExtractResult rbpf_trajectory_extract(
                 return result; /* Give up */
             }
             COMPILER_BARRIER();
-            seq1 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+            seq1 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
         }
 
         /* Read state */
-        head = atomic_load_explicit(&traj->head, memory_order_acquire);
-        count = atomic_load_explicit(&traj->count, memory_order_acquire);
-        total_ticks = atomic_load_explicit(&traj->total_ticks, memory_order_acquire);
+        head = RBPF_ATOMIC_LOAD_INT(&traj->head);
+        count = RBPF_ATOMIC_LOAD_INT(&traj->count);
+        total_ticks = RBPF_ATOMIC_LOAD_INT64(&traj->total_ticks);
 
         /* Verify no concurrent write */
-        seq2 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+        seq2 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
 
     } while (seq1 != seq2 && ++retries < max_retries);
 
@@ -345,20 +353,20 @@ RBPFTrajectoryExtractResult rbpf_trajectory_extract_double(
 
     do
     {
-        seq1 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+        seq1 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
         while (seq1 & 1)
         {
             if (++retries > max_retries * 100)
                 return result;
             COMPILER_BARRIER();
-            seq1 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+            seq1 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
         }
 
-        head = atomic_load_explicit(&traj->head, memory_order_acquire);
-        count = atomic_load_explicit(&traj->count, memory_order_acquire);
-        total_ticks = atomic_load_explicit(&traj->total_ticks, memory_order_acquire);
+        head = RBPF_ATOMIC_LOAD_INT(&traj->head);
+        count = RBPF_ATOMIC_LOAD_INT(&traj->count);
+        total_ticks = RBPF_ATOMIC_LOAD_INT64(&traj->total_ticks);
 
-        seq2 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+        seq2 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
     } while (seq1 != seq2 && ++retries < max_retries);
 
     if (seq1 != seq2)
@@ -394,14 +402,14 @@ int rbpf_trajectory_length(const RBPFTrajectory *traj)
 {
     if (!traj || !traj->initialized)
         return 0;
-    return atomic_load_explicit(&traj->count, memory_order_acquire);
+    return RBPF_ATOMIC_LOAD_INT(&traj->count);
 }
 
 bool rbpf_trajectory_ready(const RBPFTrajectory *traj, int min_length)
 {
     if (!traj || !traj->initialized)
         return false;
-    return atomic_load_explicit(&traj->count, memory_order_acquire) >= min_length;
+    return RBPF_ATOMIC_LOAD_INT(&traj->count) >= min_length;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -460,11 +468,11 @@ int rbpf_trajectory_last_regime(const RBPFTrajectory *traj)
     if (!traj || !traj->initialized)
         return -1;
 
-    int count = atomic_load_explicit(&traj->count, memory_order_acquire);
+    int count = RBPF_ATOMIC_LOAD_INT(&traj->count);
     if (count == 0)
         return -1;
 
-    int head = atomic_load_explicit(&traj->head, memory_order_acquire);
+    int head = RBPF_ATOMIC_LOAD_INT(&traj->head);
     int T_max = traj->config.T_max;
     int last_idx = (head - 1 + T_max) % T_max;
     return traj->regimes[last_idx];
@@ -475,11 +483,11 @@ float rbpf_trajectory_last_h(const RBPFTrajectory *traj)
     if (!traj || !traj->initialized)
         return 0.0f;
 
-    int count = atomic_load_explicit(&traj->count, memory_order_acquire);
+    int count = RBPF_ATOMIC_LOAD_INT(&traj->count);
     if (count == 0)
         return 0.0f;
 
-    int head = atomic_load_explicit(&traj->head, memory_order_acquire);
+    int head = RBPF_ATOMIC_LOAD_INT(&traj->head);
     int T_max = traj->config.T_max;
     int last_idx = (head - 1 + T_max) % T_max;
     return traj->h[last_idx];
@@ -489,7 +497,7 @@ int64_t rbpf_trajectory_total_ticks(const RBPFTrajectory *traj)
 {
     if (!traj || !traj->initialized)
         return 0;
-    return atomic_load_explicit(&traj->total_ticks, memory_order_acquire);
+    return RBPF_ATOMIC_LOAD_INT64(&traj->total_ticks);
 }
 
 void rbpf_trajectory_regime_distribution(
@@ -509,11 +517,11 @@ void rbpf_trajectory_regime_distribution(
         probs_out[r] = 0.0f;
     }
 
-    int count = atomic_load_explicit(&traj->count, memory_order_acquire);
+    int count = RBPF_ATOMIC_LOAD_INT(&traj->count);
     if (count == 0)
         return;
 
-    int head = atomic_load_explicit(&traj->head, memory_order_acquire);
+    int head = RBPF_ATOMIC_LOAD_INT(&traj->head);
 
     /* Count occurrences */
     int counts[RBPF_TRAJ_MAX_REGIMES] = {0};
@@ -603,7 +611,7 @@ int rbpf_trajectory_snapshot(const RBPFTrajectory *traj,
     do
     {
         /* Wait for any write to complete */
-        seq1 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+        seq1 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
         while (seq1 & 1)
         {
             if (++retries > max_retries * 100)
@@ -612,13 +620,13 @@ int rbpf_trajectory_snapshot(const RBPFTrajectory *traj,
                 return -1;
             }
             COMPILER_BARRIER();
-            seq1 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+            seq1 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
         }
 
         /* Copy state */
-        snap->head = atomic_load_explicit(&traj->head, memory_order_acquire);
-        snap->count = atomic_load_explicit(&traj->count, memory_order_acquire);
-        snap->total_ticks = atomic_load_explicit(&traj->total_ticks, memory_order_acquire);
+        snap->head = RBPF_ATOMIC_LOAD_INT(&traj->head);
+        snap->count = RBPF_ATOMIC_LOAD_INT(&traj->count);
+        snap->total_ticks = RBPF_ATOMIC_LOAD_INT64(&traj->total_ticks);
 
         /* Copy data buffers */
         memcpy(snap->regimes, traj->regimes, T_max * sizeof(int));
@@ -626,7 +634,7 @@ int rbpf_trajectory_snapshot(const RBPFTrajectory *traj,
 
         /* Verify no write occurred during copy */
         MEMORY_FENCE();
-        seq2 = atomic_load_explicit(&traj->seq, memory_order_acquire);
+        seq2 = RBPF_ATOMIC_LOAD_UINT32(&traj->seq);
 
     } while (seq1 != seq2 && ++retries < max_retries);
 
@@ -740,9 +748,9 @@ void rbpf_trajectory_print_state(const RBPFTrajectory *traj)
         return;
     }
 
-    int count = atomic_load_explicit(&traj->count, memory_order_acquire);
-    int head = atomic_load_explicit(&traj->head, memory_order_acquire);
-    int64_t total = atomic_load_explicit(&traj->total_ticks, memory_order_acquire);
+    int count = RBPF_ATOMIC_LOAD_INT(&traj->count);
+    int head = RBPF_ATOMIC_LOAD_INT(&traj->head);
+    int64_t total = RBPF_ATOMIC_LOAD_INT64(&traj->total_ticks);
 
     printf("═══════════════════════════════════════════════════════════\n");
     printf("RBPF TRAJECTORY BUFFER STATE\n");
@@ -756,7 +764,7 @@ void rbpf_trajectory_print_state(const RBPFTrajectory *traj)
            100.0f * (float)count / (float)traj->config.T_max);
     printf("Total ticks:    %lld\n", (long long)total);
     printf("Head position:  %d\n", head);
-    printf("Seqlock:        %u\n", atomic_load(&traj->seq));
+    printf("Seqlock:        %u\n", RBPF_ATOMIC_LOAD_UINT32(&traj->seq));
 
     if (count > 0)
     {
@@ -785,9 +793,9 @@ void rbpf_trajectory_print_tail(const RBPFTrajectory *traj, int n)
         return;
     }
 
-    int count = atomic_load_explicit(&traj->count, memory_order_acquire);
-    int head = atomic_load_explicit(&traj->head, memory_order_acquire);
-    int64_t total = atomic_load_explicit(&traj->total_ticks, memory_order_acquire);
+    int count = RBPF_ATOMIC_LOAD_INT(&traj->count);
+    int head = RBPF_ATOMIC_LOAD_INT(&traj->head);
+    int64_t total = RBPF_ATOMIC_LOAD_INT64(&traj->total_ticks);
 
     if (count == 0)
     {
