@@ -27,337 +27,421 @@
 #include <stdint.h>
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-/*═══════════════════════════════════════════════════════════════════════════
- * COMPILE-TIME CONFIGURATION
- *═══════════════════════════════════════════════════════════════════════════*/
+    /*═══════════════════════════════════════════════════════════════════════════
+     * COMPILE-TIME CONFIGURATION
+     *═══════════════════════════════════════════════════════════════════════════*/
 
-#define SAEM_MAX_REGIMES        8       /* Maximum number of regimes */
-#define SAEM_TRANS_FLOOR        1e-5f   /* Minimum transition probability */
-#define SAEM_GAMMA_MIN          0.02f   /* Minimum blending weight */
-#define SAEM_GAMMA_MAX          0.50f   /* Maximum blending weight */
-#define SAEM_GAMMA_DEFAULT      0.15f   /* Default blending weight */
+#define SAEM_MAX_REGIMES 8       /* Maximum number of regimes */
+#define SAEM_TRANS_FLOOR 1e-5f   /* Minimum transition probability */
+#define SAEM_GAMMA_MIN 0.02f     /* Minimum blending weight */
+#define SAEM_GAMMA_MAX 0.50f     /* Maximum blending weight */
+#define SAEM_GAMMA_DEFAULT 0.15f /* Default blending weight */
 
-/*═══════════════════════════════════════════════════════════════════════════
- * CONFIGURATION
- *═══════════════════════════════════════════════════════════════════════════*/
+    /*═══════════════════════════════════════════════════════════════════════════
+     * CONFIGURATION
+     *═══════════════════════════════════════════════════════════════════════════*/
 
-/**
- * Adaptive γ configuration
- */
-typedef struct {
-    /* Base learning rate */
-    float gamma_base;              /* Starting γ (e.g., 0.15) */
-    
-    /* Robbins-Monro decay */
-    bool  use_robbins_monro;       /* Enable 1/√t decay */
-    float rm_offset;               /* Offset to prevent early γ → 0 */
-    
-    /* Acceptance rate adaptation */
-    float accept_high;             /* Threshold for "high" acceptance (e.g., 0.4) */
-    float accept_low;              /* Threshold for "low" acceptance (e.g., 0.15) */
-    float accept_gamma_boost;      /* Multiplier when acceptance high (e.g., 1.5) */
-    float accept_gamma_penalty;    /* Multiplier when acceptance low (e.g., 0.5) */
-    
-    /* Surprise adaptation */
-    float surprise_threshold;      /* σ level to boost γ (e.g., 2.0) */
-    float surprise_gamma_boost;    /* Multiplier when surprised (e.g., 1.3) */
-    
-    /* Diversity adaptation */
-    float diversity_threshold;     /* ESS fraction for "high diversity" (e.g., 0.5) */
-    float diversity_gamma_boost;   /* Multiplier when diverse (e.g., 1.2) */
-    
-} SAEMGammaConfig;
+    /**
+     * Adaptive γ configuration
+     */
+    typedef struct
+    {
+        /* Base learning rate */
+        float gamma_base; /* Starting γ (e.g., 0.15) */
 
-/**
- * Stickiness (κ) control configuration
- */
-typedef struct {
-    bool  control_stickiness;      /* Enable κ drift control */
-    float target_diag_min;         /* Minimum average diagonal (e.g., 0.90) */
-    float target_diag_max;         /* Maximum average diagonal (e.g., 0.98) */
-    float stickiness_ema_alpha;    /* EMA for tracking κ drift (e.g., 0.1) */
-} SAEMStickinessConfig;
+        /* Robbins-Monro decay */
+        bool use_robbins_monro; /* Enable 1/√t decay */
+        float rm_offset;        /* Offset to prevent early γ → 0 */
 
-/**
- * Tempered path injection (anti-confirmation bias)
- */
-typedef struct {
-    bool  enable_tempering;        /* Enable path tempering */
-    float flip_probability;        /* Fraction of timesteps to flip (e.g., 0.05) */
-    uint64_t seed;                 /* RNG seed for reproducibility */
-} SAEMTemperingConfig;
+        /* Acceptance rate adaptation */
+        float accept_high;          /* Threshold for "high" acceptance (e.g., 0.4) */
+        float accept_low;           /* Threshold for "low" acceptance (e.g., 0.15) */
+        float accept_gamma_boost;   /* Multiplier when acceptance high (e.g., 1.5) */
+        float accept_gamma_penalty; /* Multiplier when acceptance low (e.g., 0.5) */
 
-/**
- * Full SAEM Blender configuration
- */
-typedef struct {
-    int   n_regimes;               /* Number of regimes (K) */
-    
-    SAEMGammaConfig gamma;         /* Adaptive γ settings */
-    SAEMStickinessConfig stickiness; /* κ control settings */
-    SAEMTemperingConfig tempering; /* Anti-confirmation bias */
-    
-    /* Safety bounds */
-    float trans_floor;             /* Minimum Π_ij (default: 1e-5) */
-    float trans_ceiling;           /* Maximum Π_ij (default: 0.9999) */
-    
-    /* Diagnostics */
-    bool  track_history;           /* Store blend history for debugging */
-    int   history_capacity;        /* Max history entries */
-    
-} SAEMBlenderConfig;
+        /* Surprise adaptation */
+        float surprise_threshold;   /* σ level to boost γ (e.g., 2.0) */
+        float surprise_gamma_boost; /* Multiplier when surprised (e.g., 1.3) */
 
-/*═══════════════════════════════════════════════════════════════════════════
- * STATE STRUCTURES
- *═══════════════════════════════════════════════════════════════════════════*/
+        /* Diversity adaptation */
+        float diversity_threshold;   /* ESS fraction for "high diversity" (e.g., 0.5) */
+        float diversity_gamma_boost; /* Multiplier when diverse (e.g., 1.2) */
 
-/**
- * Blend event record (for diagnostics)
- */
-typedef struct {
-    int   tick;                    /* When blend occurred */
-    float gamma_used;              /* Actual γ after adaptation */
-    float acceptance_rate;         /* PGAS acceptance */
-    float diversity;               /* ESS / N_particles */
-    float surprise_sigma;          /* Hawkes surprise at trigger */
-    float pre_diag_avg;            /* Average diagonal before blend */
-    float post_diag_avg;           /* Average diagonal after blend */
-    float kl_divergence;           /* KL(Π_new || Π_old) */
-} SAEMBlendEvent;
+    } SAEMGammaConfig;
 
-/**
- * Main SAEM Blender state
- */
-typedef struct {
-    /* Configuration */
-    SAEMBlenderConfig config;
-    
-    /* Sufficient statistics Q[i][j] = pseudo-counts */
-    float Q[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];
-    
-    /* Current transition matrix (derived from Q) */
-    float Pi[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];
-    
-    /* Running statistics for adaptation */
-    int   total_blends;            /* Lifetime blend count */
-    float acceptance_ema;          /* EMA of acceptance rates */
-    float diag_ema;                /* EMA of average diagonal (κ proxy) */
-    float gamma_current;           /* Current (possibly adapted) γ */
-    
-    /* Tempered path RNG state */
-    uint64_t rng_state;
-    
-    /* History buffer (circular) */
-    SAEMBlendEvent *history;       /* Allocated if track_history */
-    int   history_head;
-    int   history_count;
-    
-    /* Validation */
-    bool  initialized;
-    
-} SAEMBlender;
+    /**
+     * Stickiness (κ) control configuration
+     */
+    typedef struct
+    {
+        bool control_stickiness;    /* Enable κ drift control */
+        float target_diag_min;      /* Minimum average diagonal (e.g., 0.90) */
+        float target_diag_max;      /* Maximum average diagonal (e.g., 0.98) */
+        float stickiness_ema_alpha; /* EMA for tracking κ drift (e.g., 0.1) */
+    } SAEMStickinessConfig;
 
-/*═══════════════════════════════════════════════════════════════════════════
- * ORACLE OUTPUT STRUCTURE
- *═══════════════════════════════════════════════════════════════════════════*/
+    /**
+     * Tempered path injection (anti-confirmation bias)
+     */
+    typedef struct
+    {
+        bool enable_tempering;  /* Enable path tempering */
+        float flip_probability; /* Fraction of timesteps to flip (e.g., 0.05) */
+        uint64_t seed;          /* RNG seed for reproducibility */
+    } SAEMTemperingConfig;
 
-/**
- * PGAS Oracle output (input to blender)
- * 
- * This is what PGAS produces after a batch run.
- */
-typedef struct {
-    /* Sufficient statistics: transition counts from PGAS trajectories */
-    float S[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];  /* S[i][j] = count i→j */
-    
-    /* MCMC diagnostics */
-    float acceptance_rate;         /* Fraction of accepted proposals */
-    float ess_fraction;            /* ESS / N_particles */
-    
-    /* Metadata */
-    int   n_regimes;               /* Must match blender config */
-    int   n_trajectories;          /* Number of PGAS trajectories averaged */
-    int   trajectory_length;       /* T for this batch */
-    
-    /* Trigger context */
-    float trigger_surprise;        /* Hawkes surprise that triggered Oracle */
-    
-} PGASOutput;
+    /**
+     * Three-Tier Reset configuration (Phase Shift Handling)
+     *
+     * Tier 1 (Normal):   Standard γ blend           [innovation < P90]
+     * Tier 2 (Partial):  Forget 50%, γ×2            [innovation ∈ [P90, P99)]
+     * Tier 3 (Full):     Reset Q to prior           [innovation ≥ P99 AND dual-gate]
+     *
+     * Innovation = max(KL_surprise, hawkes_surprise)
+     */
+    typedef struct
+    {
+        bool enable_tiered_reset; /* Enable three-tier logic (default: true) */
 
-/*═══════════════════════════════════════════════════════════════════════════
- * API - LIFECYCLE
- *═══════════════════════════════════════════════════════════════════════════*/
+        /* Tier thresholds (in σ units) */
+        float tier2_threshold; /* Innovation σ to trigger Tier 2 (default: 1.645 = P90) */
+        float tier3_threshold; /* Innovation σ to trigger Tier 3 (default: 2.326 = P99) */
 
-/**
- * Get default configuration
- */
-SAEMBlenderConfig saem_blender_config_defaults(int n_regimes);
+        /* Tier 2 parameters */
+        float tier2_forget_fraction;  /* Fraction of Q to forget (default: 0.5) */
+        float tier2_gamma_multiplier; /* γ multiplier (default: 2.0) */
 
-/**
- * Initialize blender
- *
- * @param blender   Blender state to initialize
- * @param cfg       Configuration (NULL for defaults with K=4)
- * @param init_Pi   Initial transition matrix [K×K] row-major (NULL for uniform)
- * @return 0 on success, -1 on error
- */
-int saem_blender_init(SAEMBlender *blender,
-                      const SAEMBlenderConfig *cfg,
-                      const float *init_Pi);
+        /* Tier 3 parameters - requires BOTH conditions */
+        float tier3_kl_threshold;     /* KL divergence threshold (default: 0.1) */
+        float tier3_hawkes_threshold; /* Hawkes surprise σ threshold (default: 5.0) */
 
-/**
- * Reset blender state (keep config)
- */
-void saem_blender_reset(SAEMBlender *blender, const float *init_Pi);
+        /* Innovation tracking */
+        float innovation_ema_alpha; /* EMA smoothing for innovation (default: 0.1) */
 
-/**
- * Free resources
- */
-void saem_blender_free(SAEMBlender *blender);
+    } SAEMResetConfig;
 
-/*═══════════════════════════════════════════════════════════════════════════
- * API - CORE BLENDING
- *═══════════════════════════════════════════════════════════════════════════*/
+    /**
+     * Reset tier (for diagnostics)
+     */
+    typedef enum
+    {
+        SAEM_TIER_NORMAL = 1,  /* Normal blend */
+        SAEM_TIER_PARTIAL = 2, /* Partial forget + boosted γ */
+        SAEM_TIER_FULL = 3     /* Full reset to prior */
+    } SAEMResetTier;
 
-/**
- * Result of a blend operation
- */
-typedef struct {
-    bool  success;                 /* Blend completed without error */
-    float gamma_used;              /* Actual γ after adaptation */
-    float kl_divergence;           /* KL(Π_new || Π_old) */
-    float diag_avg_before;         /* Average diagonal before */
-    float diag_avg_after;          /* Average diagonal after */
-    int   cells_floored;           /* Number of cells clamped to floor */
-    bool  stickiness_adjusted;     /* Whether κ control kicked in */
-} SAEMBlendResult;
+    /**
+     * Full SAEM Blender configuration
+     */
+    typedef struct
+    {
+        int n_regimes; /* Number of regimes (K) */
 
-/**
- * Blend PGAS output into current estimate
- *
- * This is the main entry point. Call this when PGAS completes.
- *
- * @param blender   Blender state
- * @param oracle    PGAS output (sufficient statistics + diagnostics)
- * @return Blend result with diagnostics
- */
-SAEMBlendResult saem_blender_blend(SAEMBlender *blender,
-                                    const PGASOutput *oracle);
+        SAEMGammaConfig gamma;           /* Adaptive γ settings */
+        SAEMStickinessConfig stickiness; /* κ control settings */
+        SAEMTemperingConfig tempering;   /* Anti-confirmation bias */
+        SAEMResetConfig reset;           /* Three-tier reset (phase shift handling) */
 
-/**
- * Get current transition matrix
- *
- * @param blender   Blender state
- * @param Pi_out    Output buffer [K×K] row-major
- */
-void saem_blender_get_Pi(const SAEMBlender *blender, float *Pi_out);
+        /* Safety bounds */
+        float trans_floor;   /* Minimum Π_ij (default: 1e-5) */
+        float trans_ceiling; /* Maximum Π_ij (default: 0.9999) */
 
-/**
- * Get current sufficient statistics
- *
- * @param blender   Blender state
- * @param Q_out     Output buffer [K×K] row-major
- */
-void saem_blender_get_Q(const SAEMBlender *blender, float *Q_out);
+        /* Diagnostics */
+        bool track_history;   /* Store blend history for debugging */
+        int history_capacity; /* Max history entries */
 
-/*═══════════════════════════════════════════════════════════════════════════
- * API - TEMPERED PATH GENERATION
- *═══════════════════════════════════════════════════════════════════════════*/
+    } SAEMBlenderConfig;
 
-/**
- * Generate tempered reference path for PGAS
- *
- * Takes RBPF MAP path and injects controlled exploration.
- *
- * @param blender       Blender state (for RNG and config)
- * @param rbpf_path     RBPF MAP path [T] (regime indices)
- * @param T             Path length
- * @param tempered_out  Output tempered path [T]
- * @return Number of flips injected
- */
-int saem_blender_temper_path(SAEMBlender *blender,
-                              const int *rbpf_path,
-                              int T,
-                              int *tempered_out);
+    /*═══════════════════════════════════════════════════════════════════════════
+     * STATE STRUCTURES
+     *═══════════════════════════════════════════════════════════════════════════*/
 
-/*═══════════════════════════════════════════════════════════════════════════
- * API - QUERIES
- *═══════════════════════════════════════════════════════════════════════════*/
+    /**
+     * Blend event record (for diagnostics)
+     */
+    typedef struct
+    {
+        int tick;                 /* When blend occurred */
+        float gamma_used;         /* Actual γ after adaptation */
+        float acceptance_rate;    /* PGAS acceptance */
+        float diversity;          /* ESS / N_particles */
+        float surprise_sigma;     /* Hawkes surprise at trigger */
+        float pre_diag_avg;       /* Average diagonal before blend */
+        float post_diag_avg;      /* Average diagonal after blend */
+        float kl_divergence;      /* KL(Π_new || Π_old) */
+        float innovation_sigma;   /* Innovation surprise σ */
+        SAEMResetTier reset_tier; /* Which tier was used (1/2/3) */
+    } SAEMBlendEvent;
 
-/**
- * Get current γ (learning rate)
- */
-float saem_blender_get_gamma(const SAEMBlender *blender);
+    /**
+     * Main SAEM Blender state
+     */
+    typedef struct
+    {
+        /* Configuration */
+        SAEMBlenderConfig config;
 
-/**
- * Get average diagonal (κ proxy)
- */
-float saem_blender_get_avg_diagonal(const SAEMBlender *blender);
+        /* Sufficient statistics Q[i][j] = pseudo-counts */
+        float Q[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];
 
-/**
- * Get total blend count
- */
-int saem_blender_get_blend_count(const SAEMBlender *blender);
+        /* Prior Q (for Tier 3 reset) */
+        float Q_prior[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];
 
-/**
- * Compute KL divergence between two transition matrices
- */
-float saem_blender_kl_divergence(const float *P, const float *Q, int K);
+        /* Current transition matrix (derived from Q) */
+        float Pi[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];
 
-/*═══════════════════════════════════════════════════════════════════════════
- * API - MANUAL CONTROL
- *═══════════════════════════════════════════════════════════════════════════*/
+        /* Running statistics for adaptation */
+        int total_blends;     /* Lifetime blend count */
+        float acceptance_ema; /* EMA of acceptance rates */
+        float diag_ema;       /* EMA of average diagonal (κ proxy) */
+        float gamma_current;  /* Current (possibly adapted) γ */
 
-/**
- * Force γ to specific value (overrides adaptation)
- */
-void saem_blender_set_gamma(SAEMBlender *blender, float gamma);
+        /* Innovation tracking (for three-tier reset) */
+        float innovation_ema;     /* EMA of innovation σ */
+        float innovation_var_ema; /* EMA of innovation variance (for σ estimation) */
+        int tier2_count;          /* Number of Tier 2 resets */
+        int tier3_count;          /* Number of Tier 3 (full) resets */
+        SAEMResetTier last_tier;  /* Tier used in last blend */
 
-/**
- * Reset γ to base value
- */
-void saem_blender_reset_gamma(SAEMBlender *blender);
+        /* Tempered path RNG state */
+        uint64_t rng_state;
 
-/**
- * Inject transition matrix directly (bypass SAEM)
- * 
- * Use sparingly - this skips all safety checks except floor/normalization.
- */
-void saem_blender_inject_Pi(SAEMBlender *blender, const float *Pi);
+        /* History buffer (circular) */
+        SAEMBlendEvent *history; /* Allocated if track_history */
+        int history_head;
+        int history_count;
 
-/*═══════════════════════════════════════════════════════════════════════════
- * API - DIAGNOSTICS
- *═══════════════════════════════════════════════════════════════════════════*/
+        /* Validation */
+        bool initialized;
 
-/**
- * Get recent blend history
- *
- * @param blender   Blender state
- * @param events    Output buffer
- * @param max_events Buffer capacity
- * @return Number of events written
- */
-int saem_blender_get_history(const SAEMBlender *blender,
-                              SAEMBlendEvent *events,
-                              int max_events);
+    } SAEMBlender;
 
-/**
- * Print current state
- */
-void saem_blender_print_state(const SAEMBlender *blender);
+    /*═══════════════════════════════════════════════════════════════════════════
+     * ORACLE OUTPUT STRUCTURE
+     *═══════════════════════════════════════════════════════════════════════════*/
 
-/**
- * Print transition matrix
- */
-void saem_blender_print_Pi(const SAEMBlender *blender);
+    /**
+     * PGAS Oracle output (input to blender)
+     *
+     * This is what PGAS produces after a batch run.
+     */
+    typedef struct
+    {
+        /* Sufficient statistics: transition counts from PGAS trajectories */
+        float S[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES]; /* S[i][j] = count i→j */
 
-/**
- * Print configuration
- */
-void saem_blender_print_config(const SAEMBlenderConfig *cfg);
+        /* MCMC diagnostics */
+        float acceptance_rate; /* Fraction of accepted proposals */
+        float ess_fraction;    /* ESS / N_particles */
+
+        /* Metadata */
+        int n_regimes;         /* Must match blender config */
+        int n_trajectories;    /* Number of PGAS trajectories averaged */
+        int trajectory_length; /* T for this batch */
+
+        /* Trigger context */
+        float trigger_surprise; /* Hawkes surprise that triggered Oracle */
+
+    } PGASOutput;
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API - LIFECYCLE
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Get default configuration
+     */
+    SAEMBlenderConfig saem_blender_config_defaults(int n_regimes);
+
+    /**
+     * Initialize blender
+     *
+     * @param blender   Blender state to initialize
+     * @param cfg       Configuration (NULL for defaults with K=4)
+     * @param init_Pi   Initial transition matrix [K×K] row-major (NULL for uniform)
+     * @return 0 on success, -1 on error
+     */
+    int saem_blender_init(SAEMBlender *blender,
+                          const SAEMBlenderConfig *cfg,
+                          const float *init_Pi);
+
+    /**
+     * Reset blender state (keep config)
+     */
+    void saem_blender_reset(SAEMBlender *blender, const float *init_Pi);
+
+    /**
+     * Free resources
+     */
+    void saem_blender_free(SAEMBlender *blender);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API - CORE BLENDING
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Result of a blend operation
+     */
+    typedef struct
+    {
+        bool success;             /* Blend completed without error */
+        float gamma_used;         /* Actual γ after adaptation */
+        float kl_divergence;      /* KL(Π_new || Π_old) */
+        float diag_avg_before;    /* Average diagonal before */
+        float diag_avg_after;     /* Average diagonal after */
+        int cells_floored;        /* Number of cells clamped to floor */
+        bool stickiness_adjusted; /* Whether κ control kicked in */
+        SAEMResetTier reset_tier; /* Which tier was applied (1/2/3) */
+        float innovation_sigma;   /* Innovation surprise σ */
+    } SAEMBlendResult;
+
+    /**
+     * Blend PGAS output into current estimate
+     *
+     * This is the main entry point. Call this when PGAS completes.
+     *
+     * @param blender   Blender state
+     * @param oracle    PGAS output (sufficient statistics + diagnostics)
+     * @return Blend result with diagnostics
+     */
+    SAEMBlendResult saem_blender_blend(SAEMBlender *blender,
+                                       const PGASOutput *oracle);
+
+    /**
+     * Get current transition matrix
+     *
+     * @param blender   Blender state
+     * @param Pi_out    Output buffer [K×K] row-major
+     */
+    void saem_blender_get_Pi(const SAEMBlender *blender, float *Pi_out);
+
+    /**
+     * Get current sufficient statistics
+     *
+     * @param blender   Blender state
+     * @param Q_out     Output buffer [K×K] row-major
+     */
+    void saem_blender_get_Q(const SAEMBlender *blender, float *Q_out);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API - TEMPERED PATH GENERATION
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Generate tempered reference path for PGAS
+     *
+     * Takes RBPF MAP path and injects controlled exploration.
+     *
+     * @param blender       Blender state (for RNG and config)
+     * @param rbpf_path     RBPF MAP path [T] (regime indices)
+     * @param T             Path length
+     * @param tempered_out  Output tempered path [T]
+     * @return Number of flips injected
+     */
+    int saem_blender_temper_path(SAEMBlender *blender,
+                                 const int *rbpf_path,
+                                 int T,
+                                 int *tempered_out);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API - QUERIES
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Get current γ (learning rate)
+     */
+    float saem_blender_get_gamma(const SAEMBlender *blender);
+
+    /**
+     * Get average diagonal (κ proxy)
+     */
+    float saem_blender_get_avg_diagonal(const SAEMBlender *blender);
+
+    /**
+     * Get total blend count
+     */
+    int saem_blender_get_blend_count(const SAEMBlender *blender);
+
+    /**
+     * Get tier 2 (partial reset) count
+     */
+    int saem_blender_get_tier2_count(const SAEMBlender *blender);
+
+    /**
+     * Get tier 3 (full reset) count
+     */
+    int saem_blender_get_tier3_count(const SAEMBlender *blender);
+
+    /**
+     * Get last reset tier used
+     */
+    SAEMResetTier saem_blender_get_last_tier(const SAEMBlender *blender);
+
+    /**
+     * Get innovation EMA (σ units)
+     */
+    float saem_blender_get_innovation_ema(const SAEMBlender *blender);
+
+    /**
+     * Compute KL divergence between two transition matrices
+     */
+    float saem_blender_kl_divergence(const float *P, const float *Q, int K);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API - MANUAL CONTROL
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Force γ to specific value (overrides adaptation)
+     */
+    void saem_blender_set_gamma(SAEMBlender *blender, float gamma);
+
+    /**
+     * Reset γ to base value
+     */
+    void saem_blender_reset_gamma(SAEMBlender *blender);
+
+    /**
+     * Inject transition matrix directly (bypass SAEM)
+     *
+     * Use sparingly - this skips all safety checks except floor/normalization.
+     */
+    void saem_blender_inject_Pi(SAEMBlender *blender, const float *Pi);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API - DIAGNOSTICS
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Get recent blend history
+     *
+     * @param blender   Blender state
+     * @param events    Output buffer
+     * @param max_events Buffer capacity
+     * @return Number of events written
+     */
+    int saem_blender_get_history(const SAEMBlender *blender,
+                                 SAEMBlendEvent *events,
+                                 int max_events);
+
+    /**
+     * Print current state
+     */
+    void saem_blender_print_state(const SAEMBlender *blender);
+
+    /**
+     * Print transition matrix
+     */
+    void saem_blender_print_Pi(const SAEMBlender *blender);
+
+    /**
+     * Print configuration
+     */
+    void saem_blender_print_config(const SAEMBlenderConfig *cfg);
 
 #ifdef __cplusplus
 }

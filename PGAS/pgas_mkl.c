@@ -395,6 +395,31 @@ void pgas_mkl_set_model(PGASMKLState *state,
     }
 }
 
+/**
+ * Set exponential recency weighting parameter (Window Paradox Solution)
+ *
+ * @param state   PGAS state
+ * @param lambda  Decay rate (0.0 = disabled, 0.001 = half-life ~693 ticks)
+ *
+ * The weighting formula is: w(t) = exp(-λ × (T - 1 - t))
+ *   - At t=T-1 (most recent): w = 1.0
+ *   - At t=0 (oldest): w = exp(-λ(T-1))
+ *
+ * Recommended: λ = 0.001 for windows of ~2000 ticks
+ *   - Half-life = ln(2) / λ ≈ 693 ticks
+ *   - Oldest observation has weight ≈ 0.14 for T=2000
+ *
+ * This solves the "Window Paradox" where standard PGAS learns an average
+ * transition matrix rather than the current one after a regime change.
+ */
+void pgas_mkl_set_recency_lambda(PGASMKLState *state, float lambda)
+{
+    if (state)
+    {
+        state->model.recency_lambda = lambda;
+    }
+}
+
 void pgas_mkl_set_reference(PGASMKLState *state,
                             const int *regimes,
                             const double *h,
@@ -767,6 +792,16 @@ static void csmc_init_mkl(PGASMKLState *state)
     compute_log_emission_ocsn(state->observations[0], state->h, N, Np,
                               state->log_weights, state->ws_ocsn);
 
+    /* Apply exponential recency weighting at t=0 (oldest observation)
+     * w(0) = exp(-λ × (T - 1)) is the smallest weight */
+    const PGASMKLModel *m = &state->model;
+    if (m->recency_lambda > 1e-6f)
+    {
+        float age = (float)(state->T - 1); /* t=0 is T-1 steps old */
+        float decay_factor = expf(-m->recency_lambda * age);
+        cblas_sscal(N, decay_factor, state->log_weights, 1);
+    }
+
     /* Normalize weights (log-sum-exp for numerical stability) */
     logsumexp_normalize_mkl(state->log_weights, N, Np, state->weights, state->ws_bw);
 }
@@ -961,6 +996,32 @@ float pgas_mkl_csmc_sweep(PGASMKLState *state)
         compute_log_emission_ocsn(state->observations[t], curr_h, N, Np,
                                   &state->log_weights[t * Np], state->ws_ocsn);
 
+        /* ═══════════════════════════════════════════════════════════════════
+         * EXPONENTIAL RECENCY WEIGHTING (Window Paradox Solution)
+         *
+         * Problem: Standard PGAS learns "average" Π over window, not "current" Π
+         * after a regime change. This causes lag in adaptation.
+         *
+         * Solution: Down-weight old observations so recent data dominates:
+         *   w(t) = exp(-λ × (T - 1 - t))
+         *   At t=T-1 (most recent): w = 1.0
+         *   At t=0 (oldest): w = exp(-λ(T-1)) ≈ 0.14 for λ=0.001, T=2000
+         *
+         * In log-likelihood terms: log(p^w) = w × log(p)
+         * So we scale log_weights by the decay factor.
+         *
+         * Reference: Ljung & Söderström (1983) "Recursive Identification"
+         * ═══════════════════════════════════════════════════════════════════*/
+        if (m->recency_lambda > 1e-6f)
+        {
+            float age = (float)(T - 1 - t);
+            float decay_factor = expf(-m->recency_lambda * age);
+
+            /* Scale log-likelihoods: log(p^w) = w × log(p)
+             * Use MKL cblas_sscal for vectorized multiply */
+            cblas_sscal(N, decay_factor, &state->log_weights[t * Np], 1);
+        }
+
         /* Normalize weights */
         logsumexp_normalize_mkl(&state->log_weights[t * Np], N, Np,
                                 &state->weights[t * Np], state->ws_bw);
@@ -1092,31 +1153,15 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         int total_switches = state->last_off_diag_count;
         int total_obs = state->last_total_count;
 
-        /* Sanity check: avoid division by zero */
-        if (total_obs < 1)
-        {
-            goto skip_adaptive;
-        }
-
-        float prior_diag = (state->sticky_kappa + alpha) /
-                           (state->sticky_kappa + K * alpha);
-        float expected_switch_rate = 1.0f - prior_diag;
+        float expected_diag_local = (state->sticky_kappa + alpha) /
+                                    (state->sticky_kappa + K * alpha);
+        float expected_switch_rate = 1.0f - expected_diag_local;
 
         float observed_switch_rate = (float)total_switches / (float)total_obs;
-
-        /* Guard against degenerate cases */
-        if (expected_switch_rate < 1e-6f)
-            expected_switch_rate = 1e-6f;
 
         float laplace = 0.5f / (float)total_obs;
         float raw_chatter = (observed_switch_rate + laplace) /
                             (expected_switch_rate + laplace);
-
-        /* NaN/Inf guard - abort adaptive update if invalid */
-        if (!isfinite(raw_chatter) || raw_chatter <= 0.0f)
-        {
-            goto skip_adaptive;
-        }
 
         float lambda = state->rls_forgetting;
         float P = state->rls_variance;
@@ -1144,82 +1189,27 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         if (chatter > 3.0f)
             chatter = 3.0f;
 
-        /*═══════════════════════════════════════════════════════════════════════
-         * ADAPTIVE KAPPA: MLE-First Strategy
-         *
-         * Priority 1 (MLE): If trajectory is structurally stickier than prior,
-         *                   INCREASE κ regardless of chatter noise.
-         *
-         * Priority 2 (Chatter): Only decrease κ if BOTH chatter is high AND
-         *                       trajectory is actually less sticky than prior.
-         *
-         * Rationale: Chatter is sensitive to resampling noise (especially with
-         * low N). The MLE diagonal from raw counts is a structural signal that
-         * reflects true data stickiness, not particle filter artifacts.
-         *═══════════════════════════════════════════════════════════════════════*/
+        float target_switch_rate = expected_switch_rate * chatter;
+        float target_diag = 1.0f - target_switch_rate;
 
-        /* Compute learned average diagonal from current transition matrix */
-        float learned_diag = 0.0f;
-        for (int k = 0; k < K; k++)
-        {
-            learned_diag += state->model.trans[k * K + k];
-        }
-        learned_diag /= (float)K;
+        float min_diag = 1.0f / K + 0.01f;
+        if (target_diag < min_diag)
+            target_diag = min_diag;
+        if (target_diag > 0.999f)
+            target_diag = 0.999f;
 
-        /* MLE diagonal from raw counts (what trajectory actually shows) */
-        float mle_diag = 1.0f - observed_switch_rate;
+        float kappa_oracle = alpha * (target_diag * K - 1.0f) / (1.0f - target_diag);
 
-        /* MLE gap: positive means trajectory is stickier than prior expects */
-        float mle_gap = mle_diag - prior_diag;
+        if (kappa_oracle < state->kappa_min)
+            kappa_oracle = state->kappa_min;
+        if (kappa_oracle > state->kappa_max)
+            kappa_oracle = state->kappa_max;
 
-        float kappa_new = state->sticky_kappa;
+        float momentum = 0.8f;
+        float log_kappa_new = momentum * logf(state->sticky_kappa) +
+                              (1.0f - momentum) * logf(kappa_oracle);
+        float kappa_new = expf(log_kappa_new);
 
-        /*═══════════════════════════════════════════════════════════════════════
-         * PRIORITY 1: MLE says trajectory is STICKIER than prior
-         *
-         * This is the structural signal. If the raw trajectory diagonal exceeds
-         * what the prior expects, κ must increase. Period.
-         *
-         * We ignore chatter here because resampling noise inflates chatter even
-         * when the underlying data is highly persistent.
-         *═══════════════════════════════════════════════════════════════════════*/
-        if (mle_gap > 0.01f)
-        {
-            /* Powerful upward push proportional to gap */
-            float increase_factor = 1.0f + 2.0f * mle_gap;
-            kappa_new = state->sticky_kappa * increase_factor;
-        }
-        /*═══════════════════════════════════════════════════════════════════════
-         * PRIORITY 2: Chatter high AND MLE confirms less sticky
-         *
-         * Only decrease κ when BOTH signals agree:
-         *   - Chatter > 1.10 (more switches than expected)
-         *   - MLE gap < -0.01 (trajectory is actually less sticky)
-         *
-         * This prevents resampling noise from triggering false decreases.
-         *═══════════════════════════════════════════════════════════════════════*/
-        else if (chatter > 1.10f && mle_gap < -0.01f)
-        {
-            kappa_new = state->sticky_kappa * 0.95f;
-        }
-        /*═══════════════════════════════════════════════════════════════════════
-         * PRIORITY 3: Fine-tuning when signals are ambiguous
-         *
-         * Small adjustments when MLE gap is small and chatter is moderate.
-         *═══════════════════════════════════════════════════════════════════════*/
-        else if (chatter < 0.85f)
-        {
-            /* Fewer switches than expected → slight increase */
-            kappa_new = state->sticky_kappa * 1.03f;
-        }
-        else if (chatter > 1.15f && mle_gap < 0.005f)
-        {
-            /* High chatter but MLE is neutral → slight decrease */
-            kappa_new = state->sticky_kappa * 0.98f;
-        }
-        /* else: stable, keep current κ */
-
-        /* Clamp to bounds */
         if (kappa_new < state->kappa_min)
             kappa_new = state->kappa_min;
         if (kappa_new > state->kappa_max)
@@ -1227,8 +1217,6 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
 
         state->sticky_kappa = kappa_new;
     }
-
-skip_adaptive:; /* Label requires a statement */
 
     float gamma_samples[PGAS_MKL_MAX_K];
 

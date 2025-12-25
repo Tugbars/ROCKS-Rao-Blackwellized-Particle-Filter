@@ -91,6 +91,8 @@ extern "C"
         /* Per-regime precomputed constants for AR likelihood */
         float inv_sigma_vol_sq[PGAS_MKL_MAX_REGIMES];          /**< 1 / σ_vol[k]² */
         float neg_half_inv_sigma_vol_sq[PGAS_MKL_MAX_REGIMES]; /**< -0.5 / σ_vol[k]² */
+
+        float recency_lambda; 
     } PGASMKLModel;
 
     /**
@@ -471,6 +473,19 @@ extern "C"
     int pgas_mkl_get_sweep_count(const PGASMKLState *state);
     float pgas_mkl_get_ess(const PGASMKLState *state, int t);
     void pgas_mkl_print_diagnostics(const PGASMKLState *state);
+
+    /**
+     * @brief Set exponential recency weighting (Window Paradox Solution)
+     *
+     * Down-weights old observations so recent data dominates:
+     *   w(t) = exp(-λ × (T - 1 - t))
+     *
+     * @param state   PGAS state
+     * @param lambda  Decay rate (0.0 = disabled, 0.001 = recommended)
+     *
+     * Half-life = ln(2) / λ ≈ 693 ticks at λ=0.001
+     */
+    void pgas_mkl_set_recency_lambda(PGASMKLState *state, float lambda);
 
 #ifdef __cplusplus
 }
