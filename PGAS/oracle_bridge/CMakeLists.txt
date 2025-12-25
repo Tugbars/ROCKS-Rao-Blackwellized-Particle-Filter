@@ -62,8 +62,8 @@ target_link_libraries(oracle_bridge PUBLIC
 )
 
 # Optional: PARIS scout sweep support
-# Set ORACLE_BRIDGE_USE_PARIS=1 to enable scout pre-validation
-option(ORACLE_BRIDGE_USE_PARIS "Enable PARIS scout sweep support" OFF)
+# Set ORACLE_BRIDGE_USE_PARIS=OFF to disable scout pre-validation
+option(ORACLE_BRIDGE_USE_PARIS "Enable PARIS scout sweep support" ON)
 if(ORACLE_BRIDGE_USE_PARIS)
     target_link_libraries(oracle_bridge PUBLIC paris_mkl)
     target_compile_definitions(oracle_bridge PUBLIC ORACLE_BRIDGE_USE_PARIS=1)

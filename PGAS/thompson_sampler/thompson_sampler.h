@@ -145,6 +145,51 @@ ThompsonSampleResult thompson_sampler_exploit(
     float Pi_out[THOMPSON_MAX_REGIMES][THOMPSON_MAX_REGIMES]);
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * API - FLAT ARRAY VERSIONS (for SAEM compatibility)
+ *
+ * SAEM outputs Q as a flat array via saem_blender_get_Q().
+ * These functions accept flat [K*K] arrays directly.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+/**
+ * Sample from flat Q array (direct SAEM handoff)
+ *
+ * Usage:
+ *   float Q[K*K], Pi[K*K];
+ *   saem_blender_get_Q(&blender, Q);
+ *   thompson_sampler_sample_flat(&sampler, Q, K, Pi);
+ *
+ * @param sampler   Sampler state
+ * @param Q_flat    Sufficient statistics [K*K] row-major flat array
+ * @param K         Number of regimes
+ * @param Pi_flat   Output transition matrix [K*K] row-major flat array
+ * @return          Sample result with diagnostics
+ */
+ThompsonSampleResult thompson_sampler_sample_flat(
+    ThompsonSampler *sampler,
+    const float *Q_flat,
+    int K,
+    float *Pi_flat);
+
+/**
+ * Force exploration with flat arrays
+ */
+ThompsonSampleResult thompson_sampler_explore_flat(
+    ThompsonSampler *sampler,
+    const float *Q_flat,
+    int K,
+    float *Pi_flat);
+
+/**
+ * Force exploitation with flat arrays
+ */
+ThompsonSampleResult thompson_sampler_exploit_flat(
+    ThompsonSampler *sampler,
+    const float *Q_flat,
+    int K,
+    float *Pi_flat);
+
+/*═══════════════════════════════════════════════════════════════════════════
  * API - DIRICHLET SAMPLING
  *═══════════════════════════════════════════════════════════════════════════*/
 

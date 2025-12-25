@@ -100,12 +100,16 @@ int oracle_bridge_init_full(OracleBridge *bridge,
         return -1;
     }
 
+#if ORACLE_BRIDGE_USE_PARIS
     /* Optional: validate PARIS if provided */
     if (paris && paris->K != bridge->n_regimes)
     {
         fprintf(stderr, "OracleBridge: regime mismatch (paris=%d)\n", paris->K);
         return -1;
     }
+#else
+    (void)paris; /* Silence unused parameter warning */
+#endif
 
     /* Optional: validate Thompson if provided */
     if (thompson && thompson->config.n_regimes != bridge->n_regimes)

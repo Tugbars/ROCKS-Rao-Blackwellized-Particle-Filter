@@ -42,15 +42,15 @@
 #include "thompson_sampler.h"
 
 /*───────────────────────────────────────────────────────────────────────────────
- * PARIS Scout (optional)
+ * PARIS Scout (enabled by default)
  *
- * Define ORACLE_BRIDGE_USE_PARIS=1 to enable scout sweep pre-validation.
+ * Define ORACLE_BRIDGE_USE_PARIS=0 to disable scout sweep pre-validation.
  * Requires paris_mkl.h with PARISScoutConfig/PARISScoutResult types.
  *
  * If disabled, scout sweeps are skipped and PGAS always runs on trigger.
  *───────────────────────────────────────────────────────────────────────────────*/
 #ifndef ORACLE_BRIDGE_USE_PARIS
-#define ORACLE_BRIDGE_USE_PARIS 0
+#define ORACLE_BRIDGE_USE_PARIS 1
 #endif
 
 #if ORACLE_BRIDGE_USE_PARIS
