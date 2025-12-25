@@ -312,6 +312,48 @@ extern "C"
                                        const PGASOutput *oracle);
 
     /**
+     * Blend with explicit gamma (for confidence-based adaptation)
+     *
+     * Use this when PGAS confidence metrics should drive γ selection
+     * instead of internal adaptation logic.
+     *
+     * Typical usage with PGASConfidence:
+     *   PGASConfidence conf;
+     *   pgas_confidence_compute(pgas, ref_original, T, &conf, NULL);
+     *
+     *   float gamma = conf.suggested_gamma;
+     *   if (conf.regime_change_detected) {
+     *       saem_blender_tier2_reset(&blender);
+     *       gamma = 0.50f;
+     *   }
+     *
+     *   result = saem_blender_blend_with_gamma(&blender, &oracle, gamma);
+     *
+     * @param blender   Blender state
+     * @param oracle    PGAS output (sufficient statistics)
+     * @param gamma     Explicit learning rate [SAEM_GAMMA_MIN, SAEM_GAMMA_MAX]
+     * @return Blend result with diagnostics
+     */
+    SAEMBlendResult saem_blender_blend_with_gamma(SAEMBlender *blender,
+                                                  const PGASOutput *oracle,
+                                                  float gamma);
+
+    /**
+     * Simplified blend: just counts + gamma
+     *
+     * For when you have raw transition counts and a confidence-derived gamma,
+     * without the full PGASOutput structure.
+     *
+     * @param blender   Blender state
+     * @param S         Transition counts [K×K] row-major
+     * @param gamma     Learning rate
+     * @return Blend result
+     */
+    SAEMBlendResult saem_blender_blend_counts(SAEMBlender *blender,
+                                              const float *S,
+                                              float gamma);
+
+    /**
      * Get current transition matrix
      *
      * @param blender   Blender state
@@ -411,6 +453,26 @@ extern "C"
      * Use sparingly - this skips all safety checks except floor/normalization.
      */
     void saem_blender_inject_Pi(SAEMBlender *blender, const float *Pi);
+
+    /**
+     * Tier-2 Partial Reset: Forget half of history, prepare for major update
+     *
+     * Call this when regime change is detected (e.g., from pgas_confidence).
+     * After calling, the next blend will use boosted gamma.
+     *
+     * Q_new = 0.5 × Q_current + 0.5 × Q_prior
+     */
+    void saem_blender_tier2_reset(SAEMBlender *blender);
+
+    /**
+     * Tier-3 Full Reset: Return to prior (nuclear option)
+     *
+     * Only use when innovation > P99 AND dual-gate triggered.
+     * Completely discards learned parameters.
+     *
+     * Q_new = Q_prior
+     */
+    void saem_blender_tier3_reset(SAEMBlender *blender);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API - DIAGNOSTICS

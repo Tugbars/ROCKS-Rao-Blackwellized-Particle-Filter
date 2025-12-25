@@ -831,6 +831,179 @@ SAEMBlendResult saem_blender_blend(SAEMBlender *blender, const PGASOutput *oracl
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * BLEND WITH EXPLICIT GAMMA (for confidence-based adaptation)
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+SAEMBlendResult saem_blender_blend_with_gamma(SAEMBlender *blender,
+                                              const PGASOutput *oracle,
+                                              float gamma)
+{
+    SAEMBlendResult result;
+    memset(&result, 0, sizeof(result));
+
+    if (!blender || !blender->initialized || !oracle)
+    {
+        return result;
+    }
+
+    int K = blender->config.n_regimes;
+    if (oracle->n_regimes != K)
+    {
+        return result;
+    }
+
+    /* Clamp gamma to valid range */
+    gamma = clampf(gamma, SAEM_GAMMA_MIN, SAEM_GAMMA_MAX);
+
+    /* Record pre-blend state */
+    result.diag_avg_before = compute_avg_diagonal_2d(blender->Pi, K);
+
+    /* Store old Pi for KL computation */
+    float Pi_old[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];
+    memcpy(Pi_old, blender->Pi, sizeof(Pi_old));
+
+    /* Update sufficient statistics with explicit gamma */
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            blender->Q[i][j] = (1.0f - gamma) * blender->Q[i][j] +
+                               gamma * oracle->S[i][j];
+        }
+    }
+
+    /* Normalize Q → Pi */
+    memcpy(blender->Pi, blender->Q, sizeof(blender->Pi));
+    normalize_rows_2d(blender->Pi, K, blender->config.trans_floor);
+
+    /* Clamp to ceiling */
+    int cells_floored = 0;
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            if (blender->Pi[i][j] < blender->config.trans_floor)
+            {
+                blender->Pi[i][j] = blender->config.trans_floor;
+                cells_floored++;
+            }
+            if (blender->Pi[i][j] > blender->config.trans_ceiling)
+            {
+                blender->Pi[i][j] = blender->config.trans_ceiling;
+            }
+        }
+    }
+
+    /* Re-normalize after clamping */
+    normalize_rows_2d(blender->Pi, K, blender->config.trans_floor);
+
+    /* Compute diagnostics */
+    result.diag_avg_after = compute_avg_diagonal_2d(blender->Pi, K);
+    result.cells_floored = cells_floored;
+    result.gamma_used = gamma;
+    result.reset_tier = SAEM_TIER_NORMAL;
+
+    /* KL divergence */
+    float Pi_old_flat[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+    float Pi_new_flat[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+    copy_2d_to_flat(Pi_old, Pi_old_flat, K);
+    copy_2d_to_flat(blender->Pi, Pi_new_flat, K);
+    result.kl_divergence = compute_kl_divergence(Pi_new_flat, Pi_old_flat, K);
+
+    /* Update tracking */
+    blender->gamma_current = gamma;
+    blender->diag_ema = 0.9f * blender->diag_ema + 0.1f * result.diag_avg_after;
+    blender->acceptance_ema = 0.9f * blender->acceptance_ema + 0.1f * oracle->acceptance_rate;
+
+    blender->total_blends++;
+    result.success = true;
+
+    return result;
+}
+
+SAEMBlendResult saem_blender_blend_counts(SAEMBlender *blender,
+                                          const float *S,
+                                          float gamma)
+{
+    SAEMBlendResult result;
+    memset(&result, 0, sizeof(result));
+
+    if (!blender || !blender->initialized || !S)
+    {
+        return result;
+    }
+
+    int K = blender->config.n_regimes;
+
+    /* Clamp gamma to valid range */
+    gamma = clampf(gamma, SAEM_GAMMA_MIN, SAEM_GAMMA_MAX);
+
+    /* Record pre-blend state */
+    result.diag_avg_before = compute_avg_diagonal_2d(blender->Pi, K);
+
+    /* Store old Pi for KL computation */
+    float Pi_old[SAEM_MAX_REGIMES][SAEM_MAX_REGIMES];
+    memcpy(Pi_old, blender->Pi, sizeof(Pi_old));
+
+    /* Update sufficient statistics with explicit gamma */
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            float s_ij = S[i * K + j];
+            blender->Q[i][j] = (1.0f - gamma) * blender->Q[i][j] + gamma * s_ij;
+        }
+    }
+
+    /* Normalize Q → Pi */
+    memcpy(blender->Pi, blender->Q, sizeof(blender->Pi));
+    normalize_rows_2d(blender->Pi, K, blender->config.trans_floor);
+
+    /* Clamp to ceiling */
+    int cells_floored = 0;
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            if (blender->Pi[i][j] < blender->config.trans_floor)
+            {
+                blender->Pi[i][j] = blender->config.trans_floor;
+                cells_floored++;
+            }
+            if (blender->Pi[i][j] > blender->config.trans_ceiling)
+            {
+                blender->Pi[i][j] = blender->config.trans_ceiling;
+            }
+        }
+    }
+
+    /* Re-normalize after clamping */
+    normalize_rows_2d(blender->Pi, K, blender->config.trans_floor);
+
+    /* Compute diagnostics */
+    result.diag_avg_after = compute_avg_diagonal_2d(blender->Pi, K);
+    result.cells_floored = cells_floored;
+    result.gamma_used = gamma;
+    result.reset_tier = SAEM_TIER_NORMAL;
+
+    /* KL divergence */
+    float Pi_old_flat[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+    float Pi_new_flat[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+    copy_2d_to_flat(Pi_old, Pi_old_flat, K);
+    copy_2d_to_flat(blender->Pi, Pi_new_flat, K);
+    result.kl_divergence = compute_kl_divergence(Pi_new_flat, Pi_old_flat, K);
+
+    /* Update tracking */
+    blender->gamma_current = gamma;
+    blender->diag_ema = 0.9f * blender->diag_ema + 0.1f * result.diag_avg_after;
+
+    blender->total_blends++;
+    result.success = true;
+
+    return result;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * GETTERS
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -984,6 +1157,52 @@ void saem_blender_inject_Pi(SAEMBlender *blender, const float *Pi)
             blender->Q[i][j] = pseudo_count * blender->Pi[i][j];
         }
     }
+}
+
+void saem_blender_tier2_reset(SAEMBlender *blender)
+{
+    if (!blender || !blender->initialized)
+        return;
+
+    int K = blender->config.n_regimes;
+    float forget = blender->config.reset.tier2_forget_fraction;
+
+    /* Q_new = (1 - forget) × Q_current + forget × Q_prior */
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            blender->Q[i][j] = (1.0f - forget) * blender->Q[i][j] +
+                               forget * blender->Q_prior[i][j];
+        }
+    }
+
+    /* Normalize Q → Pi */
+    memcpy(blender->Pi, blender->Q, sizeof(blender->Pi));
+    normalize_rows_2d(blender->Pi, K, blender->config.trans_floor);
+
+    /* Track */
+    blender->tier2_count++;
+    blender->last_tier = SAEM_TIER_PARTIAL;
+}
+
+void saem_blender_tier3_reset(SAEMBlender *blender)
+{
+    if (!blender || !blender->initialized)
+        return;
+
+    int K = blender->config.n_regimes;
+
+    /* Q_new = Q_prior (complete reset) */
+    memcpy(blender->Q, blender->Q_prior, sizeof(blender->Q));
+
+    /* Normalize Q → Pi */
+    memcpy(blender->Pi, blender->Q, sizeof(blender->Pi));
+    normalize_rows_2d(blender->Pi, K, blender->config.trans_floor);
+
+    /* Track */
+    blender->tier3_count++;
+    blender->last_tier = SAEM_TIER_FULL;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
