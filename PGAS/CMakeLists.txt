@@ -135,6 +135,8 @@ target_link_libraries(pgas INTERFACE
 #───────────────────────────────────────────────────────────────────────────────
 
 add_subdirectory(test-bench)
+add_subdirectory(hawkes_signal)
+
 
 #───────────────────────────────────────────────────────────────────────────────
 # Installation

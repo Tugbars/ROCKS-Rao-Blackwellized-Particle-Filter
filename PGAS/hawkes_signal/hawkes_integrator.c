@@ -1,9 +1,9 @@
 /**
  * @file hawkes_integrator.c
- * @brief Hawkes Process Oracle Trigger - MKL Implementation
+ * @brief Hawkes Process Oracle Trigger - Implementation
  *
  * Self-contained Hawkes process with Oracle trigger logic.
- * Uses Intel MKL for vectorized kernel computation.
+ * Uses Intel MKL for vectorized kernel computation when available.
  */
 
 #include "hawkes_integrator.h"
@@ -13,8 +13,21 @@
 #include <math.h>
 #include <float.h>
 
-/* Intel MKL for vectorized math */
+/*═══════════════════════════════════════════════════════════════════════════
+ * MKL DETECTION
+ *
+ * To enable MKL acceleration:
+ *   - Define USE_MKL=1 in CMake/compiler flags
+ *   - Link against MKL libraries
+ *
+ * Without MKL, falls back to scalar expf() - still fast enough for typical use.
+ *═══════════════════════════════════════════════════════════════════════════*/
+#if defined(USE_MKL) && USE_MKL
 #include <mkl.h>
+#define HAS_MKL 1
+#else
+#define HAS_MKL 0
+#endif
 
 /*═══════════════════════════════════════════════════════════════════════════
  * INTERNAL HELPERS
@@ -32,14 +45,14 @@ static inline float clampf(float x, float lo, float hi)
  *═══════════════════════════════════════════════════════════════════════════*/
 
 /**
- * Compute current intensity λ(t) using MKL vectorization
+ * Compute current intensity λ(t) using MKL vectorization (or scalar fallback)
  *
  * λ(t) = μ + α × Σᵢ exp(-β × (t - tᵢ)) × mᵢ
  *
  * For n events, this is:
  *   1. Compute dt[i] = t - event_times[i]
  *   2. Compute arg[i] = -β × dt[i]
- *   3. Compute kernel[i] = exp(arg[i])      <- MKL vmsExp
+ *   3. Compute kernel[i] = exp(arg[i])      <- MKL vmsExp (or scalar)
  *   4. Compute weighted[i] = kernel[i] × marks[i]
  *   5. Sum weighted and scale by α
  */
@@ -58,24 +71,29 @@ static float compute_intensity_mkl(HawkesIntegrator *integ, float time)
     float *kernel = integ->scratch_kernel;
 
     /* Step 1: Compute dt = time - event_times */
-    /* Using cblas for simplicity; could also use vsLinearFrac */
     for (int i = 0; i < n; i++)
     {
         int idx = (integ->event_head - n + i + HAWKES_MAX_EVENTS) % HAWKES_MAX_EVENTS;
         dt[i] = time - integ->event_times[idx];
     }
 
-    /* Step 2: Compute -β × dt in-place */
+#if HAS_MKL
+    /* Step 2: Compute -β × dt in-place using MKL */
     cblas_sscal(n, -p->beta, dt, 1);
 
-    /* Step 3: Compute exp(-β × dt) using MKL */
-    /* vmsExp is the VML function for single-precision exp */
-    /* VML_HA = High Accuracy mode */
+    /* Step 3: Compute exp(-β × dt) using MKL VML */
     vmsExp(n, dt, kernel, VML_HA);
+#else
+    /* Scalar fallback */
+    for (int i = 0; i < n; i++)
+    {
+        dt[i] = -p->beta * dt[i];
+        kernel[i] = expf(dt[i]);
+    }
+#endif
 
     /* Step 4 & 5: Weighted sum with marks */
     float excitation = 0.0f;
-    int active_events = 0;
 
     for (int i = 0; i < n; i++)
     {
@@ -83,12 +101,10 @@ static float compute_intensity_mkl(HawkesIntegrator *integ, float time)
         {
             int idx = (integ->event_head - n + i + HAWKES_MAX_EVENTS) % HAWKES_MAX_EVENTS;
             excitation += kernel[i] * integ->event_marks[idx];
-            active_events++;
         }
     }
 
     /* Prune old events if all kernels are below cutoff */
-    /* (Simple heuristic: if oldest event's kernel is tiny, we can reduce count) */
     while (integ->event_count > 0)
     {
         int oldest_idx = (integ->event_head - integ->event_count + HAWKES_MAX_EVENTS) % HAWKES_MAX_EVENTS;
@@ -193,11 +209,11 @@ HawkesIntegratorConfig hawkes_integrator_config_defaults(void)
 
     /* Cumulative residual */
     cfg.residual_decay = 0.05f;
-    cfg.residual_threshold = 0.1f;
+    cfg.residual_threshold = 0.015f; /* Require more persistence (was 0.1) */
 
     /* Hysteresis */
-    cfg.high_water_mark = 2.5f;
-    cfg.low_water_mark = 1.5f;
+    cfg.high_water_mark = 1.3f; /* Slightly more sensitive (was 2.5) */
+    cfg.low_water_mark = 0.8f;
     cfg.min_ticks_armed = 3;
 
     /* Absolute panic */
@@ -229,8 +245,8 @@ HawkesIntegratorConfig hawkes_integrator_config_responsive(void)
     cfg.ema_alpha = 0.02f;
 
     /* Lower thresholds */
-    cfg.high_water_mark = 2.0f;
-    cfg.low_water_mark = 1.2f;
+    cfg.high_water_mark = 1.0f;
+    cfg.low_water_mark = 0.6f;
     cfg.min_ticks_armed = 2;
 
     /* Shorter refractory */
@@ -258,9 +274,12 @@ HawkesIntegratorConfig hawkes_integrator_config_conservative(void)
     cfg.ema_alpha = 0.005f;
 
     /* Higher thresholds */
-    cfg.high_water_mark = 3.0f;
-    cfg.low_water_mark = 2.0f;
+    cfg.high_water_mark = 1.8f;
+    cfg.low_water_mark = 1.0f;
     cfg.min_ticks_armed = 5;
+
+    /* Higher residual requirement */
+    cfg.residual_threshold = 0.02f;
 
     /* Longer refractory */
     cfg.refractory_ticks = 1000;
@@ -305,9 +324,9 @@ int hawkes_integrator_init(HawkesIntegrator *integ,
         integ->config.hawkes.alpha = integ->config.hawkes.beta * 0.9f;
     }
 
-    /* Initialize variance tracking */
+    /* Initialize variance tracking - small initial variance for sensitivity */
     integ->lambda_ema = integ->config.hawkes.mu;
-    integ->lambda_var_ema = 0.01f;
+    integ->lambda_var_ema = 0.0001f; /* σ ≈ 0.01 initially */
     integ->lambda_sigma = sqrtf(integ->lambda_var_ema + HAWKES_EPSILON);
 
     /* Initialize state machine */
@@ -328,7 +347,7 @@ void hawkes_integrator_reset(HawkesIntegrator *integ)
     integ->config = cfg;
 
     integ->lambda_ema = integ->config.hawkes.mu;
-    integ->lambda_var_ema = 0.01f;
+    integ->lambda_var_ema = 0.0001f; /* σ ≈ 0.01 initially */
     integ->lambda_sigma = sqrtf(integ->lambda_var_ema + HAWKES_EPSILON);
     integ->trigger_state = HAWKES_TRIG_IDLE;
     integ->ticks_since_trigger = integ->config.refractory_ticks;

@@ -37,6 +37,39 @@ extern "C"
 {
 #endif
 
+/*═══════════════════════════════════════════════════════════════════════════
+ * CROSS-PLATFORM ALIGNMENT MACROS
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+/* MKL alignment */
+#define HAWKES_ALIGN 64
+
+/*
+ * Cross-platform alignment for struct members.
+ *
+ * MSVC:  __declspec(align(x)) must come BEFORE the type
+ * GCC:   __attribute__((aligned(x))) can come after the variable
+ * C11:   alignas(x) works on both (preferred if available)
+ *
+ * For struct members, we use a typedef wrapper approach for portability.
+ */
+#if defined(_MSC_VER)
+/* MSVC: Use __declspec(align) with typedef wrapper */
+#define HAWKES_ALIGNAS(x) __declspec(align(x))
+#define HAWKES_ALIGNED_ARRAY(type, name, size) \
+    HAWKES_ALIGNAS(HAWKES_ALIGN)               \
+    type name[size]
+#elif defined(__GNUC__) || defined(__clang__)
+/* GCC/Clang: Use __attribute__ */
+#define HAWKES_ALIGNAS(x) __attribute__((aligned(x)))
+#define HAWKES_ALIGNED_ARRAY(type, name, size) \
+    type name[size] HAWKES_ALIGNAS(HAWKES_ALIGN)
+#else
+/* Fallback: No alignment (works but may be slower) */
+#define HAWKES_ALIGNAS(x)
+#define HAWKES_ALIGNED_ARRAY(type, name, size) type name[size]
+#endif
+
     /*═══════════════════════════════════════════════════════════════════════════
      * COMPILE-TIME CONFIGURATION
      *═══════════════════════════════════════════════════════════════════════════*/
@@ -50,9 +83,6 @@ extern "C"
 #define HAWKES_MIN_INTENSITY 1e-4f
 #define HAWKES_MAX_INTENSITY 10.0f
 #define HAWKES_KERNEL_CUTOFF 1e-6f /* Prune events below this kernel value */
-
-/* MKL alignment */
-#define HAWKES_ALIGN 64
 
     /*═══════════════════════════════════════════════════════════════════════════
      * HAWKES ENGINE CONFIGURATION
@@ -180,6 +210,11 @@ extern "C"
         float lambda_sigma;   /* σ_λ: sqrt of variance (cached) */
 
         /* ═══════════════════════════════════════════════════════════════════
+         * CUMULATIVE RESIDUAL (spike vs plateau detection)
+         * ═══════════════════════════════════════════════════════════════════ */
+        float residual_integral; /* ∫(λ_obs - λ_pred)dt */
+
+        /* ═══════════════════════════════════════════════════════════════════
          * INTEGRATION WINDOW (ring buffer)
          * ═══════════════════════════════════════════════════════════════════ */
         float intensity_sum; /* Running sum for O(1) average */
@@ -210,11 +245,11 @@ extern "C"
         /* ═══════════════════════════════════════════════════════════════════
          * ALIGNED ARRAYS (at end for alignment, accessed via MKL)
          * ═══════════════════════════════════════════════════════════════════ */
-        float intensity_window[HAWKES_INTEG_MAX_WINDOW] __attribute__((aligned(HAWKES_ALIGN)));
-        float event_times[HAWKES_MAX_EVENTS] __attribute__((aligned(HAWKES_ALIGN)));
-        float event_marks[HAWKES_MAX_EVENTS] __attribute__((aligned(HAWKES_ALIGN)));
-        float scratch_dt[HAWKES_MAX_EVENTS] __attribute__((aligned(HAWKES_ALIGN)));
-        float scratch_kernel[HAWKES_MAX_EVENTS] __attribute__((aligned(HAWKES_ALIGN)));
+        HAWKES_ALIGNED_ARRAY(float, intensity_window, HAWKES_INTEG_MAX_WINDOW);
+        HAWKES_ALIGNED_ARRAY(float, event_times, HAWKES_MAX_EVENTS);
+        HAWKES_ALIGNED_ARRAY(float, event_marks, HAWKES_MAX_EVENTS);
+        HAWKES_ALIGNED_ARRAY(float, scratch_dt, HAWKES_MAX_EVENTS);
+        HAWKES_ALIGNED_ARRAY(float, scratch_kernel, HAWKES_MAX_EVENTS);
 
     } HawkesIntegrator;
 
