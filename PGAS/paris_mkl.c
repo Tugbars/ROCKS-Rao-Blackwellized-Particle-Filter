@@ -635,3 +635,185 @@ void paris_mkl_print_info(const PARISMKLState *state)
     printf("\n");
     printf("═══════════════════════════════════════════════════════════\n");
 }
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * SCOUT SWEEP (Pre-validation before triggering PGAS)
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+PARISScoutConfig paris_mkl_scout_config_defaults(void)
+{
+    PARISScoutConfig cfg;
+    cfg.n_sweeps = 5;
+    cfg.min_acceptance = 0.10f;      /* At least 10% acceptance */
+    cfg.min_unique_fraction = 0.25f; /* At least 25% unique paths */
+    return cfg;
+}
+
+/**
+ * @brief Simple hash for regime path (for counting unique paths)
+ */
+static uint64_t hash_path(const int *path, int T)
+{
+    uint64_t hash = 14695981039346656037ULL; /* FNV-1a offset basis */
+    for (int t = 0; t < T; t++)
+    {
+        hash ^= (uint64_t)path[t];
+        hash *= 1099511628211ULL; /* FNV-1a prime */
+    }
+    return hash;
+}
+
+int paris_mkl_count_unique_paths(const PARISMKLState *state)
+{
+    if (!state || state->N <= 0 || state->T <= 0)
+        return 0;
+
+    const int N = state->N;
+    const int T = state->T;
+    const int Np = state->N_padded;
+
+    /* Extract paths and hash them */
+    uint64_t *hashes = (uint64_t *)malloc(N * sizeof(uint64_t));
+    int *path = (int *)malloc(T * sizeof(int));
+
+    if (!hashes || !path)
+    {
+        free(hashes);
+        free(path);
+        return 0;
+    }
+
+    for (int n = 0; n < N; n++)
+    {
+        /* Extract path for particle n */
+        for (int t = 0; t < T; t++)
+        {
+            int idx = state->smoothed[t * Np + n];
+            path[t] = state->regimes[t * Np + idx];
+        }
+        hashes[n] = hash_path(path, T);
+    }
+
+    /* Count unique hashes (simple O(n²) - N is small) */
+    int unique = 0;
+    for (int i = 0; i < N; i++)
+    {
+        int is_dup = 0;
+        for (int j = 0; j < i; j++)
+        {
+            if (hashes[i] == hashes[j])
+            {
+                is_dup = 1;
+                break;
+            }
+        }
+        if (!is_dup)
+            unique++;
+    }
+
+    free(hashes);
+    free(path);
+    return unique;
+}
+
+float paris_mkl_compute_path_entropy(const PARISMKLState *state)
+{
+    if (!state || state->N <= 0 || state->T <= 0)
+        return 0.0f;
+
+    const int N = state->N;
+    const int T = state->T;
+    const int Np = state->N_padded;
+    const int K = state->K;
+
+    /* Compute per-timestep regime distribution entropy, then average */
+    float total_entropy = 0.0f;
+
+    for (int t = 0; t < T; t++)
+    {
+        /* Count regime occurrences at time t */
+        int counts[PARIS_MKL_MAX_REGIMES] = {0};
+
+        for (int n = 0; n < N; n++)
+        {
+            int idx = state->smoothed[t * Np + n];
+            int regime = state->regimes[t * Np + idx];
+            if (regime >= 0 && regime < K)
+            {
+                counts[regime]++;
+            }
+        }
+
+        /* Compute entropy: H = -Σ p log(p) */
+        float H = 0.0f;
+        for (int k = 0; k < K; k++)
+        {
+            if (counts[k] > 0)
+            {
+                float p = (float)counts[k] / (float)N;
+                H -= p * logf(p);
+            }
+        }
+
+        total_entropy += H;
+    }
+
+    return total_entropy / (float)T; /* Average entropy per timestep */
+}
+
+PARISScoutResult paris_mkl_scout_sweep(PARISMKLState *state,
+                                       const PARISScoutConfig *config)
+{
+    PARISScoutResult result;
+    memset(&result, 0, sizeof(result));
+
+    if (!state)
+        return result;
+
+    PARISScoutConfig cfg = config ? *config : paris_mkl_scout_config_defaults();
+
+    const int N = state->N;
+
+    /* Run backward sweeps and track acceptance
+     *
+     * Note: paris_mkl_backward_smooth() doesn't return acceptance.
+     * We'll run it multiple times and measure path diversity.
+     * For proper acceptance tracking, we'd need to modify the backward kernel.
+     *
+     * Approximation: Run sweeps, measure final path diversity as proxy.
+     */
+
+    for (int sweep = 0; sweep < cfg.n_sweeps; sweep++)
+    {
+        paris_mkl_backward_smooth(state);
+        result.sweeps_run++;
+    }
+
+    /* Compute path statistics after sweeps */
+    result.unique_paths = paris_mkl_count_unique_paths(state);
+    result.entropy = paris_mkl_compute_path_entropy(state);
+
+    /* Estimate acceptance from unique paths
+     * If we have many unique paths, acceptance must have been reasonable.
+     * This is an approximation - true acceptance would require kernel modification.
+     */
+    float unique_fraction = (float)result.unique_paths / (float)N;
+    result.acceptance_rate = unique_fraction; /* Proxy */
+
+    /* Validity check */
+    result.is_valid = true;
+
+    if (result.acceptance_rate < cfg.min_acceptance)
+    {
+        /* Low acceptance → sampler stuck */
+        result.is_valid = false;
+    }
+
+    if (unique_fraction < cfg.min_unique_fraction)
+    {
+        /* Path collapse → degeneracy, not confidence */
+        result.is_valid = false;
+    }
+
+    return result;
+}

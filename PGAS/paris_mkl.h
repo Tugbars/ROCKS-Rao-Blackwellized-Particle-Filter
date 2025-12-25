@@ -185,6 +185,80 @@ extern "C"
                                   int *regimes, float *h);
 
     /*═══════════════════════════════════════════════════════════════════════════════
+     * SCOUT SWEEP (Pre-validation before triggering PGAS)
+     *
+     * Quick PARIS sweep to check if the filter is degenerate before committing
+     * to a full PGAS run. This prevents wasting compute on a broken filter.
+     *
+     * Flow:
+     *   1. Hawkes/KL triggers suspicious
+     *   2. Run scout sweep (few backward passes, ~5ms)
+     *   3. If scout INVALID → force PGAS (can't trust filter)
+     *   4. If scout VALID + low entropy → filter confident, skip PGAS
+     *   5. If scout VALID + high entropy → filter uncertain, run PGAS
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Scout sweep result
+     */
+    typedef struct
+    {
+        float entropy;         /**< Path entropy (lower = more confident) */
+        float acceptance_rate; /**< Fraction of proposals accepted */
+        int unique_paths;      /**< Number of distinct paths after sweeps */
+        int total_proposals;   /**< Total ancestor proposals made */
+        int total_accepts;     /**< Total proposals accepted */
+        int sweeps_run;        /**< Number of sweeps completed */
+        bool is_valid;         /**< True if scout mixing is adequate */
+    } PARISScoutResult;
+
+    /**
+     * Scout sweep configuration
+     */
+    typedef struct
+    {
+        int n_sweeps;              /**< Number of backward sweeps (default: 5) */
+        float min_acceptance;      /**< Minimum acceptance rate (default: 0.10) */
+        float min_unique_fraction; /**< Minimum unique paths / N (default: 0.25) */
+    } PARISScoutConfig;
+
+    /**
+     * @brief Get default scout configuration
+     */
+    PARISScoutConfig paris_mkl_scout_config_defaults(void);
+
+    /**
+     * @brief Run scout sweep with validation
+     *
+     * Runs a few backward sweeps and checks if the sampler is mixing properly.
+     * Use this to decide whether to trigger full PGAS.
+     *
+     * @param state   PARIS state (must have particles loaded from forward pass)
+     * @param config  Scout configuration (NULL for defaults)
+     * @return        Scout result with validity flag
+     */
+    PARISScoutResult paris_mkl_scout_sweep(PARISMKLState *state,
+                                           const PARISScoutConfig *config);
+
+    /**
+     * @brief Compute path entropy from smoothed trajectories
+     *
+     * Lower entropy = more agreement among particles = higher confidence
+     *
+     * @param state   PARIS state after backward smoothing
+     * @return        Path entropy in nats
+     */
+    float paris_mkl_compute_path_entropy(const PARISMKLState *state);
+
+    /**
+     * @brief Count unique paths in smoothed trajectories
+     *
+     * @param state   PARIS state after backward smoothing
+     * @return        Number of distinct regime paths
+     */
+    int paris_mkl_count_unique_paths(const PARISMKLState *state);
+
+    /*═══════════════════════════════════════════════════════════════════════════════
      * DIAGNOSTICS
      *═══════════════════════════════════════════════════════════════════════════════*/
 

@@ -142,6 +142,9 @@ add_subdirectory(saem_blender)
 add_subdirectory(thompson_sampler)
 add_subdirectory(rbpf_trajectory)
 
+# Top-level integration (depends on all above)
+add_subdirectory(oracle_bridge)
+
 #───────────────────────────────────────────────────────────────────────────────
 # Installation
 #───────────────────────────────────────────────────────────────────────────────
