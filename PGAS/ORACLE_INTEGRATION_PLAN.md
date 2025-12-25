@@ -8,15 +8,29 @@ The core challenge: **When and how should the slow, accurate PGAS update the fas
 
 ### Design Consensus
 
-After evaluating multiple approaches (fixed thresholds, SMC-SA gradients, information bottleneck, RLS blending), we converged on:
+After evaluating multiple approaches (fixed thresholds, SMC-SA gradients, information bottleneck, RLS blending), we converged on a **6-phase pipeline**:
 
-| Component | Approach | Rationale |
-|-----------|----------|-----------|
-| **Trigger 1** | Hawkes (Lead) | External early warning before filter confusion |
-| **Trigger 2** | KL Divergence (Truth) | Internal ground truth of filter state |
-| **Thresholds** | Variance-based (z × σ) | Self-calibrating, no magic numbers |
-| **Handoff** | SAEM (Sufficient Statistics) | Respects Dirichlet structure, automatic simplex |
-| **Control** | Two knobs (z, α) | Statistically meaningful parameters |
+| Phase | Component | Purpose |
+|-------|-----------|---------|
+| **1. Scout** | PARIS Smoother | Pre-validate: is filter degenerate or confident? |
+| **2. Temper** | Path Injection | Anti-confirmation bias: 5% random regime flips |
+| **3. PGAS** | Particle Gibbs | Run full inference, learn transition counts |
+| **4. Confidence** | PGASConfidence | Compute ESS ratio, path divergence → adaptive γ |
+| **5. SAEM** | SAEMBlender | Blend sufficient statistics: Q = (1-γ)Q + γS |
+| **6. Thompson** | ThompsonSampler | Sample Π ~ Dirichlet(Q) or use posterior mean |
+
+### Key Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Trigger Detection** | `hawkes_integrator.h/c` | Integrated intensity + hysteresis |
+| **Dual-Gate** | `kl_trigger.h/c` | Hawkes AND KL must fire (or panic) |
+| **Trajectory Buffer** | `rbpf_trajectory.h/c` | Lock-free seqlock for RBPF→Oracle handoff |
+| **Scout Sweep** | `paris_mkl.h/c` | Pre-validation before expensive PGAS |
+| **Confidence Metrics** | `pgas_confidence.h/c` | ESS, divergence → adaptive γ |
+| **SAEM Blending** | `saem_blender.h/c` | Sufficient stats + tier resets |
+| **Thompson Sampling** | `thompson_sampler.h/c` | Explore/exploit via Dirichlet |
+| **Pipeline Coordinator** | `oracle_bridge.h/c` | Full 6-phase orchestration |
 
 ### Critical Pitfalls Addressed
 
@@ -27,6 +41,8 @@ After evaluating multiple approaches (fixed thresholds, SMC-SA gradients, inform
 | Latency Spike | Scout pollutes RBPF cache | Pin to separate cores | — |
 | Resampling Noise | False KL triggers | Grace window requirement | — |
 | Dead Zone | Particle death on rare transitions | Uniform escape hatch | — |
+| Degenerate Scout | False confidence from stuck sampler | Acceptance + unique path check | — |
+| Silent PGAS Failure | No feedback if PGAS fails | PGASConfidence metrics | — |
 
 ### Final Tier Upgrades
 
@@ -36,6 +52,7 @@ After evaluating multiple approaches (fixed thresholds, SMC-SA gradients, inform
 | Mixing Validation | Degenerate scout false confidence | Acceptance rate + unique path check |
 | Dual-Gate + σ Cap | Oracle blind during chaos | Variance cap + absolute panic threshold |
 | Innovation Partial Reset | SAEM can't track phase shifts | Three-tier reset hierarchy |
+| Confidence-Based γ | Fixed γ ignores PGAS quality | ESS ratio + path divergence → γ |
 
 ### Multi-Armed Bandit Integration
 
@@ -53,24 +70,69 @@ After evaluating multiple approaches (fixed thresholds, SMC-SA gradients, inform
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           PRODUCTION PIPELINE                               │
 │                                                                             │
-│    FAST PATH (every tick, <5µs)         SLOW PATH (triggered, ~100ms)      │
-│    ┌─────────────────────────┐          ┌─────────────────────────┐        │
-│    │         RBPF            │          │      PGAS ORACLE        │        │
-│    │  • Track h_t, regime_t  │◄─────────│  • Learn Π from data    │        │
-│    │  • Use current Π        │   Π_new  │  • Ensemble statistics  │        │
-│    │  • Export MAP path      │──────────▶  • Confidence metrics   │        │
-│    └─────────────────────────┘  warmup  └─────────────────────────┘        │
-│              │                                     ▲                        │
-│              │ observations                        │                        │
-│              ▼                                     │ trigger                │
-│    ┌─────────────────────────┐                     │                        │
-│    │    HAWKES PROCESS       │─────────────────────┘                        │
-│    │  • Model event clusters │                                              │
-│    │  • Detect anomalies     │                                              │
-│    └─────────────────────────┘                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ FAST PATH (RBPF Thread, every tick, <5µs)                             │  │
+│  │                                                                        │  │
+│  │   observation ─► RBPF ─► Hawkes ─► KL Trigger                         │  │
+│  │                   │                    │                               │  │
+│  │                   ▼                    │                               │  │
+│  │           RBPFTrajectory              │                               │  │
+│  │           (seqlock buffer)            │                               │  │
+│  │                   │                    │                               │  │
+│  │                   │ trigger?───────────┘                               │  │
+│  │                   ▼         (dual-gate: Hawkes AND KL)                │  │
+│  └───────────────────┼───────────────────────────────────────────────────┘  │
+│                      │                                                       │
+│                      │ snapshot (lock-free)                                  │
+│                      ▼                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ SLOW PATH (Oracle Thread, triggered, ~100ms)                          │  │
+│  │                                                                        │  │
+│  │   ┌──────────────────────────────────────────────────────────────┐    │  │
+│  │   │                    6-PHASE ORACLE PIPELINE                    │    │  │
+│  │   ├──────────────────────────────────────────────────────────────┤    │  │
+│  │   │                                                               │    │  │
+│  │   │  Phase 1: SCOUT ──► Pre-validate (is filter degenerate?)     │    │  │
+│  │   │              │                                                │    │  │
+│  │   │              ▼                                                │    │  │
+│  │   │  Phase 2: TEMPER ──► Inject 5% random flips (anti-bias)      │    │  │
+│  │   │              │                                                │    │  │
+│  │   │              ▼                                                │    │  │
+│  │   │  Phase 3: PGAS ────► Run particle Gibbs (learn Π)            │    │  │
+│  │   │              │                                                │    │  │
+│  │   │              ▼                                                │    │  │
+│  │   │  Phase 4: CONFIDENCE ► Compute confidence → adaptive γ       │    │  │
+│  │   │              │                                                │    │  │
+│  │   │              ▼                                                │    │  │
+│  │   │  Phase 5: SAEM ────► Blend Q = (1-γ)Q + γS                   │    │  │
+│  │   │              │                                                │    │  │
+│  │   │              ▼                                                │    │  │
+│  │   │  Phase 6: THOMPSON ► Sample Π ~ Dirichlet(Q) or use mean    │    │  │
+│  │   │                                                               │    │  │
+│  │   └──────────────────────────────────────────────────────────────┘    │  │
+│  │                      │                                                 │  │
+│  └──────────────────────┼────────────────────────────────────────────────┘  │
+│                         │                                                    │
+│                         │ Π_new (via message queue)                          │
+│                         ▼                                                    │
+│                   RBPF updates Π                                             │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Component Summary
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **RBPFTrajectory** | `rbpf_trajectory.h/c` | Lock-free seqlock buffer for MAP path snapshots |
+| **HawkesIntegrator** | `hawkes_integrator.h/c` | Integrated intensity + hysteresis triggers |
+| **KLTrigger** | `kl_trigger.h/c` | Variance-based KL surprise + state machine |
+| **PARISScout** | `paris_mkl.h/c` | Fast backward sweep for pre-validation |
+| **PGAS** | `pgas_mkl.h/c` | Particle Gibbs with ancestor sampling |
+| **PGASConfidence** | `pgas_confidence.h/c` | ESS ratio, path divergence, regime change detection |
+| **SAEMBlender** | `saem_blender.h/c` | Sufficient statistics blending + tier resets |
+| **ThompsonSampler** | `thompson_sampler.h/c` | Dirichlet sampling for explore/exploit |
+| **OracleBridge** | `oracle_bridge.h/c` | Full pipeline coordinator |
 
 ---
 
@@ -117,9 +179,20 @@ A Hawkes process models **self-exciting** event dynamics—spikes are *expected*
 
 ---
 
-## Three-Layer Oracle Activation
+## Six-Phase Oracle Pipeline
 
-### Layer 1: Detection (Hawkes Integrator)
+The Oracle pipeline has evolved from three layers to six phases:
+
+| Phase | Component | Purpose |
+|-------|-----------|---------|
+| **1. Scout** | PARIS Smoother | Pre-validate: is filter degenerate or confident? |
+| **2. Temper** | Path Injection | Anti-confirmation bias: 5% random regime flips |
+| **3. PGAS** | Particle Gibbs | Run full inference, learn transition counts |
+| **4. Confidence** | PGASConfidence | Compute ESS ratio, path divergence → adaptive γ |
+| **5. SAEM** | SAEMBlender | Blend sufficient statistics: Q = (1-γ)Q + γS |
+| **6. Thompson** | ThompsonSampler | Sample Π ~ Dirichlet(Q) or use posterior mean |
+
+### Phase 1: Scout Sweep (Pre-validation)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -151,7 +224,7 @@ A Hawkes process models **self-exciting** event dynamics—spikes are *expected*
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 2: Verification (Scout Sweep)
+### Phase 1 (continued): Scout Validation
 
 Before committing expensive PGAS resources, run a **lightweight verification**:
 
@@ -179,9 +252,9 @@ Before committing expensive PGAS resources, run a **lightweight verification**:
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 3: Handoff (SAEM Blender)
+### Phase 5: SAEM Blending (with Confidence-Based γ)
 
-When PGAS produces a new Π, blend it into RBPF using **Stochastic Approximation EM**:
+When PGAS produces transition counts, blend them using **Stochastic Approximation EM**:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -194,24 +267,55 @@ When PGAS produces a new Π, blend it into RBPF using **Stochastic Approximation
 │   SAEM update:                                                          │
 │      Q_t[i,j] = (1 - γ) × Q_{t-1}[i,j] + γ × S_oracle[i,j]            │
 │                                                                         │
-│   Posterior mean (automatic simplex constraint!):                       │
-│      Π[i,j] = Q_t[i,j] / Σ_k Q_t[i,k]                                  │
+│   ══════════════════════════════════════════════════════════════════   │
+│   NEW: Adaptive γ from PGASConfidence (Phase 4)                        │
+│   ══════════════════════════════════════════════════════════════════   │
 │                                                                         │
-│   Adaptive γ based on:                                                  │
+│   γ = pgas_confidence_get_gamma(&conf)  // ∈ [0.02, 0.15]              │
+│                                                                         │
+│   Based on:                                                             │
 │   ┌─────────────────┬──────────────────────────────────────────────┐   │
 │   │ Signal          │ Effect on γ                                  │   │
 │   ├─────────────────┼──────────────────────────────────────────────┤   │
-│   │ High acceptance │ ↑ Trust oracle more (γ → 0.3)               │   │
-│   │ Low acceptance  │ ↓ Trust oracle less (γ → 0.05)              │   │
-│   │ High diversity  │ ↑ Confident estimate                         │   │
-│   │ Large surprise  │ ↑ Market changed, adapt faster               │   │
-│   │ Robbins-Monro   │ γ decays as 1/√t over time                   │   │
+│   │ ESS ratio       │ ↑ Good mixing → trust oracle more           │   │
+│   │ Path divergence │ ↑ PGAS disagrees with RBPF → adapt faster   │   │
+│   │ Acceptance rate │ ↑ Proposals accepted → confident            │   │
+│   │ Regime change   │ → Tier-2 reset, γ = 0.50                    │   │
+│   │ Degeneracy      │ → Minimal blend, γ = 0.02                   │   │
 │   └─────────────────┴──────────────────────────────────────────────┘   │
 │                                                                         │
 │   Safety Rails:                                                         │
 │   • Floor enforcement: Π_ij ≥ 1e-5 (escape hatch for rare events)     │
 │   • Automatic normalization: Dirichlet posterior is on simplex         │
-│   • γ bounds: 0.02 ≤ γ ≤ 0.5                                          │
+│   • γ bounds: 0.02 ≤ γ ≤ 0.15 (external) or 0.50 (tier-2 reset)       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 6: Thompson Sampling (Explore/Exploit)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        THOMPSON SAMPLING                                │
+│                                                                         │
+│   After SAEM blending, we have sufficient statistics Q[i,j]            │
+│                                                                         │
+│   Decision: Sample or use mean?                                         │
+│                                                                         │
+│   if min_row_sum(Q) < exploit_threshold (default: 500):                │
+│       → EXPLORE: Π ~ Dirichlet(Q)   // Thompson sampling               │
+│   else:                                                                 │
+│       → EXPLOIT: Π = Q / sum(Q)     // Posterior mean                  │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │  Why this matters:                                               │  │
+│   │                                                                   │  │
+│   │  Early (low Q): High uncertainty → explore parameter space      │  │
+│   │  Later (high Q): Confident → exploit learned Π                  │  │
+│   │  After reset: Q drops → automatically explore again             │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│   Literature: Agrawal & Goyal (2012) - Thompson Sampling is optimal    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -419,46 +523,106 @@ cfg.saem_surprise_scale = z_score;                       // Same z as triggers
                         ┌────────────────────────┐
                         │   RBPF processes tick  │
                         │   (always, <5µs)       │
-                        └────────────┬───────────┘
+                        │   Updates trajectory   │──► RBPFTrajectory
+                        └────────────┬───────────┘    (seqlock buffer)
+                                     │
+                        ┌────────────┴───────────┐
+                        │                        │
+                        ▼                        ▼
+          ┌────────────────────────┐  ┌────────────────────────┐
+          │  Hawkes updates λ(t)   │  │  KL Trigger update     │
+          └────────────┬───────────┘  └────────────┬───────────┘
+                       │                           │
+                       └─────────────┬─────────────┘
                                      │
                                      ▼
                         ┌────────────────────────┐
-                        │  Hawkes updates λ(t)   │
-                        └────────────┬───────────┘
-                                     │
-                                     ▼
-                        ┌────────────────────────┐
-                  No    │  ∫λdt > high_water?    │
-              ┌─────────│  AND refractory OK?    │
+                  No    │  DUAL-GATE CHECK       │
+              ┌─────────│  Hawkes AND KL fire?   │
+              │         │  OR panic override?    │
               │         └────────────┬───────────┘
               │                      │ Yes
               │                      ▼
               │         ┌────────────────────────┐
-              │         │    SCOUT SWEEP         │
-              │         │    (5-10 PARIS)        │
+              │         │   Snapshot trajectory  │◄── Lock-free read
+              │         │   (seqlock)            │
               │         └────────────┬───────────┘
+              │                      │
+              │    ╔═════════════════╧═══════════════════╗
+              │    ║  ORACLE THREAD (6-PHASE PIPELINE)   ║
+              │    ╠═════════════════════════════════════╣
+              │    ║                                     ║
+              │    ║  ┌─────────────────────────────┐   ║
+              │    ║  │ Phase 1: SCOUT SWEEP        │   ║
+              │    ║  │ • 5 PARIS backward sweeps   │   ║
+              │    ║  │ • Check: is_valid? entropy? │   ║
+              │    ║  └──────────────┬──────────────┘   ║
+              │    ║                 │                   ║
+              │    ║       ┌─────────┴─────────┐        ║
+              │    ║       │                   │        ║
+              │    ║  invalid/high      valid/low       ║
+              │    ║  entropy           entropy         ║
+              │    ║       │               │            ║
+              │    ║       ▼               ▼            ║
+              │    ║  continue        SKIP PGAS        ─╬──► Return
+              │    ║       │          (confident)       ║
+              │    ║       ▼                            ║
+              │    ║  ┌─────────────────────────────┐   ║
+              │    ║  │ Phase 2: TEMPER PATH        │   ║
+              │    ║  │ • 5% random regime flips    │   ║
+              │    ║  │ • Anti-confirmation bias    │   ║
+              │    ║  └──────────────┬──────────────┘   ║
+              │    ║                 │                   ║
+              │    ║                 ▼                   ║
+              │    ║  ┌─────────────────────────────┐   ║
+              │    ║  │ Phase 3: FULL PGAS          │   ║
+              │    ║  │ • 3-10 Gibbs sweeps         │   ║
+              │    ║  │ • Exponential weighting     │   ║
+              │    ║  │ • Output: S (counts)        │   ║
+              │    ║  └──────────────┬──────────────┘   ║
+              │    ║                 │                   ║
+              │    ║                 ▼                   ║
+              │    ║  ┌─────────────────────────────┐   ║
+              │    ║  │ Phase 4: PGAS CONFIDENCE    │   ║
+              │    ║  │ • ESS ratio                 │   ║
+              │    ║  │ • Path divergence           │   ║
+              │    ║  │ • Regime change detection   │   ║
+              │    ║  │ • Output: γ ∈ [0.02, 0.15]  │   ║
+              │    ║  └──────────────┬──────────────┘   ║
+              │    ║                 │                   ║
+              │    ║   ┌─────────────┴─────────────┐    ║
+              │    ║   │                           │    ║
+              │    ║  regime                    normal  ║
+              │    ║  change?                      │    ║
+              │    ║   │                           │    ║
+              │    ║   ▼                           │    ║
+              │    ║  tier2_reset()                │    ║
+              │    ║  γ = 0.50                     │    ║
+              │    ║   │                           │    ║
+              │    ║   └─────────────┬─────────────┘    ║
+              │    ║                 │                   ║
+              │    ║                 ▼                   ║
+              │    ║  ┌─────────────────────────────┐   ║
+              │    ║  │ Phase 5: SAEM BLEND         │   ║
+              │    ║  │ • Q = (1-γ)Q + γS           │   ║
+              │    ║  │ • Floor enforcement         │   ║
+              │    ║  │ • Stickiness control        │   ║
+              │    ║  └──────────────┬──────────────┘   ║
+              │    ║                 │                   ║
+              │    ║                 ▼                   ║
+              │    ║  ┌─────────────────────────────┐   ║
+              │    ║  │ Phase 6: THOMPSON SAMPLE    │   ║
+              │    ║  │ • row_sum < 500 → EXPLORE   │   ║
+              │    ║  │   Π ~ Dirichlet(Q)          │   ║
+              │    ║  │ • row_sum ≥ 500 → EXPLOIT   │   ║
+              │    ║  │   Π = Q / sum(Q)            │   ║
+              │    ║  └──────────────┬──────────────┘   ║
+              │    ║                 │                   ║
+              │    ╚═════════════════╧═══════════════════╝
               │                      │
               │                      ▼
               │         ┌────────────────────────┐
-              │    No   │   ΔH > threshold?      │
-              │◄────────│   (entropy changed)    │
-              │         └────────────┬───────────┘
-              │                      │ Yes
-              │                      ▼
-              │         ┌────────────────────────┐
-              │         │      FULL PGAS         │
-              │         │  (300 burn + 500 samp) │
-              │         └────────────┬───────────┘
-              │                      │
-              │                      ▼
-              │         ┌────────────────────────┐
-              │         │     RLS BLENDER        │
-              │         │  Π = Π + G(Π_new - Π)  │
-              │         └────────────┬───────────┘
-              │                      │
-              │                      ▼
-              │         ┌────────────────────────┐
-              │         │   Update RBPF's Π      │
+              │         │   Update RBPF's Π      │◄── Via message queue
               │         │   Reset refractory     │
               │         └────────────┬───────────┘
               │                      │
@@ -499,7 +663,7 @@ init_reference_from_observations(obs, T, K, mu_vol, phi, ref_regimes, ref_h);
 
 **Risk:** Sudden Π change → particle weight collapse.
 
-**Fix:** RLS blending with confidence-weighted gain (see Layer 3).
+**Fix:** SAEM blending with confidence-based γ (see Phase 4-5). Low confidence → small γ → gradual change.
 
 ### 3. Zero-Probability Traps
 
@@ -1015,6 +1179,8 @@ apply_escape_hatch(Pi_out, K);
 | **Latency Spike** | P99 latency jumps during scouts | Pin threads to separate cores | — | Core affinity |
 | **Resampling Noise** | False KL triggers | Grace window requirement | — | `grace_window = 5` |
 | **Dead Zone** | Particle death on rare transition | Uniform escape hatch blend | — | `escape_weight = 0.01` |
+| **Degenerate Scout** | False confidence from stuck sampler | Acceptance + unique path check | — | `min_accept = 0.10` |
+| **Silent PGAS Failure** | No feedback if PGAS fails | PGASConfidence metrics → γ | — | ESS ratio, divergence |
 
 ---
 
@@ -1445,6 +1611,9 @@ void saem_update_final(SAEMBlenderFinal *saem,
 | **Mixing Validation** | Degenerate scout false confidence | `min_acceptance = 0.10` |
 | **Dual-Gate + σ Cap** | Oracle blindness during chaos | `sigma_H_max = 1.0`, `panic_kl = 2.0` |
 | **Innovation Partial Reset** | SAEM can't track phase shifts | `partial_reset = 0.5` |
+| **PGAS Confidence** | Fixed γ ignores PGAS quality | ESS ratio + path divergence → γ |
+| **Thompson Sampling** | No exploration after convergence | Π ~ Dirichlet(Q) when counts low |
+| **RBPFTrajectory** | Lock contention on path handoff | Seqlock for lock-free snapshot |
 
 ---
 
@@ -1798,24 +1967,41 @@ typedef struct {
 
 ## Implementation Modules
 
-| Module | File | Purpose |
-|--------|------|---------|
-| `HawkesIntegrator` | `hawkes_trigger.h/c` | Integrated intensity + hysteresis |
-| `AdaptiveKLTrigger` | `kl_trigger.h/c` | Variance-based KL trigger + grace window |
-| `DualGateTrigger` | `dual_gate.h/c` | Variance + absolute panic + σ cap |
-| `ScoutSweepValidated` | `scout_sweep.h/c` | Mixing-aware entropy verification |
-| `TemperedPath` | `tempered_path.h/c` | Reference path jitter (5% flips) |
-| `ExponentialCSMC` | `pgas_mkl.h/c` | Recency-weighted likelihood |
-| `SAEMBlenderFinal` | `saem_blender.h/c` | Three-tier reset (normal/partial/full) |
-| `ThompsonSampler` | `thompson_sampler.h/c` | Dirichlet sampling for Π exploration |
-| `AdaptiveHandoff` | `handoff.h/c` | Mean vs Thompson mode selection |
-| `EscapeHatch` | `transition_safety.h/c` | Uniform blend + floor enforcement |
-| `OracleScheduler` | `oracle_scheduler.h/c` | Main coordinator |
-| `TransitionLearner` | `pgas_learner.h/c` | PGAS wrapper for Π learning |
+### Delivered Files
+
+| Module | File | Tests | Purpose |
+|--------|------|-------|---------|
+| **HawkesIntegrator** | `hawkes_integrator.h/c` | 6/6 | Integrated intensity + hysteresis + refractory |
+| **KLTrigger** | `kl_trigger.h/c` | 10/10 | Variance-based KL + state machine + grace window |
+| **RBPFTrajectory** | `rbpf_trajectory.h/c` | 12/12 | Seqlock buffer for lock-free MAP path snapshots |
+| **SAEMBlender** | `saem_blender.h/c` | 7/7 | Sufficient stats blending + tier resets + external γ |
+| **ThompsonSampler** | `thompson_sampler.h/c` | 11/11 | Gamma/Dirichlet sampling + flat array API |
+| **PGASConfidence** | `pgas_confidence.h/c` | 9/9 | ESS ratio, path divergence, regime change → γ |
+| **OracleBridge** | `oracle_bridge.h/c` | 7/7 | Full 6-phase pipeline coordinator |
+| **PGAS-MKL** | `pgas_mkl.h/c` | 5/5 | Particle Gibbs with exponential weighting |
+| **PARIS-MKL** | `paris_mkl.h/c` | — | Backward smoother + scout sweep |
+| **PGAS Mock** | `pgas_mkl_mock.c` | — | Testing without MKL dependency |
+
+**Total: 66+ tests passing**
+
+### Feature Matrix
+
+| Feature | File | Status |
+|---------|------|--------|
+| Dual-gate trigger (Hawkes + KL) | `oracle_bridge.c` | ✅ |
+| Scout sweep validation | `paris_mkl.c` | ✅ |
+| Tempered path injection (5% flips) | `saem_blender.c` | ✅ |
+| Confidence-based γ | `pgas_confidence.c` | ✅ |
+| Three-tier reset (normal/partial/full) | `saem_blender.c` | ✅ |
+| Thompson sampling (explore/exploit) | `thompson_sampler.c` | ✅ |
+| Exponential recency weighting | `pgas_mkl.c` | ✅ |
+| Lock-free trajectory snapshot | `rbpf_trajectory.c` | ✅ |
+| Floor enforcement | `saem_blender.c` | ✅ |
+| Stickiness control | `saem_blender.c` | ✅ |
 
 ---
 
-## Implementation Order
+## Implementation Order (Completed)
 
 **Phase 1: Core Triggers**
 1. **`HawkesIntegrator`** — Integrated intensity with hysteresis thresholds
@@ -1884,7 +2070,7 @@ typedef struct {
 
 ## Dual-Trigger Philosophy: Lead + Truth
 
-The system uses two complementary triggers with distinct failure modes:
+The system uses two complementary triggers with **AND** logic (dual-gate):
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1900,13 +2086,21 @@ The system uses two complementary triggers with distinct failure modes:
 │                         │                         │                         │
 │    ┌────────────────────┴─────────────────────────┴───────────────────┐    │
 │    │                                                                   │    │
-│    │                         EITHER                                    │    │
+│    │                      DUAL-GATE (AND)                             │    │
+│    │          Both must fire (reduces false positives)                │    │
+│    │                           │                                       │    │
+│    │    ┌──────────────────────┼──────────────────────┐               │    │
+│    │    │                      │                      │               │    │
+│    │   normal              OR: PANIC              normal              │    │
+│    │   operation           OVERRIDE               operation           │    │
+│    │                     (absolute threshold)                         │    │
 │    │                           │                                       │    │
 │    │                           ▼                                       │    │
-│    │                     SCOUT SWEEP                                   │    │
+│    │                     6-PHASE PIPELINE                             │    │
 │    │                           │                                       │    │
-│    │                           ▼                                       │    │
-│    │                      FULL PGAS                                    │    │
+│    │              Scout → Temper → PGAS → Confidence                  │    │
+│    │                           │                                       │    │
+│    │                    → SAEM → Thompson                              │    │
 │    │                                                                   │    │
 │    └───────────────────────────────────────────────────────────────────┘    │
 │                                                                             │
@@ -1920,7 +2114,9 @@ The system uses two complementary triggers with distinct failure modes:
 | **Hawkes** | Early warning | Needs market physics | False positive on normal spike |
 | **KL** | Ground truth | Reactive (lag) | Already confused when it fires |
 
-**Combined:** Hawkes gives you a head start, KL gives you certainty. Neither can fool you alone.
+**Combined (AND):** Hawkes gives you a head start, KL confirms it's real. Both must agree to trigger, except in panic situations.
+
+**Panic Override:** Absolute threshold (e.g., KL > 2.0 nats) bypasses dual-gate for extreme events.
 
 ### Trigger Comparison
 
@@ -2205,7 +2401,8 @@ OracleConfig oracle_config_from_knobs(OracleKnobs knobs) {
 | KL Trigger | Information Entropy | **z-score choice** (statistically meaningful) |
 | Hawkes Trigger | Point Process Theory | **z-score choice** (same as KL) |
 | Scout Sweep | Bayesian Verification | **z-score choice** (consistent) |
-| RLS Blender | Least Squares | **α choice** (memory horizon) |
+| SAEM Blender | Sufficient Statistics | **γ choice** (from PGASConfidence) |
+| Thompson Sampler | Dirichlet Posterior | **exploit_threshold** (when to stop exploring) |
 
 **Result:** Two knobs with clear statistical interpretation. No magic numbers.
 
@@ -2277,41 +2474,55 @@ Combine both signals:
 │                      PRODUCTION-GRADE ORACLE INTEGRATION                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
+│  FAST PATH (RBPF Thread):                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  observation → RBPF → RBPFTrajectory (seqlock buffer)              │   │
+│  │                  ↓                                                   │   │
+│  │            Hawkes + KL Trigger (dual-gate)                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
 │  DUAL-GATE TRIGGERS (Lead + Truth + Panic):                                │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Hawkes (Lead)  ──┬──▶ Scout ──▶ PGAS ──▶ SAEM ──▶ Handoff ──▶ Π  │   │
-│  │  KL (Truth)     ──┤     │                           │              │   │
-│  │  Absolute Panic ──┘     │                           ▼              │   │
-│  │                         ▼                    ┌─────────────┐       │   │
-│  │  Thresholds:   Relative: z × min(σ_H, σ_max) │  Thompson   │       │   │
-│  │                Absolute: KL > 2.0 nats       │  Sampling   │       │   │
-│  │  Grace window: 5 consecutive elevated checks │  (adaptive) │       │   │
-│  │                                              └─────────────┘       │   │
+│  │  Hawkes (Lead)  ──┬──▶ 6-Phase Pipeline ──▶ Π                      │   │
+│  │  KL (Truth)     ──┤                                                 │   │
+│  │  Absolute Panic ──┘                                                 │   │
+│  │                                                                     │   │
+│  │  Thresholds:   Relative: z × min(σ_H, σ_max)                       │   │
+│  │                Absolute: KL > 2.0 nats (panic override)            │   │
+│  │  Grace window: 5 consecutive elevated checks                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  6-PHASE ORACLE PIPELINE:                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. SCOUT      → PARIS backward sweep, pre-validation              │   │
+│  │  2. TEMPER     → 5% random flips (anti-confirmation bias)          │   │
+│  │  3. PGAS       → Particle Gibbs with exponential weighting         │   │
+│  │  4. CONFIDENCE → ESS ratio, path divergence → adaptive γ           │   │
+│  │  5. SAEM       → Q = (1-γ)Q + γS with tier resets                 │   │
+│  │  6. THOMPSON   → Sample Π ~ Dirichlet(Q) or use mean              │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  SCOUT VERIFICATION (Mixing-Aware):                                        │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  10 PARIS sweeps ──▶ Check acceptance ≥ 10%                        │   │
-│  │                  ──▶ Check unique paths ≥ 25%                       │   │
-│  │                  ──▶ If invalid: force full PGAS anyway            │   │
+│  │  5 PARIS sweeps ──▶ Check acceptance ≥ 10%                         │   │
+│  │                 ──▶ Check unique paths ≥ 25%                        │   │
+│  │                 ──▶ If invalid: force full PGAS anyway             │   │
+│  │                 ──▶ If valid + low entropy: skip PGAS              │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
-│  PGAS REFERENCE PATH (Chopin & Papaspiliopoulos 2020):                     │
+│  PGAS CONFIDENCE → ADAPTIVE γ:                                            │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  RBPF MAP path ──▶ Tempered Injection (5% flips) ──▶ PGAS ref     │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  EXPONENTIAL CSMC (Non-Stationary Adaptation):                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Likelihood weighted by recency: w(t) = exp(-λ(T-t))               │   │
-│  │  λ = 0.001 → half-life ~700 ticks → prioritizes "Now"              │   │
+│  │  ESS ratio + path divergence + acceptance → confidence score       │   │
+│  │  confidence → γ ∈ [0.02, 0.15]                                     │   │
+│  │  regime_change_detected → tier2_reset() + γ = 0.50                 │   │
+│  │  degeneracy_detected → γ = 0.02 (minimal blend)                    │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  SAEM THREE-TIER RESET (Delyon 1999 + Särkkä 2013):                       │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Tier 1 (Normal):   γ blend              [Innovation < P90]        │   │
-│  │  Tier 2 (Partial):  Forget 50%, γ×2      [Innovation > P99]        │   │
-│  │  Tier 3 (Full):     Reset to prior       [KL AND Hawkes > 5σ]      │   │
+│  │  Tier 1 (Normal):   γ blend                [from PGASConfidence]   │   │
+│  │  Tier 2 (Partial):  Reset Q to prior/2     [regime change]         │   │
+│  │  Tier 3 (Full):     Reset to prior         [KL AND Hawkes > 5σ]    │   │
 │  │                                                                     │   │
 │  │  Safeguards: Q_max cap, escape hatch (1%), trans floor (1e-5)      │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
@@ -2328,6 +2539,7 @@ Combine both signals:
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │  Core 0: RBPF hot path (isolated, never preempted)                 │   │
 │  │  Core 2: Scout sweeps + PGAS oracle (separate L2 cache)            │   │
+│  │  Handoff: Lock-free seqlock snapshot (RBPFTrajectory)              │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  TWO PRIMARY KNOBS: z_score (confidence), α_variance (memory)              │
