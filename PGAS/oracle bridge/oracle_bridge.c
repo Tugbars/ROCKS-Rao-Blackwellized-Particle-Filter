@@ -1,8 +1,8 @@
 /**
  * @file oracle_bridge.c
- * @brief Oracle Bridge Implementation
+ * @brief Oracle Bridge Implementation - Full Pipeline
  *
- * Connects Hawkes Trigger → PGAS Oracle → SAEM Blender
+ * Flow: Trigger → Scout → PGAS → Confidence → SAEM → Thompson → RBPF
  */
 
 #include "oracle_bridge.h"
@@ -26,18 +26,30 @@ OracleBridgeConfig oracle_bridge_config_defaults(void)
     cfg.pgas_sweeps_max = 10;
     cfg.pgas_target_accept = 0.15f;
 
-    /* Exponential Weighting (Window Paradox Solution)
-     * half-life = ln(2) / lambda ≈ 693 ticks at lambda=0.001
-     * This ensures recent data dominates after regime change */
+    /* Exponential Weighting (Window Paradox Solution) */
     cfg.recency_lambda = 0.001f;
 
     /* Dual-gate trigger */
     cfg.use_dual_gate = true;
     cfg.kl_threshold_sigma = 2.0f;
 
+    /* Scout sweep */
+    cfg.use_scout_sweep = true;
+    cfg.scout_sweeps = 5;
+    cfg.scout_min_acceptance = 0.10f;
+    cfg.scout_min_unique_frac = 0.25f;
+    cfg.scout_entropy_skip = 0.1f;
+
     /* Tempered path */
     cfg.use_tempered_path = true;
     cfg.temper_flip_prob = 0.05f;
+
+    /* Thompson */
+    cfg.thompson_exploit_thresh = 500.0f;
+
+    /* Confidence-based γ */
+    cfg.gamma_on_regime_change = 0.50f;
+    cfg.gamma_on_degeneracy = SAEM_GAMMA_MIN;
 
     cfg.verbose = false;
 
@@ -48,12 +60,14 @@ OracleBridgeConfig oracle_bridge_config_defaults(void)
  * LIFECYCLE
  *═══════════════════════════════════════════════════════════════════════════*/
 
-int oracle_bridge_init(OracleBridge *bridge,
-                       const OracleBridgeConfig *cfg,
-                       HawkesIntegrator *hawkes,
-                       KLTrigger *kl_trigger,
-                       SAEMBlender *blender,
-                       PGASMKLState *pgas)
+int oracle_bridge_init_full(OracleBridge *bridge,
+                            const OracleBridgeConfig *cfg,
+                            HawkesIntegrator *hawkes,
+                            KLTrigger *kl_trigger,
+                            SAEMBlender *blender,
+                            PGASMKLState *pgas,
+                            PARISMKLState *paris,
+                            ThompsonSampler *thompson)
 {
     if (!bridge)
         return -1;
@@ -64,11 +78,13 @@ int oracle_bridge_init(OracleBridge *bridge,
 
     /* Store component handles (not owned) */
     bridge->hawkes = hawkes;
-    bridge->kl_trigger = kl_trigger; /* Can be NULL to disable dual-gate */
+    bridge->kl_trigger = kl_trigger;
     bridge->blender = blender;
     bridge->pgas = pgas;
+    bridge->paris = paris;
+    bridge->thompson = thompson;
 
-    /* Validate components */
+    /* Validate required components */
     if (!blender || !pgas)
     {
         fprintf(stderr, "OracleBridge: blender and pgas are required\n");
@@ -84,10 +100,37 @@ int oracle_bridge_init(OracleBridge *bridge,
         return -1;
     }
 
-    bridge->last_trigger_tick = -1000; /* Allow immediate first trigger */
+    /* Optional: validate PARIS if provided */
+    if (paris && paris->K != bridge->n_regimes)
+    {
+        fprintf(stderr, "OracleBridge: regime mismatch (paris=%d)\n", paris->K);
+        return -1;
+    }
+
+    /* Optional: validate Thompson if provided */
+    if (thompson && thompson->config.n_regimes != bridge->n_regimes)
+    {
+        fprintf(stderr, "OracleBridge: regime mismatch (thompson=%d)\n",
+                thompson->config.n_regimes);
+        return -1;
+    }
+
+    bridge->last_trigger_tick = -1000;
     bridge->initialized = true;
 
     return 0;
+}
+
+/* Backward compatible init */
+int oracle_bridge_init(OracleBridge *bridge,
+                       const OracleBridgeConfig *cfg,
+                       HawkesIntegrator *hawkes,
+                       KLTrigger *kl_trigger,
+                       SAEMBlender *blender,
+                       PGASMKLState *pgas)
+{
+    return oracle_bridge_init_full(bridge, cfg, hawkes, kl_trigger,
+                                   blender, pgas, NULL, NULL);
 }
 
 void oracle_bridge_reset(OracleBridge *bridge)
@@ -100,7 +143,13 @@ void oracle_bridge_reset(OracleBridge *bridge)
     bridge->last_trigger_tick = -1000;
     bridge->total_oracle_calls = 0;
     bridge->successful_blends = 0;
+    bridge->scout_skip_count = 0;
+    bridge->regime_change_count = 0;
+    bridge->degeneracy_count = 0;
     bridge->cumulative_kl_change = 0.0f;
+    bridge->last_scout_valid = false;
+    bridge->last_scout_skipped_pgas = false;
+    memset(&bridge->last_confidence, 0, sizeof(bridge->last_confidence));
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -127,71 +176,28 @@ OracleTriggerResult oracle_bridge_check_trigger(
     result.triggered_by_panic = hawkes_result->triggered_by_panic;
     result.ticks_since_last = current_tick - bridge->last_trigger_tick;
 
-    /* Check Hawkes trigger */
     bool hawkes_fired = hawkes_result->should_trigger;
+    bool kl_fired = true;
 
-    /* Check KL trigger (if dual-gate enabled) */
-    bool kl_fired = true; /* Default: pass if not using dual-gate */
     if (bridge->config.use_dual_gate)
     {
         kl_fired = (kl_surprise >= bridge->config.kl_threshold_sigma);
     }
 
-    /* Absolute panic overrides dual-gate requirement */
     if (hawkes_result->triggered_by_panic)
     {
         result.should_trigger = true;
     }
     else if (bridge->config.use_dual_gate)
     {
-        /* Dual-gate: both must fire */
         result.should_trigger = hawkes_fired && kl_fired;
     }
     else
     {
-        /* Single-gate: Hawkes only */
         result.should_trigger = hawkes_fired;
     }
 
     return result;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * PGAS → SAEM CONVERSION
- *═══════════════════════════════════════════════════════════════════════════*/
-
-/**
- * Extract sufficient statistics from PGAS into PGASOutput format
- */
-static void pgas_to_saem_output(const PGASMKLState *pgas,
-                                float trigger_surprise,
-                                PGASOutput *output)
-{
-    if (!pgas || !output)
-        return;
-
-    int K = pgas->K;
-    output->n_regimes = K;
-    output->n_trajectories = 1; /* Single trajectory from PGAS */
-    output->trajectory_length = pgas->T;
-    output->trigger_surprise = trigger_surprise;
-
-    /* Copy transition counts as floats
-     * PGAS stores as int[K*K], SAEM expects float[K][K] */
-    for (int i = 0; i < K; i++)
-    {
-        for (int j = 0; j < K; j++)
-        {
-            output->S[i][j] = (float)pgas->n_trans[i * K + j];
-        }
-    }
-
-    /* MCMC diagnostics */
-    output->acceptance_rate = pgas->acceptance_rate;
-
-    /* ESS at final time */
-    float ess = pgas_mkl_get_ess(pgas, pgas->T - 1);
-    output->ess_fraction = ess / (float)pgas->N;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -230,15 +236,83 @@ OracleRunResult oracle_bridge_run(
     }
 
     /* ═══════════════════════════════════════════════════════════════════
-     * STEP 1: Prepare reference path (with optional tempering)
+     * PHASE 1: SCOUT SWEEP (Pre-validation)
+     * ═══════════════════════════════════════════════════════════════════*/
+
+    bool should_run_pgas = true;
+
+    if (bridge->config.use_scout_sweep && bridge->paris)
+    {
+        PARISScoutConfig scout_cfg;
+        scout_cfg.n_sweeps = bridge->config.scout_sweeps;
+        scout_cfg.min_acceptance = bridge->config.scout_min_acceptance;
+        scout_cfg.min_unique_fraction = bridge->config.scout_min_unique_frac;
+
+        PARISScoutResult scout = paris_mkl_scout_sweep(bridge->paris, &scout_cfg);
+
+        result.scout_ran = true;
+        result.scout_valid = scout.is_valid;
+        result.scout_entropy = scout.entropy;
+        result.scout_unique_paths = scout.unique_paths;
+
+        bridge->last_scout_valid = scout.is_valid;
+
+        if (!scout.is_valid)
+        {
+            /* Scout degenerate - can't trust filter, force PGAS */
+            if (bridge->config.verbose)
+            {
+                printf("[OracleBridge] Scout INVALID: accept=%.2f unique=%d → force PGAS\n",
+                       scout.acceptance_rate, scout.unique_paths);
+            }
+            should_run_pgas = true;
+        }
+        else if (scout.entropy < bridge->config.scout_entropy_skip)
+        {
+            /* Scout valid + low entropy → filter confident, skip PGAS */
+            if (bridge->config.verbose)
+            {
+                printf("[OracleBridge] Scout VALID + low entropy (%.3f) → skip PGAS\n",
+                       scout.entropy);
+            }
+            result.scout_skipped_pgas = true;
+            bridge->last_scout_skipped_pgas = true;
+            bridge->scout_skip_count++;
+            should_run_pgas = false;
+        }
+        else
+        {
+            if (bridge->config.verbose)
+            {
+                printf("[OracleBridge] Scout VALID + high entropy (%.3f) → run PGAS\n",
+                       scout.entropy);
+            }
+        }
+    }
+
+    if (!should_run_pgas)
+    {
+        /* Scout allowed skip - return early with success */
+        result.success = true;
+        return result;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 2: PREPARE REFERENCE PATH (with tempering)
      * ═══════════════════════════════════════════════════════════════════*/
 
     int *ref_path = (int *)malloc(T * sizeof(int));
-    if (!ref_path)
+    int *ref_path_original = (int *)malloc(T * sizeof(int));
+    if (!ref_path || !ref_path_original)
     {
         fprintf(stderr, "OracleBridge: malloc failed\n");
+        free(ref_path);
+        free(ref_path_original);
         return result;
     }
+
+    /* Keep original for divergence check */
+    memcpy(ref_path_original, rbpf_path, T * sizeof(int));
 
     if (bridge->config.use_tempered_path && blender)
     {
@@ -258,17 +332,18 @@ OracleRunResult oracle_bridge_run(
     }
 
     /* ═══════════════════════════════════════════════════════════════════
-     * STEP 2: Load data into PGAS
+     * PHASE 3: RUN PGAS
      * ═══════════════════════════════════════════════════════════════════*/
+
+    result.pgas_ran = true;
 
     pgas_mkl_load_observations(pgas, observations, T);
     pgas_mkl_set_reference(pgas, ref_path, rbpf_h, T);
 
-    /* Copy current transition matrix from blender to PGAS */
+    /* Copy current Π from blender to PGAS */
     float Pi_current[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
     saem_blender_get_Pi(blender, Pi_current);
 
-    /* Convert to double for PGAS API */
     double trans_d[PGAS_MKL_MAX_K * PGAS_MKL_MAX_K];
     double mu_vol_d[PGAS_MKL_MAX_K];
     double sigma_vol_d[PGAS_MKL_MAX_K];
@@ -285,15 +360,9 @@ OracleRunResult oracle_bridge_run(
 
     pgas_mkl_set_model(pgas, trans_d, mu_vol_d, sigma_vol_d,
                        (double)pgas->model.phi);
-
-    /* Set exponential recency weighting (Window Paradox Solution)
-     * This ensures PGAS learns Π_now instead of Π_average after regime change */
     pgas_mkl_set_recency_lambda(pgas, bridge->config.recency_lambda);
 
-    /* ═══════════════════════════════════════════════════════════════════
-     * STEP 3: Run PGAS Gibbs sweeps
-     * ═══════════════════════════════════════════════════════════════════*/
-
+    /* Run Gibbs sweeps */
     float total_accept = 0.0f;
     int sweeps = 0;
 
@@ -313,7 +382,6 @@ OracleRunResult oracle_bridge_run(
     result.acceptance_rate = total_accept / sweeps;
     result.sweeps_used = sweeps;
 
-    /* Get final ESS */
     float ess = pgas_mkl_get_ess(pgas, T - 1);
     result.ess_fraction = ess / (float)pgas->N;
 
@@ -324,18 +392,77 @@ OracleRunResult oracle_bridge_run(
     }
 
     /* ═══════════════════════════════════════════════════════════════════
-     * STEP 4: Extract sufficient statistics and blend
+     * PHASE 4: PGAS CONFIDENCE → ADAPTIVE γ
      * ═══════════════════════════════════════════════════════════════════*/
 
-    PGASOutput oracle_output;
-    memset(&oracle_output, 0, sizeof(oracle_output));
-    pgas_to_saem_output(pgas, trigger_surprise, &oracle_output);
+    PGASConfidence conf;
+    pgas_confidence_compute(pgas, ref_path_original, T, &conf, NULL);
 
-    SAEMBlendResult blend = saem_blender_blend(blender, &oracle_output);
+    bridge->last_confidence = conf;
+    result.confidence_score = conf.overall_confidence;
+    result.path_divergence = conf.path_divergence;
+    result.regime_change_detected = conf.regime_change_detected;
+    result.degeneracy_detected = !pgas_confidence_usable(&conf);
+
+    float gamma;
+
+    if (conf.regime_change_detected)
+    {
+        /* Tier-2 reset: market fundamentally changed */
+        saem_blender_tier2_reset(blender);
+        gamma = bridge->config.gamma_on_regime_change;
+        bridge->regime_change_count++;
+
+        if (bridge->config.verbose)
+        {
+            printf("[OracleBridge] REGIME CHANGE detected → tier2 reset, γ=%.2f\n", gamma);
+        }
+    }
+    else if (!pgas_confidence_usable(&conf))
+    {
+        /* Degeneracy: PGAS failed to mix properly */
+        gamma = bridge->config.gamma_on_degeneracy;
+        bridge->degeneracy_count++;
+
+        if (bridge->config.verbose)
+        {
+            printf("[OracleBridge] DEGENERACY detected → minimal blend, γ=%.3f\n", gamma);
+        }
+    }
+    else
+    {
+        /* Normal operation: use confidence-derived γ */
+        gamma = pgas_confidence_get_gamma(&conf);
+
+        if (bridge->config.verbose)
+        {
+            printf("[OracleBridge] Confidence=%.3f → γ=%.3f\n",
+                   conf.overall_confidence, gamma);
+        }
+    }
+
+    result.gamma_used = gamma;
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 5: SAEM BLEND
+     * ═══════════════════════════════════════════════════════════════════*/
+
+    /* Extract transition counts from PGAS */
+    float S[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            S[i * K + j] = (float)pgas->n_trans[i * K + j];
+        }
+    }
+
+    result.diag_before = saem_blender_get_avg_diagonal(blender);
+
+    SAEMBlendResult blend = saem_blender_blend_counts(blender, S, gamma);
 
     result.success = blend.success;
     result.kl_divergence = blend.kl_divergence;
-    result.diag_before = blend.diag_avg_before;
     result.diag_after = blend.diag_avg_after;
     result.stickiness_adjusted = blend.stickiness_adjusted;
 
@@ -347,13 +474,37 @@ OracleRunResult oracle_bridge_run(
 
     if (bridge->config.verbose)
     {
-        printf("[OracleBridge] Blend: KL=%.6f, diag %.4f→%.4f%s\n",
-               blend.kl_divergence, blend.diag_avg_before, blend.diag_avg_after,
+        printf("[OracleBridge] Blend: γ=%.3f, KL=%.6f, diag %.4f→%.4f%s\n",
+               gamma, blend.kl_divergence, result.diag_before, result.diag_after,
                blend.stickiness_adjusted ? " (κ adjusted)" : "");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 6: THOMPSON SAMPLING (if enabled)
+     * ═══════════════════════════════════════════════════════════════════*/
+
+    if (bridge->thompson)
+    {
+        float Q[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+        float Pi_thompson[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+
+        saem_blender_get_Q(blender, Q);
+        ThompsonSampleResult ts_result = thompson_sampler_sample_flat(
+            bridge->thompson, Q, K, Pi_thompson);
+
+        result.thompson_explored = ts_result.explored;
+
+        if (bridge->config.verbose)
+        {
+            printf("[OracleBridge] Thompson: %s (min_row=%.0f)\n",
+                   ts_result.explored ? "EXPLORE" : "EXPLOIT",
+                   ts_result.min_row_sum);
+        }
     }
 
     /* Cleanup */
     free(ref_path);
+    free(ref_path_original);
 
     return result;
 }
@@ -369,6 +520,40 @@ void oracle_bridge_get_Pi(const OracleBridge *bridge, float *Pi_out)
     saem_blender_get_Pi(bridge->blender, Pi_out);
 }
 
+void oracle_bridge_get_Pi_thompson(OracleBridge *bridge, float *Pi_out)
+{
+    if (!bridge || !bridge->initialized || !bridge->blender || !Pi_out)
+        return;
+
+    int K = bridge->n_regimes;
+
+    if (bridge->thompson)
+    {
+        float Q[SAEM_MAX_REGIMES * SAEM_MAX_REGIMES];
+        saem_blender_get_Q(bridge->blender, Q);
+        thompson_sampler_sample_flat(bridge->thompson, Q, K, Pi_out);
+    }
+    else
+    {
+        /* No Thompson: return SAEM mean */
+        saem_blender_get_Pi(bridge->blender, Pi_out);
+    }
+}
+
+void oracle_bridge_get_Q(const OracleBridge *bridge, float *Q_out)
+{
+    if (!bridge || !bridge->initialized || !bridge->blender || !Q_out)
+        return;
+    saem_blender_get_Q(bridge->blender, Q_out);
+}
+
+void oracle_bridge_get_last_confidence(const OracleBridge *bridge, PGASConfidence *conf)
+{
+    if (!bridge || !conf)
+        return;
+    *conf = bridge->last_confidence;
+}
+
 void oracle_bridge_get_stats(const OracleBridge *bridge, OracleBridgeStats *stats)
 {
     if (!bridge || !stats)
@@ -378,6 +563,9 @@ void oracle_bridge_get_stats(const OracleBridge *bridge, OracleBridgeStats *stat
 
     stats->total_oracle_calls = bridge->total_oracle_calls;
     stats->successful_blends = bridge->successful_blends;
+    stats->scout_skip_count = bridge->scout_skip_count;
+    stats->regime_change_count = bridge->regime_change_count;
+    stats->degeneracy_count = bridge->degeneracy_count;
 
     if (bridge->total_oracle_calls > 0)
     {
@@ -388,6 +576,11 @@ void oracle_bridge_get_stats(const OracleBridge *bridge, OracleBridgeStats *stat
     {
         stats->current_gamma = saem_blender_get_gamma(bridge->blender);
         stats->current_avg_diagonal = saem_blender_get_avg_diagonal(bridge->blender);
+    }
+
+    if (bridge->thompson)
+    {
+        stats->thompson_explore_ratio = thompson_sampler_get_explore_ratio(bridge->thompson);
     }
 }
 
@@ -404,25 +597,56 @@ void oracle_bridge_print_state(const OracleBridge *bridge)
     printf("|                  ORACLE BRIDGE STATE                      |\n");
     printf("+===========================================================+\n");
     printf("| Regimes: %d                                               \n", bridge->n_regimes);
-    printf("| Oracle calls: %d (successful: %d)                         \n",
+    printf("+-----------------------------------------------------------+\n");
+    printf("| Statistics:                                               |\n");
+    printf("|   Oracle calls:    %d (successful: %d)                    \n",
            stats.total_oracle_calls, stats.successful_blends);
-    printf("| Avg KL change: %.6f                                      \n", stats.avg_kl_change);
-    printf("| Current γ: %.4f                                          \n", stats.current_gamma);
-    printf("| Avg diagonal: %.4f                                       \n", stats.current_avg_diagonal);
-    printf("| Last trigger: tick %d (surprise=%.2fσ)                   \n",
+    printf("|   Scout skips:     %d                                     \n", stats.scout_skip_count);
+    printf("|   Regime changes:  %d                                     \n", stats.regime_change_count);
+    printf("|   Degeneracies:    %d                                     \n", stats.degeneracy_count);
+    printf("|   Avg KL change:   %.6f                                  \n", stats.avg_kl_change);
+    printf("+-----------------------------------------------------------+\n");
+    printf("| Current state:                                            |\n");
+    printf("|   γ: %.4f                                                \n", stats.current_gamma);
+    printf("|   Avg diagonal: %.4f                                     \n", stats.current_avg_diagonal);
+    if (bridge->thompson)
+    {
+        printf("|   Thompson explore ratio: %.1f%%                         \n",
+               stats.thompson_explore_ratio * 100);
+    }
+    printf("|   Last trigger: tick %d (surprise=%.2fσ)                 \n",
            bridge->last_trigger_tick, bridge->last_hawkes_surprise);
     printf("+-----------------------------------------------------------+\n");
     printf("| Config:                                                   |\n");
     printf("|   Dual-gate: %s (KL threshold=%.1fσ)                     \n",
            bridge->config.use_dual_gate ? "ON" : "OFF",
            bridge->config.kl_threshold_sigma);
+    printf("|   Scout sweep: %s                                        \n",
+           (bridge->config.use_scout_sweep && bridge->paris) ? "ON" : "OFF");
     printf("|   Tempered path: %s (flip=%.1f%%)                        \n",
            bridge->config.use_tempered_path ? "ON" : "OFF",
            bridge->config.temper_flip_prob * 100);
     printf("|   PGAS sweeps: %d-%d (target accept=%.2f)                \n",
            bridge->config.pgas_sweeps_min, bridge->config.pgas_sweeps_max,
            bridge->config.pgas_target_accept);
+    printf("|   Thompson: %s                                           \n",
+           bridge->thompson ? "ON" : "OFF");
     printf("+===========================================================+\n");
+
+    /* Last confidence */
+    if (bridge->total_oracle_calls > 0)
+    {
+        printf("| Last PGAS Confidence:                                     |\n");
+        printf("|   Overall: %.3f                                          \n",
+               bridge->last_confidence.overall_confidence);
+        printf("|   Path divergence: %.1f%%                                \n",
+               bridge->last_confidence.path_divergence * 100);
+        printf("|   ESS ratio: %.3f                                        \n",
+               bridge->last_confidence.ess_ratio);
+        printf("|   Regime change: %s                                      \n",
+               bridge->last_confidence.regime_change_detected ? "YES" : "NO");
+        printf("+===========================================================+\n");
+    }
 
     if (bridge->blender)
     {

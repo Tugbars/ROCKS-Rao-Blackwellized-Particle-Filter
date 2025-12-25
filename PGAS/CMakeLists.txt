@@ -137,6 +137,7 @@ target_link_libraries(pgas INTERFACE
 add_subdirectory(test-bench)
 add_subdirectory(hawkes_signal)
 add_subdirectory(kl_trigger)
+add_subdirectory(pgas_confidence)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Installation
