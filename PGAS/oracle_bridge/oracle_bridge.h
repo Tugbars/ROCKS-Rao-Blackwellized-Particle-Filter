@@ -40,7 +40,24 @@
 #include "kl_trigger.h"
 #include "pgas_confidence.h"
 #include "thompson_sampler.h"
+
+/*───────────────────────────────────────────────────────────────────────────────
+ * PARIS Scout (optional)
+ *
+ * Define ORACLE_BRIDGE_USE_PARIS=1 to enable scout sweep pre-validation.
+ * Requires paris_mkl.h with PARISScoutConfig/PARISScoutResult types.
+ *
+ * If disabled, scout sweeps are skipped and PGAS always runs on trigger.
+ *───────────────────────────────────────────────────────────────────────────────*/
+#ifndef ORACLE_BRIDGE_USE_PARIS
+#define ORACLE_BRIDGE_USE_PARIS 0
+#endif
+
+#if ORACLE_BRIDGE_USE_PARIS
 #include "paris_mkl.h"
+#else
+typedef void PARISMKLState; /* Opaque placeholder when PARIS disabled */
+#endif
 
 #include <stdbool.h>
 

@@ -241,6 +241,7 @@ OracleRunResult oracle_bridge_run(
 
     bool should_run_pgas = true;
 
+#if ORACLE_BRIDGE_USE_PARIS
     if (bridge->config.use_scout_sweep && bridge->paris)
     {
         PARISScoutConfig scout_cfg;
@@ -289,6 +290,10 @@ OracleRunResult oracle_bridge_run(
             }
         }
     }
+#else
+    /* PARIS disabled - scout sweep not available */
+    (void)bridge->paris; /* Silence unused warning */
+#endif
 
     if (!should_run_pgas)
     {
@@ -399,7 +404,7 @@ OracleRunResult oracle_bridge_run(
     pgas_confidence_compute(pgas, ref_path_original, T, &conf, NULL);
 
     bridge->last_confidence = conf;
-    result.confidence_score = conf.overall_confidence;
+    result.confidence_score = conf.overall_score;
     result.path_divergence = conf.path_divergence;
     result.regime_change_detected = conf.regime_change_detected;
     result.degeneracy_detected = !pgas_confidence_usable(&conf);
@@ -437,7 +442,7 @@ OracleRunResult oracle_bridge_run(
         if (bridge->config.verbose)
         {
             printf("[OracleBridge] Confidence=%.3f → γ=%.3f\n",
-                   conf.overall_confidence, gamma);
+                   conf.overall_score, gamma);
         }
     }
 
@@ -638,7 +643,7 @@ void oracle_bridge_print_state(const OracleBridge *bridge)
     {
         printf("| Last PGAS Confidence:                                     |\n");
         printf("|   Overall: %.3f                                          \n",
-               bridge->last_confidence.overall_confidence);
+               bridge->last_confidence.overall_score);
         printf("|   Path divergence: %.1f%%                                \n",
                bridge->last_confidence.path_divergence * 100);
         printf("|   ESS ratio: %.3f                                        \n",

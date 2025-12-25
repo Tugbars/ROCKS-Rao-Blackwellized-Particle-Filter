@@ -51,9 +51,8 @@ target_link_libraries(oracle_bridge PUBLIC
     # Trigger components
     hawkes_integrator
     kl_trigger
-    # PGAS/PARIS (from main PGAS folder)
+    # PGAS (from main PGAS folder)
     pgas_mkl
-    paris_mkl
     # Confidence and blending
     pgas_confidence
     saem_blender
@@ -61,6 +60,18 @@ target_link_libraries(oracle_bridge PUBLIC
     # Trajectory buffer (optional, for snapshot mode)
     rbpf_trajectory
 )
+
+# Optional: PARIS scout sweep support
+# Set ORACLE_BRIDGE_USE_PARIS=1 to enable scout pre-validation
+option(ORACLE_BRIDGE_USE_PARIS "Enable PARIS scout sweep support" OFF)
+if(ORACLE_BRIDGE_USE_PARIS)
+    target_link_libraries(oracle_bridge PUBLIC paris_mkl)
+    target_compile_definitions(oracle_bridge PUBLIC ORACLE_BRIDGE_USE_PARIS=1)
+    message(STATUS "    → PARIS scout enabled")
+else()
+    target_compile_definitions(oracle_bridge PUBLIC ORACLE_BRIDGE_USE_PARIS=0)
+    message(STATUS "    → PARIS scout disabled (set ORACLE_BRIDGE_USE_PARIS=ON to enable)")
+endif()
 
 target_compile_options(oracle_bridge PRIVATE ${COMMON_FLAGS})
 target_compile_definitions(oracle_bridge PRIVATE ${COMMON_DEFS})
