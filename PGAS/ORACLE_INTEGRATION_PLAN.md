@@ -2366,6 +2366,6 @@ Normal Hawkes behavior:          Structural change:
 
 ---
 
-*Document version: 1.6*  
+*Document version: 1.7*  
 *Last updated: December 2025*  
 *Status: Production-ready — Dual-trigger + SAEM + Final Tier + MAB/Thompson Sampling*

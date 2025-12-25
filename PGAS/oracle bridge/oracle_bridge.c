@@ -51,6 +51,7 @@ OracleBridgeConfig oracle_bridge_config_defaults(void)
 int oracle_bridge_init(OracleBridge *bridge,
                        const OracleBridgeConfig *cfg,
                        HawkesIntegrator *hawkes,
+                       KLTrigger *kl_trigger,
                        SAEMBlender *blender,
                        PGASMKLState *pgas)
 {
@@ -63,6 +64,7 @@ int oracle_bridge_init(OracleBridge *bridge,
 
     /* Store component handles (not owned) */
     bridge->hawkes = hawkes;
+    bridge->kl_trigger = kl_trigger; /* Can be NULL to disable dual-gate */
     bridge->blender = blender;
     bridge->pgas = pgas;
 
