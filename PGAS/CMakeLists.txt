@@ -139,6 +139,7 @@ add_subdirectory(hawkes_signal)
 add_subdirectory(kl_trigger)
 add_subdirectory(pgas_confidence)
 add_subdirectory(saem_blender)
+add_subdirectory(thompson_sampler)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Installation
