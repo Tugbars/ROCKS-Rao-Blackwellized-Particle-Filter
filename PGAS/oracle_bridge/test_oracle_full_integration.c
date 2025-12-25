@@ -106,7 +106,7 @@ static int oracle_stack_init(OracleStack *stack, int K, int N, int T_max)
     hawkes_integrator_init(&stack->hawkes, &hcfg);
 
     /* Initialize KL Trigger */
-    KLTriggerConfig kcfg = kl_trigger_config_defaults();
+    KLTriggerConfig kcfg = kl_trigger_config_defaults(K);
     kl_trigger_init(&stack->kl_trigger, &kcfg);
 
     /* Initialize SAEM Blender */

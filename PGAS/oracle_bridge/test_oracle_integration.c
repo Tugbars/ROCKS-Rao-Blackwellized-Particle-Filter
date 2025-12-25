@@ -86,7 +86,7 @@ static int test_full_stack_init(void)
     hawkes_integrator_init(&hawkes, &hcfg);
 
     KLTrigger kl_trigger;
-    KLTriggerConfig kcfg = kl_trigger_config_defaults();
+    KLTriggerConfig kcfg = kl_trigger_config_defaults(K);
     kl_trigger_init(&kl_trigger, &kcfg);
 
     SAEMBlender blender;
