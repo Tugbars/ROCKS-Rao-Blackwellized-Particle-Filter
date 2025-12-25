@@ -138,6 +138,7 @@ add_subdirectory(test-bench)
 add_subdirectory(hawkes_signal)
 add_subdirectory(kl_trigger)
 add_subdirectory(pgas_confidence)
+add_subdirectory(saem_blender)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Installation
