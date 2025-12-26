@@ -33,6 +33,41 @@
 #endif
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * CROSS-PLATFORM ALIGNED ALLOCATION (64-byte for AVX-512)
+ *
+ * pgas_mkl_set_reference may use AVX-512 instructions (vmovaps) which
+ * require 64-byte alignment for optimal performance.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#define RBPF_TRAJ_ALIGNMENT 64 /* AVX-512 / cache line */
+
+#if defined(_MSC_VER) || defined(__INTEL_COMPILER)
+/* MSVC/Intel: Use _mm_malloc/_mm_free */
+#include <malloc.h>
+#define RBPF_ALIGNED_ALLOC(size, align) _mm_malloc((size), (align))
+#define RBPF_ALIGNED_FREE(ptr) _mm_free(ptr)
+#elif defined(__GNUC__) && !defined(__APPLE__)
+/* GCC on Linux: Use aligned_alloc (C11) */
+#define RBPF_ALIGNED_ALLOC(size, align) aligned_alloc((align), (size))
+#define RBPF_ALIGNED_FREE(ptr) free(ptr)
+#elif defined(__APPLE__)
+/* macOS: aligned_alloc available since macOS 10.15 */
+#include <stdlib.h>
+static inline void *rbpf_aligned_alloc_posix(size_t align, size_t size)
+{
+    void *ptr = NULL;
+    posix_memalign(&ptr, align, size);
+    return ptr;
+}
+#define RBPF_ALIGNED_ALLOC(size, align) rbpf_aligned_alloc_posix((align), (size))
+#define RBPF_ALIGNED_FREE(ptr) free(ptr)
+#else
+/* Fallback: Regular malloc (may not be aligned) */
+#define RBPF_ALIGNED_ALLOC(size, align) malloc(size)
+#define RBPF_ALIGNED_FREE(ptr) free(ptr)
+#endif
+
+/*═══════════════════════════════════════════════════════════════════════════
  * RNG (xoroshiro128+)
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -115,15 +150,19 @@ int rbpf_trajectory_init(RBPFTrajectory *traj, const RBPFTrajectoryConfig *confi
 
     int T = traj->config.T_max;
 
-    /* Allocate buffers */
-    traj->regimes = (int *)calloc(T, sizeof(int));
-    traj->h = (float *)calloc(T, sizeof(float));
+    /* Allocate 64-byte aligned buffers for AVX-512 compatibility */
+    traj->regimes = (int *)RBPF_ALIGNED_ALLOC(T * sizeof(int), RBPF_TRAJ_ALIGNMENT);
+    traj->h = (float *)RBPF_ALIGNED_ALLOC(T * sizeof(float), RBPF_TRAJ_ALIGNMENT);
 
     if (!traj->regimes || !traj->h)
     {
         rbpf_trajectory_free(traj);
         return -1;
     }
+
+    /* Zero the buffers */
+    memset(traj->regimes, 0, T * sizeof(int));
+    memset(traj->h, 0, T * sizeof(float));
 
     /* Initialize RNG */
     seed_rng(traj->rng_state, traj->config.seed);
@@ -177,8 +216,8 @@ void rbpf_trajectory_free(RBPFTrajectory *traj)
     if (!traj)
         return;
 
-    free(traj->regimes);
-    free(traj->h);
+    RBPF_ALIGNED_FREE(traj->regimes);
+    RBPF_ALIGNED_FREE(traj->h);
 
     memset(traj, 0, sizeof(*traj));
 }

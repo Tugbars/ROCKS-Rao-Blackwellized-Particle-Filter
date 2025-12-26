@@ -82,12 +82,17 @@
 #include "bocpd.h"
 #include "rbpf_dirichlet_transition.h"
 #include "rbpf_sprt.h"
-#include "rbpf_mh_jitter.h"       /* Stone #2: Informed particle exploration */
-#include "online_vi_transition.h" /* ═══ ONLINE VI INTEGRATION ═══ */
+#include "rbpf_mh_jitter.h"      
+#include "online_vi_transition.h" 
+#include "rbpf_lut_buffer.h"
 #include <mkl.h>
 #include <mkl_vsl.h>
 #include <stdint.h>
 #include <math.h>
+
+#ifdef _WIN32
+#include <intrin.h>  /* For _InterlockedExchange, _ReadWriteBarrier */
+#endif
 
 #ifdef __cplusplus
 extern "C"
@@ -646,7 +651,17 @@ typedef float rbpf_real_t;
          * REGIME SYSTEM
          *======================================================================*/
         RBPF_RegimeParams params[RBPF_MAX_REGIMES];
-        uint8_t trans_lut[RBPF_MAX_REGIMES][RBPF_TRANS_LUT_SIZE]; /* Precomputed transition LUT */
+
+        // ... existing fields ...
+
+        /*═══════════════════════════════════════════════════════════════════════
+         * THREAD-SAFE TRANSITION LUT
+         *
+         * See rbpf_lut_buffer.h for protocol documentation.
+         * Oracle writes via rbpf_ksc_build_transition_lut()
+         * RBPF reads via rbpf_lut_acquire_read() in transition step
+         *═══════════════════════════════════════════════════════════════════════*/
+        RBPF_LUT_Buffer trans_lut;
 
         /*========================================================================
          * WORKSPACE (preallocated - NO malloc in hot path)
@@ -843,6 +858,11 @@ typedef float rbpf_real_t;
         uint64_t vi_heartbeat_interval; /**< Force reset after this many ticks (e.g., 50000) */
 
     } RBPF_KSC;
+
+
+/* Compatibility macro for legacy code */
+#define RBPF_TRANS_LUT(rbpf) \
+    ((const uint8_t (*)[RBPF_LUT_SIZE])rbpf_lut_acquire_read(&(rbpf)->trans_lut))
 
     /**
      * Output from rbpf_ksc_step()
@@ -1809,6 +1829,17 @@ typedef float rbpf_real_t;
      * @brief Print Dirichlet transition learning diagnostics
      */
     void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf);
+
+    /**
+     * @brief Thread-safe transition matrix update from Oracle
+     *
+     * Writes to shadow buffer, then atomically swaps.
+     * Safe to call from Oracle thread while RBPF is running.
+     *
+     * @param rbpf       RBPF instance
+     * @param Pi_flat    Row-major K×K transition matrix
+     */
+    void rbpf_ksc_update_transition_matrix_threadsafe(RBPF_KSC *rbpf, const float *Pi_flat);
 
 #ifdef __cplusplus
 }

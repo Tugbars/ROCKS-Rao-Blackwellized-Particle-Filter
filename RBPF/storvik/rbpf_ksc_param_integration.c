@@ -487,11 +487,32 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
     if (ext->smoother)
     {
         fls_reset(ext->smoother);
+        
+        /* Sync model params to smoother for PARIS backward kernel */
+        if (ext->smoothed_storvik_enabled)
+        {
+            const int nr = ext->rbpf->n_regimes;
+            double trans[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
+            double mu_vol[RBPF_MAX_REGIMES];
+            double sigma_vol[RBPF_MAX_REGIMES];
+            double phi = 1.0 - ext->rbpf->params[0].theta;  /* Assume same θ */
+            
+            for (int i = 0; i < nr; i++)
+            {
+                mu_vol[i] = ext->rbpf->params[i].mu_vol;
+                sigma_vol[i] = ext->rbpf->params[i].sigma_vol;
+                for (int j = 0; j < nr; j++)
+                {
+                    trans[i * nr + j] = ext->base_trans_matrix[i * nr + j];
+                }
+            }
+            fls_set_model(ext->smoother, trans, mu_vol, sigma_vol, phi);
+        }
     }
     ext->cooldown_remaining = 0;
 
     /* Initialize policy engine state */
-    ext->prev_sprt_regime = 0; /* Start in regime 0 (typically calm) */
+    ext->prev_sprt_regime = 0;
     ext->structural_break_signaled = 0;
 }
 
@@ -748,19 +769,21 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
             ext->trans_ticks_since_update = 0;
 
             /* Update base matrix for Hawkes */
+            const uint8_t (*lut)[RBPF_LUT_SIZE] = rbpf_lut_acquire_read(&rbpf->trans_lut);
             const int nr = rbpf->n_regimes;
+
             for (int i = 0; i < nr; i++)
             {
                 for (int j = 0; j < nr; j++)
                 {
                     int count = 0;
-                    for (int k = 0; k < 1024; k++)
+                    for (int k = 0; k < RBPF_LUT_SIZE; k++)
                     {
-                        if (rbpf->trans_lut[i][k] == j)
+                        if (lut[i][k] == (uint8_t)j)
                             count++;
                     }
                     ext->base_trans_matrix[i * nr + j] =
-                        (rbpf_real_t)count / RBPF_REAL(1024.0);
+                        (rbpf_real_t)count / (rbpf_real_t)RBPF_LUT_SIZE;
                 }
             }
         }

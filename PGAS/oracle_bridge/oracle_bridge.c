@@ -32,6 +32,7 @@ OracleBridgeConfig oracle_bridge_config_defaults(void)
     /* Dual-gate trigger */
     cfg.use_dual_gate = true;
     cfg.kl_threshold_sigma = 2.0f;
+    cfg.refractory_ticks = 100; /* Prevent spamming Oracle */
 
     /* Scout sweep */
     cfg.use_scout_sweep = true;
@@ -202,6 +203,74 @@ OracleTriggerResult oracle_bridge_check_trigger(
     }
 
     return result;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * FAST PATH (Run on RBPF Thread)
+ *
+ * Called every tick (<5μs latency). Updates Hawkes + KL and checks trigger.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+bool oracle_bridge_ingest_tick(
+    OracleBridge *bridge,
+    int tick_idx,
+    float obs_return,
+    float vol_predicted,
+    float vol_actual,
+    float vol_std)
+{
+
+    if (!bridge || !bridge->initialized)
+        return false;
+
+    /* 1. Update Hawkes (Lead Trigger) - tracks market activity bursts */
+    HawkesIntegratorResult hawkes_res = hawkes_integrator_update(
+        bridge->hawkes,
+        (float)tick_idx,
+        obs_return);
+
+    /* 2. Update KL Trigger (Truth Trigger) - tracks model confusion
+     * The KL trigger measures how "surprised" the model is by the actual
+     * volatility vs what it predicted. Large surprise = regime confusion.
+     */
+    KLInnovation innov;
+    memset(&innov, 0, sizeof(innov));
+    innov.vol_predicted = vol_predicted;
+    innov.vol_actual = vol_actual;
+    innov.vol_std = vol_std;
+    /* obs_predicted, obs_actual, obs_std can be left as 0 if not tracking */
+
+    KLTriggerResult kl_res = kl_trigger_update(bridge->kl_trigger, &innov);
+    bridge->last_kl_surprise = kl_res.surprise_sigma;
+
+    /* 3. Check Dual-Gate Trigger */
+    OracleTriggerResult trig = oracle_bridge_check_trigger(
+        bridge,
+        &hawkes_res,
+        kl_res.surprise_sigma,
+        tick_idx);
+
+    /* 4. Handle Trigger with Refractory Period
+     * Prevent spamming the Oracle worker thread.
+     */
+    if (trig.should_trigger)
+    {
+        int ticks_since_last = tick_idx - bridge->last_trigger_tick;
+        int refractory = bridge->config.refractory_ticks;
+
+        if (refractory <= 0)
+        {
+            refractory = 100; /* Default refractory period */
+        }
+
+        if (ticks_since_last > refractory)
+        {
+            bridge->last_trigger_tick = tick_idx;
+            return true; /* Signal RBPF to wake up Oracle Worker */
+        }
+    }
+
+    return false;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════

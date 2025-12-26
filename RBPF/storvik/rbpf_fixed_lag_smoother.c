@@ -607,6 +607,47 @@ int fls_emergency_flush(RBPF_FixedLagSmoother *fls, ParamLearner *learner)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * STROBOSCOPIC BATCH UPDATE (Amortized Smoothing)
+ *
+ * Runs PARIS once, extracts ALL (ℓ̃_t, ℓ̃_{t-1}) pairs from buffer.
+ * Does NOT reset buffer - ring buffer slides naturally.
+ *
+ * Cost: ~50μs PARIS + ~25μs for L Storvik updates
+ * Amortized over L ticks: ~1.5μs/tick
+ *═══════════════════════════════════════════════════════════════════════════*/
+int fls_stroboscopic_update(RBPF_FixedLagSmoother *fls, ParamLearner *learner)
+{
+    if (!fls || !learner || !fls_ready(fls)) return 0;
+    
+    double t0 = get_time_us();
+    
+    /* Run PARIS backward smoothing once */
+    fls_load_partial_to_paris(fls, fls->count);
+    paris_mkl_backward_smooth(fls->paris);
+    
+    /* Extract ALL smoothed pairs from buffer */
+    int T = fls->count;
+    int updates = 0;
+    
+    for (int t = 1; t < T; t++)
+    {
+        fls_build_particle_info_at(fls, t - 1, t);
+        param_learn_update(learner, fls->particle_info, fls->n_particles);
+        updates++;
+    }
+    
+    /* DON'T reset - let ring buffer slide naturally via overwrite */
+    /* This ensures no gaps between stroboscopic windows */
+    
+    double elapsed = get_time_us() - t0;
+    fls->smoothing_calls++;
+    fls->total_smooth_time_us += elapsed;
+    fls->last_smooth_time_us = elapsed;
+    
+    return updates;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * DIAGNOSTICS
  *═══════════════════════════════════════════════════════════════════════════*/
 

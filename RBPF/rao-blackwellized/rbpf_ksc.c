@@ -356,12 +356,15 @@ void rbpf_ksc_transition(RBPF_KSC *rbpf)
     int *regime = rbpf->regime;
     rbpf_pcg32_t *rng = &rbpf->pcg[0];
 
+    /* Acquire active LUT - cache pointer for entire loop */
+    const uint8_t (*lut)[RBPF_LUT_SIZE] = rbpf_lut_acquire_read(&rbpf->trans_lut);
+
     for (int i = 0; i < n; i++)
     {
         int r_old = regime[i];
-        rbpf_real_t u = rbpf_pcg32_uniform(rng);
-        int lut_idx = (int)(u * RBPF_REAL(1023.0));
-        regime[i] = rbpf->trans_lut[r_old][lut_idx];
+        uint32_t r = rbpf_pcg32_random(rng);
+        int lut_idx = r >> (32 - 11);  /* top 11 bits for 2048-size LUT */
+        regime[i] = lut[r_old][lut_idx];
     }
 }
 

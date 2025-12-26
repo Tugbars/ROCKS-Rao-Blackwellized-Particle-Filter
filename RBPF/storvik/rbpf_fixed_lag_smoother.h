@@ -355,6 +355,9 @@ extern "C"
      */
     void fls_print_info(const RBPF_FixedLagSmoother *fls);
 
+    static void fls_build_particle_info_at(RBPF_FixedLagSmoother *fls, 
+                                        int t_lag, int t_cur);
+
 #ifdef __cplusplus
 }
 #endif

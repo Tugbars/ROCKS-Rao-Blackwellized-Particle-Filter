@@ -369,6 +369,10 @@ void rbpf_ksc_set_regime_params(RBPF_KSC *rbpf, int r,
 
 void rbpf_ksc_build_transition_lut(RBPF_KSC *rbpf, const rbpf_real_t *trans_matrix)
 {
+    /* Get shadow buffer (safe to write) */
+    uint8_t (*shadow)[RBPF_LUT_SIZE] = rbpf_lut_begin_write(&rbpf->trans_lut);
+
+    /* Build LUT in shadow buffer */
     for (int r = 0; r < rbpf->n_regimes; r++)
     {
         rbpf_real_t cumsum[RBPF_MAX_REGIMES];
@@ -378,9 +382,9 @@ void rbpf_ksc_build_transition_lut(RBPF_KSC *rbpf, const rbpf_real_t *trans_matr
             cumsum[j] = cumsum[j - 1] + trans_matrix[r * rbpf->n_regimes + j];
         }
 
-        for (int i = 0; i < 1024; i++)
+        for (int i = 0; i < RBPF_LUT_SIZE; i++)
         {
-            rbpf_real_t u = (rbpf_real_t)i / RBPF_REAL(1024.0);
+            rbpf_real_t u = (rbpf_real_t)i / (rbpf_real_t)RBPF_LUT_SIZE;
             int next = rbpf->n_regimes - 1;
             for (int j = 0; j < rbpf->n_regimes - 1; j++)
             {
@@ -390,9 +394,12 @@ void rbpf_ksc_build_transition_lut(RBPF_KSC *rbpf, const rbpf_real_t *trans_matr
                     break;
                 }
             }
-            rbpf->trans_lut[r][i] = (uint8_t)next;
+            shadow[r][i] = (uint8_t)next;
         }
     }
+
+    /* Atomic commit - readers now see new LUT */
+    rbpf_lut_commit_write(&rbpf->trans_lut);
 }
 
 void rbpf_ksc_set_regularization(RBPF_KSC *rbpf, rbpf_real_t h_mu, rbpf_real_t h_var)
@@ -848,13 +855,16 @@ float rbpf_ksc_get_transition_prob(const RBPF_KSC *rbpf, int from, int to)
     {
         /* Return from fixed LUT (approximate - LUT is discretized) */
         /* Count how many LUT entries map to 'to' */
+        /* Get active LUT pointer */
+        const uint8_t (*lut)[RBPF_LUT_SIZE] = rbpf_lut_acquire_read(&rbpf->trans_lut);
+
         int count = 0;
-        for (int i = 0; i < 1024; i++)
+        for (int i = 0; i < RBPF_LUT_SIZE; i++)
         {
-            if (rbpf->trans_lut[from][i] == (uint8_t)to)
+            if (lut[from][i] == (uint8_t)to)
                 count++;
         }
-        return (float)count / 1024.0f;
+        return (float)count / (float)RBPF_LUT_SIZE;
     }
 }
 
@@ -897,6 +907,22 @@ void rbpf_ksc_print_transition_prior(const RBPF_KSC *rbpf)
         }
     }
     printf("═══════════════════════════════════════════════════════════════\n");
+}
+
+void rbpf_ksc_update_transition_matrix_threadsafe(RBPF_KSC *rbpf, const float *Pi_flat)
+{
+    if (!rbpf || !Pi_flat) return;
+    
+    /* Convert float to rbpf_real_t if needed, then delegate */
+    rbpf_real_t trans[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
+    int K = rbpf->n_regimes;
+    
+    for (int i = 0; i < K * K; i++)
+    {
+        trans[i] = (rbpf_real_t)Pi_flat[i];
+    }
+    
+    rbpf_ksc_build_transition_lut(rbpf, trans);
 }
 
 /*─────────────────────────────────────────────────────────────────────────────

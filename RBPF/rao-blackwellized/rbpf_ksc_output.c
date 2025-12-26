@@ -58,6 +58,9 @@ void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
     const int n_regimes = rbpf->n_regimes;
     const DirichletTransition *dt = &rbpf->trans_prior;
 
+    /* Get shadow buffer for writing */
+    uint8_t (*shadow)[RBPF_LUT_SIZE] = rbpf_lut_begin_write(&rbpf->trans_lut);
+
     for (int r = 0; r < n_regimes; r++)
     {
         /* Build cumulative distribution */
@@ -68,10 +71,10 @@ void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
             cumsum[j] = cumsum[j - 1] + dt->prob[r][j];
         }
 
-        /* Fill LUT: for each u ∈ [0, 1024), find smallest j where cumsum[j] > u/1024 */
-        for (int i = 0; i < 1024; i++)
+        /* Fill LUT: for each u ∈ [0, LUT_SIZE), find smallest j where cumsum[j] > u/LUT_SIZE */
+        for (int i = 0; i < RBPF_LUT_SIZE; i++)
         {
-            float u = (float)i / 1024.0f;
+            float u = (float)i / (float)RBPF_LUT_SIZE;
             int next = n_regimes - 1;
             for (int j = 0; j < n_regimes - 1; j++)
             {
@@ -81,9 +84,12 @@ void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf)
                     break;
                 }
             }
-            rbpf->trans_lut[r][i] = (uint8_t)next;
+            shadow[r][i] = (uint8_t)next;
         }
     }
+
+    /* Atomic commit - readers now see new LUT */
+    rbpf_lut_commit_write(&rbpf->trans_lut);
 }
 
 /*─────────────────────────────────────────────────────────────────────────────

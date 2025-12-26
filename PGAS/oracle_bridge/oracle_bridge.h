@@ -86,6 +86,7 @@ extern "C"
         /* Dual-gate trigger (Hawkes + KL) */
         bool use_dual_gate;       /* Require both signals (default: true) */
         float kl_threshold_sigma; /* KL surprise threshold in σ (default: 2.0) */
+        int refractory_ticks;     /* Min ticks between Oracle triggers (default: 100) */
 
         /* Scout sweep pre-validation */
         bool use_scout_sweep;        /* Enable scout validation (default: true) */
@@ -221,6 +222,36 @@ extern "C"
         const HawkesIntegratorResult *hawkes_result,
         float kl_surprise,
         int current_tick);
+
+    /*═══════════════════════════════════════════════════════════════════════════
+     * API - FAST PATH (Run on RBPF Thread)
+     *
+     * This is the <5μs latency path called every tick by the RBPF filter.
+     * Updates Hawkes + KL trigger and checks if Oracle should fire.
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Ingest a tick and check if Oracle should trigger
+     *
+     * Call this from the RBPF thread at every tick. It updates:
+     *   - Hawkes integrator (market activity)
+     *   - KL trigger (model confusion)
+     *
+     * @param bridge         Initialized bridge
+     * @param tick_idx       Current tick index
+     * @param obs_return     Observed return at this tick
+     * @param vol_predicted  RBPF predicted volatility
+     * @param vol_actual     RBPF actual/estimated volatility (or surprise magnitude)
+     * @param vol_std        Standard deviation of volatility estimate
+     * @return true if Oracle should be triggered (wake up worker thread)
+     */
+    bool oracle_bridge_ingest_tick(
+        OracleBridge *bridge,
+        int tick_idx,
+        float obs_return,
+        float vol_predicted,
+        float vol_actual,
+        float vol_std);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API - ORACLE EXECUTION
