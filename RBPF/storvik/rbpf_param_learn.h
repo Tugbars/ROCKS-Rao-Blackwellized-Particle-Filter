@@ -551,6 +551,7 @@ typedef PARAM_LEARN_REAL param_real;
      * @param learner   Storvik learner handle
      */
     void param_learn_print_reset_stats(const ParamLearner *learner);
+    
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API: Diagnostics

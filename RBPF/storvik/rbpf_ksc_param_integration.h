@@ -177,9 +177,33 @@ extern "C"
         rbpf_real_t surprise_zscore;
         rbpf_real_t discount_applied;
 
+        /* ═══════════════════════════════════════════════════════════════════════
+         * LAMBDA OVERRIDE / RESTORE STATE (v3)
+         *
+         * When circuit breaker fires, we override ALL lambda sources with
+         * emergency_lambda. These fields track the original values so we
+         * can restore them after the crisis passes.
+         * ═══════════════════════════════════════════════════════════════════════ */
+
+        /** Flag: emergency lambda override is currently active */
+        int lambda_override_active;
+
+        /** Saved global lambda before override */
+        rbpf_real_t saved_lambda_global;
+
+        /** Saved per-regime lambdas before override */
+        rbpf_real_t saved_lambda_regime[RBPF_MAX_REGIMES];
+
+        /** Number of ticks to blend from emergency → saved lambdas */
+        int restore_blend_ticks;
+
+        /** Ticks elapsed since restoration started */
+        int restore_ticks_elapsed;
+
         /* Statistics */
         uint64_t interventions;
         rbpf_real_t max_surprise_seen;
+        
 
     } RBPF_AdaptiveForgetting;
 
@@ -525,6 +549,33 @@ extern "C"
                                      rbpf_real_t *current_lambda,
                                      rbpf_real_t *max_surprise);
     void rbpf_ext_print_adaptive_config(const RBPF_Extended *ext);
+
+    /**
+     * @brief Set restoration blend duration
+     *
+     * After circuit breaker cooldown expires, per-regime lambdas are
+     * gradually restored over this many ticks.
+     *
+     * @param ext    Extended RBPF handle
+     * @param ticks  Number of ticks to blend from emergency → saved (default 50)
+     */
+    void rbpf_ext_set_circuit_breaker_restore_ticks(RBPF_Extended *ext, int ticks);
+
+    /**
+     * @brief Check if lambda override is currently active
+     *
+     * Returns true between circuit breaker trip and restoration completion.
+     */
+    int rbpf_ext_lambda_override_active(const RBPF_Extended *ext);
+
+    /**
+     * @brief Get restoration progress (0.0 to 1.0)
+     *
+     * Returns how far along the lambda restoration process is.
+     * 0.0 = just started (using emergency lambda)
+     * 1.0 = complete (using original per-regime lambdas)
+     */
+    rbpf_real_t rbpf_ext_get_restore_progress(const RBPF_Extended *ext);
 
     /*═══════════════════════════════════════════════════════════════════════════
      * SECTION 11: KL TEMPERING (rbpf_kl_tempering.c)
