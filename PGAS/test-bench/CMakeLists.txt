@@ -56,24 +56,6 @@ target_link_libraries(test_paris_mkl
 target_compile_options(test_paris_mkl PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(test_paris_mkl PRIVATE ${COMMON_DEFS})
 
-#───────────────────────────────────────────────────────────────────────────────
-# Test: Lifeboat Integration
-#───────────────────────────────────────────────────────────────────────────────
-
-add_executable(test_lifeboat
-    test_lifeboat.c
-)
-
-target_link_libraries(test_lifeboat
-    PRIVATE
-        lifeboat
-        pgas_mkl
-        MKL::MKL
-        Threads::Threads
-)
-
-target_compile_options(test_lifeboat PRIVATE ${PGAS_COMPILE_FLAGS})
-target_compile_definitions(test_lifeboat PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
 # Validation: Option A - Ground Truth Recovery
