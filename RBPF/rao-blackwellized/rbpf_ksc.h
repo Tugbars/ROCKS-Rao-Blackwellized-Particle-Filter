@@ -59,26 +59,6 @@
 #ifndef RBPF_KSC_H
 #define RBPF_KSC_H
 
-/*═══════════════════════════════════════════════════════════════════════════
- * BOCPD CHANGEPOINT DETECTION (For MMPF Integration)
- *
- * NOTE: BOCPD is designed for MMPF architecture, not single RBPF.
- *
- * In MMPF:
- *   - Multiple warm RBPFs exist (one per regime hypothesis)
- *   - BOCPD triggers → upweight correct hypothesis instantly
- *   - Works because alternatives are already tracking
- *
- * In single RBPF:
- *   - All particles stuck at current regime
- *   - BOCPD triggers → no good particles to upweight
- *   - KSC observation noise (~2.2 std) buries regime signal (~1.5)
- *   - SNR ≈ 0.7 → unreliable single-tick detection
- *
- * The attach/detach API is preserved for MMPF integration.
- * For single RBPF, use SPRT + pilot light for regime detection.
- *═══════════════════════════════════════════════════════════════════════════*/
-
 #include "rbpf_dirichlet_transition.h"
 #include "rbpf_sprt.h"
 #include "rbpf_mh_jitter.h"      
@@ -1374,62 +1354,6 @@ typedef float rbpf_real_t;
                                                   rbpf_real_t y,
                                                   const RBPF_RobustOCSN *robust_ocsn);
 
-    /*─────────────────────────────────────────────────────────────────────────────
-     * APF (Auxiliary Particle Filter) API
-     *
-     * Lookahead-based resampling for improved regime change detection.
-     * Requires r_{t+1} to be available (1-tick lookahead).
-     *
-     * ═══════════════════════════════════════════════════════════════════════════
-     * SPLIT-STREAM ARCHITECTURE (CRITICAL)
-     * ═══════════════════════════════════════════════════════════════════════════
-     *
-     * For best results, use DIFFERENT data streams for update vs lookahead:
-     *
-     *   obs_current: SSA-CLEANED return → stable state update
-     *   obs_next:    RAW tick return    → see full spike for lookahead
-     *
-     * Why: If you smooth the lookahead (SSA on obs_next), you remove the
-     * "surprise" signal that triggers aggressive APF resampling. SSA-smoothed
-     * lookahead turns a "crisis detector" into a "laggy tracker".
-     *
-     * Example usage:
-     *   rbpf_ksc_step_apf(rbpf, ssa_return[t], raw_return[t+1], &output);
-     *
-     * Key improvements in this implementation:
-     *   1. Variance inflation (2.5x): Widen search beam for 5σ spikes
-     *   2. Shotgun sampling: Evaluate at mean, ±2σ, take best
-     *   3. Mixture proposal (α=0.8): 80% APF + 20% SIR for diversity
-     *───────────────────────────────────────────────────────────────────────────*/
-
-    /* Full APF step - always uses lookahead (~20μs with shotgun sampling)
-     * obs_current: SSA-cleaned return for UPDATE (stable estimate)
-     * obs_next:    RAW return for LOOKAHEAD (see the spike) */
-    void rbpf_ksc_step_apf(RBPF_KSC *rbpf, rbpf_real_t obs_current, rbpf_real_t obs_next,
-                           RBPF_KSC_Output *output);
-
-    /* Adaptive APF - switches based on surprise level (12-20μs)
-     * Uses standard SIR in calm markets, APF during regime changes */
-    void rbpf_ksc_step_adaptive(RBPF_KSC *rbpf, rbpf_real_t obs_current, rbpf_real_t obs_next,
-                                RBPF_KSC_Output *output);
-
-    /* Force APF for next n_steps (call when BOCPD signals changepoint) */
-    void rbpf_ksc_force_apf(int n_steps);
-    int rbpf_ksc_apf_forced(void);
-
-    /* APF statistics */
-    void rbpf_apf_reset_stats(void);
-    void rbpf_apf_get_stats(int *total, int *apf_count, rbpf_real_t *apf_ratio);
-
-    /*─────────────────────────────────────────────────────────────────────────────
-     * INTERNAL FUNCTIONS (exposed for APF module)
-     *───────────────────────────────────────────────────────────────────────────*/
-    void rbpf_ksc_predict_internal(RBPF_KSC *rbpf);
-    rbpf_real_t rbpf_ksc_update_internal(RBPF_KSC *rbpf, rbpf_real_t y);
-    void rbpf_ksc_resample_internal(RBPF_KSC *rbpf);
-    void rbpf_ksc_transition_internal(RBPF_KSC *rbpf);
-    void rbpf_ksc_compute_outputs_internal(RBPF_KSC *rbpf, rbpf_real_t marginal, RBPF_KSC_Output *out);
-
     /*═══════════════════════════════════════════════════════════════════════════
      * RBPF PIPELINE: Unified Change Detection + Volatility Tracking
      *
@@ -1556,62 +1480,6 @@ typedef float rbpf_real_t;
 
     void rbpf_ksc_set_learned_params_mode(RBPF_KSC *rbpf, int enable);
 
-    /**
-     * @brief APF step with resample index output (for Storvik integration)
-     *
-     * Same as rbpf_ksc_step_apf but returns the resample indices, allowing
-     * external code to apply the same resampling to additional arrays.
-     *
-     * CRITICAL for Storvik: Without consistent resampling of per-particle
-     * parameter arrays, particle states and learned params become misaligned.
-     *
-     * @param rbpf              RBPF context
-     * @param obs_current       Current observation (raw return r_t)
-     * @param obs_next          Next observation (raw return r_{t+1}) for lookahead
-     * @param out               Output structure
-     * @param resample_indices_out  Output: index[i] = which source particle new particle i came from
-     */
-    void rbpf_ksc_step_apf_indexed(
-        RBPF_KSC *rbpf,
-        rbpf_real_t obs_current,
-        rbpf_real_t obs_next,
-        RBPF_KSC_Output *out,
-        int *resample_indices_out);
-
-    /**
-     * @brief Compute APF resample indices without applying
-     *
-     * Useful when you need to resample multiple array sets with the same indices.
-     *
-     * @param rbpf                  RBPF context
-     * @param log_weight_combined   Combined APF weights [n_particles]
-     * @param indices_out           Output: resample indices [n_particles]
-     */
-    void rbpf_ksc_apf_compute_resample_indices(
-        RBPF_KSC *rbpf,
-        const rbpf_real_t *log_weight_combined,
-        int *indices_out);
-
-    /**
-     * @brief Apply pre-computed resample indices to RBPF arrays
-     *
-     * @param rbpf     RBPF context
-     * @param indices  Resample indices from rbpf_ksc_apf_compute_resample_indices
-     */
-    void rbpf_ksc_apf_apply_resample_indices(
-        RBPF_KSC *rbpf,
-        const int *indices);
-
-    /**
-     * @brief Get last computed resample indices
-     *
-     * @param indices_out  Output buffer
-     * @param max_n        Max indices to copy
-     * @return Number of indices copied, or 0 if none available
-     */
-    int rbpf_ksc_apf_get_resample_indices(int *indices_out, int max_n);
-
-    void rbpf_ksc_force_sprt_regime(RBPF_KSC *rbpf, int regime);
 
     /*─────────────────────────────────────────────────────────────────────────────
      * MH JITTERING API (Stone #2 - Informed Exploration)
