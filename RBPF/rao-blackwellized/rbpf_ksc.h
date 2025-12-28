@@ -1488,7 +1488,6 @@ typedef float rbpf_real_t;
      * Turns blind jitter into likelihood-guided exploration.
      * Safe with Storvik - stays within regime boundaries.
      *───────────────────────────────────────────────────────────────────────────*/
-
     /**
      * @brief Enable/disable MH jittering
      *

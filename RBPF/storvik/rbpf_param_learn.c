@@ -364,13 +364,6 @@ ParamLearnConfig param_learn_config_no_forgetting(void)
     return cfg;
 }
 
-ParamLearnConfig param_learn_config_ewss(void)
-{
-    ParamLearnConfig cfg = param_learn_config_defaults();
-    cfg.method = PARAM_LEARN_EWSS;
-    return cfg;
-}
-
 /*═══════════════════════════════════════════════════════════════════════════
  * LIFECYCLE
  *═══════════════════════════════════════════════════════════════════════════*/
@@ -886,39 +879,6 @@ static void storvik_sample_soa(ParamLearner *learner, StorvikSoA *soa, int idx, 
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * EWSS
- *═══════════════════════════════════════════════════════════════════════════*/
-
-static void ewss_update(EWSSStats *e, const RegimePrior *prior,
-                        param_real ell, param_real ell_lag,
-                        param_real weight, param_real lambda)
-{
-    param_real phi = prior->phi;
-    param_real z = ell - phi * ell_lag;
-    e->sum_z = lambda * e->sum_z + weight * z;
-    e->sum_z_sq = lambda * e->sum_z_sq + weight * z * z;
-    e->eff_n = lambda * e->eff_n + weight;
-}
-
-static void ewss_compute_mle(EWSSStats *e, const RegimePrior *prior, param_real min_eff_n)
-{
-    if (e->eff_n < min_eff_n)
-    {
-        e->mu = prior->m;
-        e->sigma = prior->sigma_prior;
-        return;
-    }
-
-    param_real one_minus_phi = 1.0 - prior->phi;
-    param_real mean_z = e->sum_z / e->eff_n;
-    param_real var_z = e->sum_z_sq / e->eff_n - mean_z * mean_z;
-    var_z = fmax(1e-10, var_z);
-
-    e->mu = mean_z / one_minus_phi;
-    e->sigma = sqrt(var_z);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
  * MAIN UPDATE
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -966,26 +926,6 @@ void param_learn_update(ParamLearner *learner,
     if (break_flag)
     {
         learner->structural_break_flag = false;
-    }
-
-    /* EWSS mode */
-    if (cfg->method == PARAM_LEARN_EWSS)
-    {
-        for (int i = 0; i < n && i < learner->n_particles; i++)
-        {
-            const ParticleInfo *p = &particles[i];
-            int r = p->regime;
-            if (r < 0 || r >= learner->n_regimes)
-                continue;
-            ewss_update(&learner->ewss[r], &learner->priors[r],
-                        p->ell, p->ell_lag, p->weight, cfg->ewss_lambda);
-        }
-        for (int r = 0; r < learner->n_regimes; r++)
-        {
-            ewss_compute_mle(&learner->ewss[r], &learner->priors[r], cfg->ewss_min_eff_n);
-        }
-        learner->total_stat_updates += n;
-        return;
     }
 
     /* Fixed mode */
@@ -1175,24 +1115,6 @@ void param_learn_get_params(const ParamLearner *learner,
         params->ticks_since_sample = 0;
         params->last_trigger = SAMPLE_TRIGGER_NONE;
         params->confidence = 0;
-        return;
-    }
-
-    if (cfg->method == PARAM_LEARN_EWSS)
-    {
-        const EWSSStats *e = &learner->ewss[regime];
-        params->mu = e->mu;
-        params->phi = p->phi;
-        params->sigma = e->sigma;
-        params->sigma2 = e->sigma * e->sigma;
-        params->mu_post_mean = e->mu;
-        params->mu_post_std = 0;
-        params->sigma2_post_mean = params->sigma2;
-        params->sigma2_post_std = 0;
-        params->n_obs = (int)e->eff_n;
-        params->ticks_since_sample = 0;
-        params->last_trigger = SAMPLE_TRIGGER_NONE;
-        params->confidence = fmin(1.0, e->eff_n / cfg->ewss_min_eff_n);
         return;
     }
 
