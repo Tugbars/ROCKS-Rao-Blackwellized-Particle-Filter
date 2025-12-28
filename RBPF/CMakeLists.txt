@@ -17,30 +17,6 @@ option(MMPF_ENABLE_MCMC "Enable MCMC particle teleportation" ON)
 option(RBPF_ENABLE_HDP_BEAM "Enable Sticky HDP-HMM Beam Sampling" ON)
 option(RBPF_ENABLE_ONLINE_VI "Enable Online VI transition learning" OFF)
 
-
-#───────────────────────────────────────────────────────────────────────────────
-# BOCPD Library (required for regime detection)
-#
-# Architecture: "Pilot Light + Afterburner"
-#   - Pilot Light (mutation): Prevents P(regime=k)=0 absorbing states
-#   - Afterburner (BOCPD): Event-driven regime switching on vol structure change
-#───────────────────────────────────────────────────────────────────────────────
-
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c)
-    message(FATAL_ERROR "BOCPD not found at ../RBPF-BOCPD/bocpd.c - BOCPD is required for ROCKS")
-endif()
-
-add_library(bocpd STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.c
-)
-
-target_include_directories(bocpd PUBLIC 
-    ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
-)
-
-target_compile_options(bocpd PRIVATE ${COMMON_FLAGS})
-target_compile_definitions(bocpd PRIVATE ${COMMON_DEFS})
-
 #───────────────────────────────────────────────────────────────────────────────
 # ROCKS Core Library
 #───────────────────────────────────────────────────────────────────────────────
@@ -113,14 +89,12 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
         ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam
         ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI
-        ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS
 )
 
 target_link_libraries(rocks 
     PUBLIC 
         MKL::MKL
-        bocpd
 )
 
 target_compile_options(rocks PRIVATE ${COMMON_FLAGS})
@@ -183,32 +157,6 @@ if(RBPF_BUILD_TESTS)
         target_link_libraries(test_mmpf_real_data PRIVATE rocks)
         target_compile_options(test_mmpf_real_data PRIVATE ${COMMON_FLAGS})
         target_compile_definitions(test_mmpf_real_data PRIVATE ${COMMON_DEFS})
-    endif()
-
-    # BOCPD standalone test
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c)
-        add_executable(test_bocpd
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd.c
-        )
-        target_link_libraries(test_bocpd PRIVATE bocpd)
-        if(NOT WIN32)
-            target_link_libraries(test_bocpd PRIVATE m)
-        endif()
-        target_compile_options(test_bocpd PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_bocpd PRIVATE ${COMMON_DEFS})
-    endif()
-
-    # BOCPD + MMPF integration test
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_mmpf.c)
-        add_executable(test_bocpd_mmpf
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_mmpf.c
-        )
-        target_link_libraries(test_bocpd_mmpf PRIVATE rocks)
-        if(NOT WIN32)
-            target_link_libraries(test_bocpd_mmpf PRIVATE m)
-        endif()
-        target_compile_options(test_bocpd_mmpf PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_bocpd_mmpf PRIVATE ${COMMON_DEFS})
     endif()
 
     #───────────────────────────────────────────────────────────────────────────────
@@ -298,11 +246,6 @@ target_link_libraries(test_stone1_diagnostic PRIVATE rocks)
 # Installation
 #───────────────────────────────────────────────────────────────────────────────
 
-install(TARGETS rocks bocpd
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
-)
-
 # Core headers
 set(ROCKS_HEADERS
     mkl_config.h
@@ -312,7 +255,6 @@ set(ROCKS_HEADERS
     rao-blackwellized/rbpf_mh_jitter.h
     rao-blackwellized/rbpf_kl_tempering.h
     rbpf_fisher_rao.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.h
 )
 
 # Storvik and related headers
@@ -324,7 +266,6 @@ if(RBPF_ENABLE_STORVIK)
         storvik/p2_quantile.h
         storvik/rbpf_fixed_lag_smoother.h
         preprocess/rbpf_preprocess.h
-        rbpf_dirichlet_transition.h
         mmpf/mmpf_internal.h
         mmpf/mmpf_entropy.h
         mmpf/mmpf_online_em.h

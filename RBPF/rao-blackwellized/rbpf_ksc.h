@@ -79,7 +79,6 @@
  * For single RBPF, use SPRT + pilot light for regime detection.
  *═══════════════════════════════════════════════════════════════════════════*/
 
-#include "bocpd.h"
 #include "rbpf_dirichlet_transition.h"
 #include "rbpf_sprt.h"
 #include "rbpf_mh_jitter.h"      
@@ -802,36 +801,6 @@ typedef float rbpf_real_t;
 
         rbpf_real_t last_y; /* Last observation y = log(r²) for likelihood */
 
-        /*========================================================================
-         * BOCPD CHANGEPOINT DETECTION
-         *======================================================================*/
-
-        /** BOCPD detector instance (externally owned, NULL = disabled) */
-        bocpd_t *bocpd;
-
-        /** Delta detector for changepoint triggering (externally owned) */
-        bocpd_delta_detector_t *bocpd_delta;
-
-        /** Hazard function for online learning (externally owned, optional) */
-        bocpd_hazard_t *bocpd_hazard;
-
-        /** Z-score threshold for delta detector (default: 3.0)
-         *  Higher = fewer false positives, slower response
-         *  Range: [1.0, 10.0] */
-        double bocpd_threshold;
-
-        /** Decay factor for delta detector's Storvik update (default: 0.995)
-         *  Higher = longer memory, more stable baseline
-         *  Range: [0.9, 0.9999] */
-        double bocpd_decay;
-
-        /** Window size for hazard learning decay (default: 1000)
-         *  Only used when hazard->type == HAZARD_LEARNED */
-        size_t bocpd_learn_window;
-
-        /** Cooldown counter: ticks until next BOCPD trigger allowed */
-        int bocpd_cooldown;
-
         DirichletTransition trans_prior; /**< Dirichlet posterior over transitions */
         int trans_prior_enabled;         /**< 0 = use fixed matrix, 1 = learn online */
 
@@ -921,21 +890,6 @@ typedef float rbpf_real_t;
         int student_t_active;                     /* 1 if Student-t update was used */
 
         double sprt_evidence[SPRT_MAX_REGIMES];
-
-        /*========================================================================
-         * BOCPD DIAGNOSTICS
-         *======================================================================*/
-
-        /** 1 if BOCPD triggered regime switch this tick, 0 otherwise */
-        int bocpd_triggered;
-
-        /** MAP (most probable) run length from BOCPD
-         *  Small values suggest recent changepoint */
-        size_t bocpd_map_runlength;
-
-        /** BOCPD's P(changepoint) = P(r < 5)
-         *  High values (>0.5) suggest regime instability */
-        rbpf_real_t bocpd_p_changepoint;
 
         /* Transition learning diagnostics (optional) */
         int trans_learning_active;                /**< 1 if Dirichlet learning is enabled */
@@ -1699,79 +1653,6 @@ typedef float rbpf_real_t;
      * @brief Reset MH jittering statistics
      */
     void rbpf_ksc_reset_mh_stats(RBPF_KSC *rbpf);
-
-    /*─────────────────────────────────────────────────────────────────────────────
-     * BOCPD API Functions
-     *───────────────────────────────────────────────────────────────────────────*/
-
-    /**
-     * @brief Attach BOCPD changepoint detector to RBPF
-     *
-     * Enables MMPF-style shock injection - event-driven regime exploration
-     * based on volatility structure changes detected by BOCPD.
-     *
-     * All pointers are borrowed (not owned). Caller must ensure objects
-     * remain valid for the lifetime of the RBPF, and must free them after
-     * detaching or destroying the RBPF.
-     *
-     * @param rbpf    RBPF instance
-     * @param bocpd   Initialized BOCPD detector (required)
-     * @param delta   Initialized delta detector (required)
-     * @param hazard  Hazard function for learning (optional, can be NULL)
-     *
-     * @code
-     *   bocpd_hazard_t hazard;
-     *   bocpd_t bocpd;
-     *   bocpd_delta_detector_t delta;
-     *
-     *   bocpd_hazard_init_power_law(&hazard, 0.8, 1024);
-     *   bocpd_init_with_hazard(&bocpd, &hazard, prior);
-     *   bocpd_delta_init(&delta, 100);
-     *
-     *   rbpf_ksc_attach_bocpd(rbpf, &bocpd, &delta, &hazard);
-     * @endcode
-     */
-    void rbpf_ksc_attach_bocpd(RBPF_KSC *rbpf,
-                               bocpd_t *bocpd,
-                               bocpd_delta_detector_t *delta,
-                               bocpd_hazard_t *hazard);
-
-    /**
-     * @brief Detach BOCPD from RBPF
-     *
-     * Disables BOCPD integration. Does not free the BOCPD objects.
-     * After detaching, caller is responsible for freeing bocpd/delta/hazard.
-     *
-     * @param rbpf  RBPF instance
-     */
-    void rbpf_ksc_detach_bocpd(RBPF_KSC *rbpf);
-
-    /**
-     * @brief Configure BOCPD detection parameters
-     *
-     * @param rbpf          RBPF instance
-     * @param z_threshold   Z-score threshold for triggering (clamped to [1, 10])
-     *                      Default: 3.0 (≈0.13% false positive rate)
-     *                      Recommended: 2.5-4.0 for trading
-     * @param decay         Storvik decay for delta baseline (clamped to [0.9, 0.9999])
-     *                      Default: 0.995 (≈200 tick half-life)
-     *                      Higher = more stable, slower adaptation
-     * @param learn_window  Window for hazard learning decay
-     *                      Default: 1000
-     *                      Only used when hazard->type == HAZARD_LEARNED
-     */
-    void rbpf_ksc_set_bocpd_params(RBPF_KSC *rbpf,
-                                   double z_threshold,
-                                   double decay,
-                                   size_t learn_window);
-
-    /**
-     * @brief Check if BOCPD is attached and active
-     *
-     * @param rbpf  RBPF instance
-     * @return      1 if BOCPD is attached, 0 otherwise
-     */
-    int rbpf_ksc_bocpd_attached(const RBPF_KSC *rbpf);
 
     /**
      * @brief Enable/disable online transition matrix learning

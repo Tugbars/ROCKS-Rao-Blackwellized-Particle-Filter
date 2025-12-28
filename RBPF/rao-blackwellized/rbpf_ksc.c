@@ -29,7 +29,6 @@
 #include "rbpf_sprt.h"
 #include "rbpf_mh_jitter.h"
 #include "rbpf_fisher_rao.h"
-#include "bocpd.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -676,7 +675,6 @@ void rbpf_ksc_step(RBPF_KSC *rbpf, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /* Initialize output flags */
-    output->bocpd_triggered = 0;
     output->regime_changed = 0;
 
     /* 1. Regime transition */
