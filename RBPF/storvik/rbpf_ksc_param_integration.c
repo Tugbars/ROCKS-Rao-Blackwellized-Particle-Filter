@@ -540,14 +540,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 1: HAWKES PRE-STEP (modify transitions)
-     *═══════════════════════════════════════════════════════════════════════*/
-    if (ext->hawkes.enabled)
-    {
-        rbpf_ext_hawkes_apply_to_transitions(ext);
-    }
-
-    /*═══════════════════════════════════════════════════════════════════════
      * PHASE 2: RBPF FORWARD PASS
      *═══════════════════════════════════════════════════════════════════════*/
 
@@ -577,15 +569,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
 
     rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
     output->resampled = rbpf_ksc_resample(rbpf);
-
-    /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 3: HAWKES POST-STEP (update intensity)
-     *═══════════════════════════════════════════════════════════════════════*/
-    if (ext->hawkes.enabled)
-    {
-        rbpf_ext_hawkes_update_intensity(ext, obs);
-        rbpf_ext_hawkes_restore_base_transitions(ext);
-    }
 
     /*═══════════════════════════════════════════════════════════════════════
      * PHASE 4: OUTLIER FRACTION

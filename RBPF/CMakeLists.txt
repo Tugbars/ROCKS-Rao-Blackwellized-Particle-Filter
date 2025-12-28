@@ -15,7 +15,7 @@ option(RBPF_BUILD_TESTS "Build test executables" ON)
 option(RBPF_ENABLE_STORVIK "Enable Sleeping Storvik parameter learning" ON)
 option(MMPF_ENABLE_MCMC "Enable MCMC particle teleportation" ON)
 option(RBPF_ENABLE_HDP_BEAM "Enable Sticky HDP-HMM Beam Sampling" ON)
-option(RBPF_ENABLE_ONLINE_VI "Enable Online VI transition learning" ON)
+option(RBPF_ENABLE_ONLINE_VI "Enable Online VI transition learning" OFF)
 
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -60,23 +60,6 @@ set(ROCKS_SOURCES
 )
 
 #───────────────────────────────────────────────────────────────────────────────
-# Online VI Transition Learning
-#
-# Replaces discrete Dirichlet updates with per-tick variational inference.
-# Provides:
-#   - Var[π_ij] for Kelly sizing
-#   - Row entropy H[π_i] for PGAS triggers
-#   - Geometric mean for correct LUT generation
-#   - Skeptical safeguards (ρ floor, heartbeat reset, logsumexp stability)
-#───────────────────────────────────────────────────────────────────────────────
-
-if(RBPF_ENABLE_ONLINE_VI)
-    list(APPEND ROCKS_SOURCES
-        Online-VI/online_vi_transition.c
-    )
-endif()
-
-#───────────────────────────────────────────────────────────────────────────────
 # Soft Dirichlet Transition Learning (legacy, kept for testing/comparison)
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -93,7 +76,6 @@ if(RBPF_ENABLE_STORVIK)
         storvik/rbpf_fixed_lag_smoother.c 
 
         storvik/rbpf_ksc_param_integration.c      # Core: lifecycle, step, config
-        storvik/rbpf_ext_hawkes.c                 # Hawkes + Robust OCSN + Presets
         storvik/rbpf_ext_smoothed_storvik.c       # PARIS smoothed Storvik
 
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/paris_mkl.c
@@ -101,14 +83,8 @@ if(RBPF_ENABLE_STORVIK)
         # Robust OCSN likelihood
         ocsn/rbpf_ocsn_robust.c
         
-        # Tuner
-        tuner/rbpf_tuner.c
-        
         # Preprocessor
         preprocess/rbpf_preprocess.c
-        
-        # Hawkes intensity
-        hawkes/hawkes_intensity.c
         
         # MMPF (Multi-Model Particle Filter) - Institutional Grade
         mmpf/mmpf_core.c
@@ -137,12 +113,9 @@ target_include_directories(rocks
     PUBLIC 
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/rao-blackwellized
-        ${CMAKE_CURRENT_SOURCE_DIR}/apf
         ${CMAKE_CURRENT_SOURCE_DIR}/storvik
         ${CMAKE_CURRENT_SOURCE_DIR}/ocsn
-        ${CMAKE_CURRENT_SOURCE_DIR}/tuner
         ${CMAKE_CURRENT_SOURCE_DIR}/preprocess
-        ${CMAKE_CURRENT_SOURCE_DIR}/hawkes
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
@@ -186,19 +159,6 @@ add_library(rbpf_ksc ALIAS rocks)
 #───────────────────────────────────────────────────────────────────────────────
 
 if(RBPF_BUILD_TESTS)
-
-    #───────────────────────────────────────────────────────────────────────────
-    # Online VI Tests (disabled - clock_gettime not available on Windows)
-    #───────────────────────────────────────────────────────────────────────────
-
-    # if(RBPF_ENABLE_ONLINE_VI AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI/test_vi_vs_dirichlet.c)
-    #     add_executable(test_vi_vs_dirichlet
-    #         ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI/test_vi_vs_dirichlet.c
-    #     )
-    #     target_link_libraries(test_vi_vs_dirichlet PRIVATE rocks)
-    #     target_compile_options(test_vi_vs_dirichlet PRIVATE ${COMMON_FLAGS})
-    #     target_compile_definitions(test_vi_vs_dirichlet PRIVATE ${COMMON_DEFS})
-    # endif()
 
     #───────────────────────────────────────────────────────────────────────────
     # MMPF-level tests
@@ -260,20 +220,6 @@ if(RBPF_BUILD_TESTS)
         target_compile_definitions(test_bocpd_mmpf PRIVATE ${COMMON_DEFS})
     endif()
 
-    # BOCPD vs Baseline comparison test (targeted scenarios)
-    #if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_comparison.c)
-    #    add_executable(test_bocpd_comparison
-    #        ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_bocpd_comparison.c
-    #    )
-    #    target_link_libraries(test_bocpd_comparison PRIVATE rocks)
-    #    if(NOT WIN32)
-    #        target_link_libraries(test_bocpd_comparison PRIVATE m)
-    #   endif()
-    #    target_compile_options(test_bocpd_comparison PRIVATE ${COMMON_FLAGS})
-    #    target_compile_definitions(test_bocpd_comparison PRIVATE ${COMMON_DEFS})
-    #endif()
-
-
     #───────────────────────────────────────────────────────────────────────────────
     # HDP-Beam Benchmark
     #───────────────────────────────────────────────────────────────────────────────
@@ -287,16 +233,6 @@ if(RBPF_BUILD_TESTS)
         target_compile_options(bench_sticky_hdp PRIVATE ${COMMON_FLAGS})
         target_compile_definitions(bench_sticky_hdp PRIVATE ${COMMON_DEFS})
         endif()
-    endif()
-
-    # Hawkes test
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_hawkes.c)
-        add_executable(test_hawkes
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_hawkes.c
-        )
-        target_link_libraries(test_hawkes PRIVATE rocks)
-        target_compile_options(test_hawkes PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_hawkes PRIVATE ${COMMON_DEFS})
     endif()
 
     #───────────────────────────────────────────────────────────────────────────
@@ -350,25 +286,6 @@ endif()
 #───────────────────────────────────────────────────────────────────────────────
 
 if(RBPF_BUILD_BENCH)
-    # PMMH benchmark
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/bench_pmmh_mkl.c)
-        add_executable(bench_pmmh_mkl
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/bench_pmmh_mkl.c
-        )
-        target_link_libraries(bench_pmmh_mkl PRIVATE rocks)
-        target_compile_options(bench_pmmh_mkl PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(bench_pmmh_mkl PRIVATE ${COMMON_DEFS})
-    endif()
-
-    # PMMH tuning
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/tune_pmmh.c)
-        add_executable(tune_pmmh
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/tune_pmmh.c
-        )
-        target_link_libraries(tune_pmmh PRIVATE rocks)
-        target_compile_options(tune_pmmh PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(tune_pmmh PRIVATE ${COMMON_DEFS})
-    endif()
 
     # Student-t MKL benchmark
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/bench_student_t.c)
@@ -407,13 +324,6 @@ set(ROCKS_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.h
 )
 
-# Online VI headers
-if(RBPF_ENABLE_ONLINE_VI)
-    list(APPEND ROCKS_HEADERS
-        Online-VI/online_vi_transition.h
-    )
-endif()
-
 # Soft Dirichlet headers (legacy, kept for testing)
 list(APPEND ROCKS_HEADERS
     soft_dirichlet/soft_dirichlet_transition.h
@@ -427,12 +337,8 @@ if(RBPF_ENABLE_STORVIK)
         storvik/rbpf_adaptive_forgetting.h
         storvik/p2_quantile.h
         storvik/rbpf_fixed_lag_smoother.h
-        tuner/rbpf_tuner.h
         preprocess/rbpf_preprocess.h
         rbpf_dirichlet_transition.h
-        hawkes/hawkes_intensity.h
-        pmmh/pmmh_mkl.h
-        duration_tracker/duration_tracker_fast.h
         mmpf/mmpf_internal.h
         mmpf/mmpf_entropy.h
         mmpf/mmpf_online_em.h

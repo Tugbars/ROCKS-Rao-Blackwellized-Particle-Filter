@@ -83,7 +83,6 @@
 #include "rbpf_dirichlet_transition.h"
 #include "rbpf_sprt.h"
 #include "rbpf_mh_jitter.h"      
-#include "online_vi_transition.h" 
 #include "rbpf_lut_buffer.h"
 #include <mkl.h>
 #include <mkl_vsl.h>
@@ -836,18 +835,6 @@ typedef float rbpf_real_t;
         DirichletTransition trans_prior; /**< Dirichlet posterior over transitions */
         int trans_prior_enabled;         /**< 0 = use fixed matrix, 1 = learn online */
 
-        /*========================================================================
-         * ONLINE VI TRANSITION LEARNING
-         *
-         * Replaces discrete Dirichlet updates with per-tick variational inference.
-         * Provides:
-         *   - Var[π_ij] for Kelly sizing
-         *   - Row entropy H[π_i] for PGAS triggers
-         *   - Geometric mean for correct LUT generation
-         *======================================================================*/
-        OnlineVI vi_transition; /**< Online VI posterior over transitions */
-        int use_online_vi;      /**< 0 = Dirichlet/fixed, 1 = Online VI */
-
         /** SKEPTICAL: Learning rate floor to prevent stiffening
          *  After 100k ticks, Robbins-Monro ρ_t → 0 and model stops adapting.
          *  This floor ensures minimum responsiveness even without Lifeboat reset. */
@@ -955,11 +942,6 @@ typedef float rbpf_real_t;
         int trans_learned_this_tick;              /**< 1 if a transition was learned this tick */
         float trans_stickiness[RBPF_MAX_REGIMES]; /**< Current P(stay in regime r) */
 
-        /*========================================================================
-         * ONLINE VI TRANSITION DIAGNOSTICS
-         *
-         * Provides uncertainty quantification for Kelly sizing and PGAS triggers.
-         *======================================================================*/
 
         /** Transition variance from Online VI
          *  INDEXING: trans_var[from][to] = Var[π_ij]
