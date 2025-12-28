@@ -259,35 +259,6 @@ target_compile_options(benchmark_trans_learning PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(benchmark_trans_learning PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
-# Validation: Regime Parameter Learning (PGAS vs PGAS-PARIS)
-#
-# Side-by-side comparison of μ_vol learning:
-#   - Vanilla PGAS: Single reference trajectory
-#   - PGAS-PARIS: Rao-Blackwellized ensemble (M trajectories)
-#
-# Compares:
-#   - μ_vol RMSE vs ground truth
-#   - Posterior variance (lower = better)
-#   - Convergence speed
-#   - Π learning quality
-#───────────────────────────────────────────────────────────────────────────────
-
-add_executable(test_regime_learning
-    test_regime_learning.c
-)
-
-target_link_libraries(test_regime_learning
-    PRIVATE
-        pgas_paris
-        pgas_mkl
-        paris_mkl
-        MKL::MKL
-)
-
-target_compile_options(test_regime_learning PRIVATE ${PGAS_COMPILE_FLAGS})
-target_compile_definitions(test_regime_learning PRIVATE ${COMMON_DEFS})
-
-#───────────────────────────────────────────────────────────────────────────────
 # Summary
 #───────────────────────────────────────────────────────────────────────────────
 
