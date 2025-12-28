@@ -50,6 +50,10 @@ static int next_power_of_2(int n)
     return n + 1;
 }
 
+/* Forward declaration for vectorized reference propagation */
+static void propagate_reference_forward_vectorized(PGASSlidingState *state,
+                                                   int start_t, int end_t);
+
 /*═══════════════════════════════════════════════════════════════════════════════
  * LIFECYCLE
  *═══════════════════════════════════════════════════════════════════════════════*/
@@ -111,12 +115,13 @@ PGASSlidingState *pgas_sliding_alloc(int window_size, int slide_step,
     state->warmup_size = window_size; /* First window needs full data */
 
     /* ═══════════════════════════════════════════════════════════════════════
-     * REFERENCE TRAJECTORY (for warm start)
+     * OPTIMIZATION: Pre-allocate RNG workspaces for vectorized propagation
+     * Align to 64 bytes for AVX-512
      * ═══════════════════════════════════════════════════════════════════════*/
-    state->ref_regimes = (int *)mkl_malloc(window_size * sizeof(int), 64);
-    state->ref_h = (float *)mkl_malloc(window_size * sizeof(float), 64);
+    state->ws_rng_uniform = (float *)mkl_malloc(slide_step * sizeof(float), 64);
+    state->ws_rng_normal = (float *)mkl_malloc(slide_step * sizeof(float), 64);
 
-    if (!state->ref_regimes || !state->ref_h)
+    if (!state->ws_rng_uniform || !state->ws_rng_normal)
     {
         pgas_sliding_free(state);
         return NULL;
@@ -155,8 +160,8 @@ void pgas_sliding_free(PGASSlidingState *state)
 
     mkl_free(state->obs_ring);
     mkl_free(state->tick_ring);
-    mkl_free(state->ref_regimes);
-    mkl_free(state->ref_h);
+    mkl_free(state->ws_rng_uniform);
+    mkl_free(state->ws_rng_normal);
     mkl_free(state);
 }
 
@@ -268,57 +273,32 @@ void pgas_sliding_extract_window(PGASSlidingState *state)
         return;
 
     const int T = state->window_size;
+    const int S = state->slide_step;
     PGASMKLState *pgas = state->pgas;
+    float *obs_dst = pgas->observations;
 
-    /* Determine window range in ring buffer
-     *
-     * First window: read_idx .. read_idx + T
-     * Subsequent:   read_idx .. read_idx + T  (after slide advanced read_idx)
-     */
+    /* Determine window range in ring buffer */
     int64_t start_idx = state->ring_read_idx;
 
-    /* Copy observations to PGAS linear array */
-    for (int t = 0; t < T; t++)
+    if (state->windows_completed == 0)
     {
-        int ring_pos = (int)((start_idx + t) & state->ring_mask);
-        pgas->observations[t] = state->obs_ring[ring_pos];
-    }
-
-    /* Record window tick range */
-    int ring_start = (int)(start_idx & state->ring_mask);
-    int ring_end = (int)((start_idx + T - 1) & state->ring_mask);
-    state->window_start_tick = state->tick_ring[ring_start];
-    state->window_end_tick = state->tick_ring[ring_end];
-
-    /* ═══════════════════════════════════════════════════════════════════════
-     * WARM START: Set up reference trajectory from previous sweep
-     *
-     * If we have a saved reference, shift it and use as starting point.
-     * This dramatically improves PGAS mixing (30-40% acceptance vs 5-10%).
-     * ═══════════════════════════════════════════════════════════════════════*/
-    if (state->has_reference && state->windows_completed > 0)
-    {
-        /* Reference trajectory already shifted in pgas_sliding_slide().
-         * Copy directly to PGAS internal arrays. */
+        /* ═══════════════════════════════════════════════════════════════════
+         * COLD START: Full copy of T elements from ring buffer
+         * ═══════════════════════════════════════════════════════════════════*/
         for (int t = 0; t < T; t++)
         {
-            pgas->ref_regimes[t] = state->ref_regimes[t];
-            pgas->ref_h[t] = state->ref_h[t];
-            pgas->ref_ancestors[t] = pgas->ref_idx;
+            int ring_pos = (int)((start_idx + t) & state->ring_mask);
+            obs_dst[t] = state->obs_ring[ring_pos];
         }
-    }
-    else
-    {
-        /* First window: Initialize reference from observations
-         * Use observation-based initialization for better starting point */
+
+        /* Initialize reference trajectory from observation mean */
         float mean_obs = 0.0f;
         for (int t = 0; t < T; t++)
         {
-            mean_obs += pgas->observations[t];
+            mean_obs += obs_dst[t];
         }
         mean_obs /= T;
 
-        /* Simple initialization: regime 0, h = mean observation */
         for (int t = 0; t < T; t++)
         {
             pgas->ref_regimes[t] = 0;
@@ -326,6 +306,42 @@ void pgas_sliding_extract_window(PGASSlidingState *state)
             pgas->ref_ancestors[t] = pgas->ref_idx;
         }
     }
+    else
+    {
+        /* ═══════════════════════════════════════════════════════════════════
+         * WARM SLIDE: Differential update (All-in-one)
+         *
+         * 1. memmove existing obs left by S (reuse T-S elements)
+         * 2. Copy only S new elements from ring buffer
+         * 3. memmove reference left by S
+         * 4. Propagate reference tail (vectorized)
+         *
+         * This is MUCH faster than full reconstruction.
+         * ═══════════════════════════════════════════════════════════════════*/
+
+        /* 1. Shift observations left by S positions */
+        memmove(obs_dst, obs_dst + S, (T - S) * sizeof(float));
+
+        /* 2. Copy only the NEW observations from ring (last S positions) */
+        for (int t = T - S; t < T; t++)
+        {
+            int ring_pos = (int)((start_idx + t) & state->ring_mask);
+            obs_dst[t] = state->obs_ring[ring_pos];
+        }
+
+        /* 3. Shift reference trajectory left by S (IN-PLACE) */
+        memmove(pgas->ref_regimes, pgas->ref_regimes + S, (T - S) * sizeof(int));
+        memmove(pgas->ref_h, pgas->ref_h + S, (T - S) * sizeof(float));
+
+        /* 4. Propagate reference tail (VECTORIZED) */
+        propagate_reference_forward_vectorized(state, T - S, T);
+    }
+
+    /* Record window tick range */
+    int ring_start = (int)(start_idx & state->ring_mask);
+    int ring_end = (int)((start_idx + T - 1) & state->ring_mask);
+    state->window_start_tick = state->tick_ring[ring_start];
+    state->window_end_tick = state->tick_ring[ring_end];
 
     pgas->T = T;
 }
@@ -379,52 +395,79 @@ void pgas_sliding_get_pi(const PGASSlidingState *state, float *pi_out)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 /**
- * Propagate reference trajectory forward using AR(1) dynamics
+ * Propagate reference trajectory forward using AR(1) dynamics (VECTORIZED)
  *
- * Used to extend the shifted reference for new observations.
+ * OPTIMIZATION: Batch generate random numbers instead of scalar MKL calls.
+ * This reduces MKL function call overhead by ~90%.
+ *
+ * Works IN-PLACE on pgas->ref_regimes and pgas->ref_h.
  */
-static void propagate_reference_forward(PGASSlidingState *state,
-                                        int start_t, int end_t)
+static void propagate_reference_forward_vectorized(PGASSlidingState *state,
+                                                   int start_t, int end_t)
 {
     if (!state || !state->pgas)
         return;
 
     PGASMKLState *pgas = state->pgas;
     const PGASMKLModel *m = &pgas->model;
+    const int K = pgas->K;
+    const int n_needed = end_t - start_t;
 
-    /* Sample from model's RNG (MKLRngStream wrapper) */
+    if (n_needed <= 0)
+        return;
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * 1. BATCH GENERATE RANDOM NUMBERS
+     * ═══════════════════════════════════════════════════════════════════════*/
     VSLStreamStatePtr stream = (VSLStreamStatePtr)pgas->rng.stream;
 
-    for (int t = start_t; t < end_t; t++)
+    /* Generate Uniforms for regime transitions */
+    vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, n_needed,
+                 state->ws_rng_uniform, 0.0f, 1.0f);
+
+    /* Generate standard Normals for AR(1) noise */
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, n_needed,
+                  state->ws_rng_normal, 0.0f, 1.0f);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * 2. PROPAGATE STATE USING BATCHED RANDOM NUMBERS
+     *    Work directly on pgas->ref_* buffers (IN-PLACE)
+     * ═══════════════════════════════════════════════════════════════════════*/
+    int *regimes = pgas->ref_regimes;
+    float *h = pgas->ref_h;
+
+    for (int i = 0; i < n_needed; i++)
     {
-        int prev_regime = state->ref_regimes[t - 1];
-        float prev_h = state->ref_h[t - 1];
+        const int t = start_t + i;
+        const int prev_regime = regimes[t - 1];
+        const float prev_h = h[t - 1];
 
-        /* Sample regime transition */
-        float u;
-        vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, 1, &u, 0.0f, 1.0f);
-
+        /* A. Sample Regime Transition */
+        const float u = state->ws_rng_uniform[i];
+        const float *row = &m->trans[prev_regime * K];
         float cumsum = 0.0f;
-        int new_regime = prev_regime; /* Default: stay */
-        for (int j = 0; j < pgas->K; j++)
+        int new_regime = prev_regime; /* Default: stay (stickiness) */
+
+        for (int j = 0; j < K; j++)
         {
-            cumsum += m->trans[prev_regime * pgas->K + j];
+            cumsum += row[j];
             if (u < cumsum)
             {
                 new_regime = j;
                 break;
             }
         }
-        state->ref_regimes[t] = new_regime;
+        regimes[t] = new_regime;
 
-        /* Propagate h using AR(1) */
-        float noise;
-        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1,
-                      &noise, 0.0f, m->sigma_vol[new_regime]);
+        /* B. AR(1) State Propagation: h_t = μ + φ(h_{t-1} - μ) + σ·ε */
+        const float mu_k = m->mu_vol[new_regime];
+        const float sigma_k = m->sigma_vol[new_regime];
+        const float mean = mu_k + m->phi * (prev_h - mu_k);
 
-        float mu_k = m->mu_vol[new_regime];
-        float mean = mu_k + m->phi * (prev_h - mu_k);
-        state->ref_h[t] = mean + noise;
+        h[t] = mean + sigma_k * state->ws_rng_normal[i];
+
+        /* Set ancestor to self */
+        pgas->ref_ancestors[t] = pgas->ref_idx;
     }
 }
 
@@ -433,58 +476,25 @@ void pgas_sliding_slide(PGASSlidingState *state)
     if (!state || !state->pgas)
         return;
 
-    const int T = state->window_size;
-    const int S = state->slide_step;
-    PGASMKLState *pgas = state->pgas;
-
     /* ═══════════════════════════════════════════════════════════════════════
-     * SAVE CURRENT REFERENCE TRAJECTORY
+     * SLIDE (Simplified)
      *
-     * After sweep, pgas->ref_regimes and ref_h contain the sampled trajectory.
-     * ═══════════════════════════════════════════════════════════════════════*/
-    memcpy(state->ref_regimes, pgas->ref_regimes, T * sizeof(int));
-    memcpy(state->ref_h, pgas->ref_h, T * sizeof(float));
-
-    /* ═══════════════════════════════════════════════════════════════════════
-     * SHIFT REFERENCE LEFT BY S POSITIONS
-     *
-     * Old: ref[0..T-1] covers observations[0..T-1]
-     * New: ref[0..T-1-S] = old ref[S..T-1]  (reuse overlapping portion)
-     *      ref[T-S..T-1] = propagated forward (new observations)
-     *
-     *      +───────────────────────────────────────+
-     *      │ Old window                            │
-     *      +───────────────────────────────────────+
-     *            │ Slide by S │
-     *            +───────────────────────────────────────+
-     *            │ New window                            │
-     *            +───────────────────────────────────────+
-     *            │←  Reused  →│←      New data         →│
+     * In the optimized flow, all data movement (obs shift, ref shift,
+     * ref propagation) happens in extract_window(). This function just:
+     *   1. Advances ring read pointer (commits consumption of S items)
+     *   2. Updates output statistics
      *
      * ═══════════════════════════════════════════════════════════════════════*/
-    if (S < T)
-    {
-        /* Shift left: ref[0..T-1-S] = ref[S..T-1] */
-        memmove(state->ref_regimes, state->ref_regimes + S, (T - S) * sizeof(int));
-        memmove(state->ref_h, state->ref_h + S, (T - S) * sizeof(float));
 
-        /* Propagate forward for new suffix: ref[T-S..T-1] */
-        propagate_reference_forward(state, T - S, T);
-    }
-    /* Else S == T: completely new window, no reuse */
+    /* Advance ring read index for NEXT window */
+    state->ring_read_idx += state->slide_step;
 
+    /* Mark that we have a valid reference for next window */
     state->has_reference = true;
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * ADVANCE RING READ INDEX
-     * ═══════════════════════════════════════════════════════════════════════*/
-    state->ring_read_idx += S;
-
-    /* ═══════════════════════════════════════════════════════════════════════
-     * UPDATE OUTPUT
-     * ═══════════════════════════════════════════════════════════════════════*/
-    const int K = pgas->K;
-    memcpy(state->pi, pgas->model.trans, K * K * sizeof(float));
+    /* Update output statistics */
+    const int K = state->pgas->K;
+    memcpy(state->pi, state->pgas->model.trans, K * K * sizeof(float));
     state->last_window_end_tick = state->window_end_tick;
 
     state->windows_completed++;

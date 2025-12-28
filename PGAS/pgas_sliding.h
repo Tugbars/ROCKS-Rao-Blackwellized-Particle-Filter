@@ -89,12 +89,17 @@ extern "C"
         /* ═══════════════════════════════════════════════════════════════════════
          * REFERENCE TRAJECTORY (Warm Start)
          *
-         * After each sweep, we save the sampled trajectory.
-         * When sliding, we shift it left and extend with propagated states.
+         * We work directly on pgas->ref_* buffers (in-place).
+         * When sliding, we shift left and extend with propagated states.
          * ═══════════════════════════════════════════════════════════════════════*/
         bool has_reference; /* Valid reference from previous sweep? */
-        int *ref_regimes;   /* Saved reference regimes [window_size] */
-        float *ref_h;       /* Saved reference h [window_size] */
+
+        /* ═══════════════════════════════════════════════════════════════════════
+         * OPTIMIZATION: Workspaces for vectorized tail propagation
+         * Pre-allocated to avoid allocs in hot path
+         * ═══════════════════════════════════════════════════════════════════════*/
+        float *ws_rng_uniform; /* Size: slide_step (regime transitions) */
+        float *ws_rng_normal;  /* Size: slide_step (AR noise) */
 
         /* ═══════════════════════════════════════════════════════════════════════
          * OUTPUT (Last completed sweep)

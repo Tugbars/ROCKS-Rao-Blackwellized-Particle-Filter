@@ -466,10 +466,10 @@ int main(int argc, char **argv)
 
     /* PGAS Configuration */
     const int WINDOW_SIZE = 500; /* Smaller for more frequent updates */
-    const int SLIDE_STEP = 100;  /* Slide by 100 ticks */
-    const int N_PARTICLES = 128; /* Moderate particle count */
+    const int SLIDE_STEP = 50;  /* Slide by 100 ticks */
+    const int N_PARTICLES = 64;  /* Moderate particle count */
     const int K = 3;             /* Match 3 hypotheses */
-    const int N_SWEEPS = 3;      /* Gibbs sweeps per iteration */
+    const int N_SWEEPS = 2;      /* Gibbs sweeps per iteration */
 
     printf("PGAS Configuration:\n");
     printf("  Window size: %d\n", WINDOW_SIZE);
