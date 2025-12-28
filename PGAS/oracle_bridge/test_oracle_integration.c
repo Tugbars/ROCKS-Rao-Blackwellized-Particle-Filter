@@ -127,7 +127,8 @@ static int test_full_stack_init(void)
     printf("    KL Trigger: %s\n", bridge.kl_trigger ? "YES" : "NO");
     printf("    Thompson: %s\n", bridge.thompson ? "YES" : "NO");
     printf("    PARIS (scout): %s\n", bridge.paris ? "YES" : "NO");
-    printf("    Dual-gate: %s\n", bcfg.use_dual_gate ? "ON" : "OFF");
+    printf("    KL threshold: %.1fσ (Hawkes boost: %.0f%%)\n",
+           bcfg.kl_threshold_sigma, bcfg.hawkes_kl_boost * 100);
 
     /* Cleanup */
     thompson_sampler_free(&thompson);
@@ -195,11 +196,16 @@ static int test_trigger_check(void)
 
     OracleBridge bridge;
     OracleBridgeConfig cfg = oracle_bridge_config_defaults();
-    cfg.use_dual_gate = true;
     cfg.kl_threshold_sigma = 2.0f;
+    cfg.hawkes_kl_boost = 0.5f; /* Hawkes reduces KL threshold by 50% */
 
     oracle_bridge_init(&bridge, &cfg, &hawkes, NULL, &blender, pgas);
 
+    /* Test cases for OR-gate with Hawkes accelerator:
+     *   KL > threshold → trigger
+     *   Hawkes hot + KL > threshold * boost → trigger
+     *   Panic → trigger
+     */
     struct
     {
         bool hawkes_fire;
@@ -209,9 +215,16 @@ static int test_trigger_check(void)
         bool expect;
         const char *desc;
     } cases[] = {
-        {true, 2.5f, 1.5f, false, false, "Hawkes=Y, KL<thresh"},
-        {true, 2.5f, 2.5f, false, true, "Hawkes=Y, KL>thresh"},
-        {false, 1.0f, 3.0f, false, false, "Hawkes=N, KL>thresh"},
+        /* KL alone is sufficient */
+        {false, 1.0f, 2.5f, false, true, "KL > thresh (filter confused)"},
+        {true, 2.5f, 2.5f, false, true, "KL > thresh + Hawkes (redundant)"},
+
+        /* Hawkes accelerator (lowers threshold) */
+        {true, 2.0f, 1.2f, false, true, "Hawkes hot + KL > 50% thresh"},
+        {false, 1.0f, 1.2f, false, false, "KL > 50% but Hawkes cold"},
+        {true, 2.0f, 0.5f, false, false, "Hawkes hot but KL < 50% thresh"},
+
+        /* Panic override */
         {true, 1.0f, 0.5f, true, true, "Panic override"},
     };
 
@@ -461,7 +474,8 @@ static int test_config_defaults(void)
     OracleBridgeConfig cfg = oracle_bridge_config_defaults();
 
     printf("    pgas_particles: %d\n", cfg.pgas_particles);
-    printf("    use_dual_gate: %s\n", cfg.use_dual_gate ? "YES" : "NO");
+    printf("    kl_threshold_sigma: %.1f\n", cfg.kl_threshold_sigma);
+    printf("    hawkes_kl_boost: %.2f\n", cfg.hawkes_kl_boost);
     printf("    use_scout_sweep: %s\n", cfg.use_scout_sweep ? "YES" : "NO");
     printf("    use_tempered_path: %s\n", cfg.use_tempered_path ? "YES" : "NO");
     printf("    scout_sweeps: %d\n", cfg.scout_sweeps);
@@ -472,7 +486,8 @@ static int test_config_defaults(void)
 
     /* Verify some key defaults */
     bool ok = (cfg.pgas_particles == 256 &&
-               cfg.use_dual_gate == true &&
+               cfg.kl_threshold_sigma == 2.0f &&
+               cfg.hawkes_kl_boost == 0.5f &&
                cfg.use_scout_sweep == true &&
                cfg.use_tempered_path == true &&
                cfg.gamma_on_regime_change >= 0.4f);

@@ -83,9 +83,16 @@ extern "C"
          * lambda=0.001 → half-life ~693 ticks (prioritizes "Now") */
         float recency_lambda; /* Decay rate (default: 0.001, 0=disabled) */
 
-        /* Dual-gate trigger (Hawkes + KL) */
-        bool use_dual_gate;       /* Require both signals (default: true) */
+        /* KL trigger (primary) + Hawkes accelerator
+         *
+         * Trigger logic (OR-gate with boost):
+         *   - KL > threshold → trigger (filter confused, must act)
+         *   - Hawkes hot + KL > threshold * boost → trigger (early warning)
+         *
+         * hawkes_kl_boost = 0.5 means Hawkes lowers threshold by 50%
+         */
         float kl_threshold_sigma; /* KL surprise threshold in σ (default: 2.0) */
+        float hawkes_kl_boost;    /* KL threshold multiplier when Hawkes hot (default: 0.5) */
         int refractory_ticks;     /* Min ticks between Oracle triggers (default: 100) */
 
         /* Scout sweep pre-validation */
@@ -200,18 +207,41 @@ extern "C"
 
     /*═══════════════════════════════════════════════════════════════════════════
      * API - TRIGGER CHECK
+     *
+     * OR-gate with Hawkes accelerator (KL is primary):
+     *
+     *   KL > threshold              → trigger (filter confused NOW)
+     *   Hawkes hot + KL > 50%       → trigger (early warning)
+     *   Panic                       → trigger (absolute override)
+     *
+     * Why KL is primary:
+     *   - KL is self-correcting: Stale Π → bad predictions → KL rises
+     *   - If PGAS fires too late (after RBPF collapse), PGAS has garbage
+     *   - Hawkes can miss quiet drift; KL cannot miss real problems
      *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Why the trigger fired
+     */
+    typedef enum
+    {
+        TRIGGER_NONE = 0,     /* No trigger */
+        TRIGGER_KL_PRIMARY,   /* KL > threshold (filter confused) */
+        TRIGGER_HAWKES_BOOST, /* Hawkes hot + KL > reduced threshold */
+        TRIGGER_PANIC         /* Absolute panic override */
+    } OracleTriggerReason;
 
     /**
      * Trigger check result
      */
     typedef struct
     {
-        bool should_trigger;     /* Fire Oracle? */
-        float hawkes_surprise;   /* Hawkes surprise (σ) */
-        float kl_surprise;       /* KL surprise (σ) - if dual-gate */
-        bool triggered_by_panic; /* Absolute panic override? */
-        int ticks_since_last;    /* Ticks since last Oracle call */
+        bool should_trigger;                /* Fire Oracle? */
+        OracleTriggerReason trigger_reason; /* Why it triggered */
+        float hawkes_surprise;              /* Hawkes surprise (σ) */
+        float kl_surprise;                  /* KL surprise (σ) */
+        bool triggered_by_panic;            /* Absolute panic override? */
+        int ticks_since_last;               /* Ticks since last Oracle call */
     } OracleTriggerResult;
 
     /**

@@ -29,9 +29,9 @@ OracleBridgeConfig oracle_bridge_config_defaults(void)
     /* Exponential Weighting (Window Paradox Solution) */
     cfg.recency_lambda = 0.001f;
 
-    /* Dual-gate trigger */
-    cfg.use_dual_gate = true;
+    /* KL trigger (primary) + Hawkes accelerator */
     cfg.kl_threshold_sigma = 2.0f;
+    cfg.hawkes_kl_boost = 0.5f; /* Hawkes lowers KL threshold by 50% */
     cfg.refractory_ticks = 100; /* Prevent spamming Oracle */
 
     /* Scout sweep */
@@ -181,27 +181,58 @@ OracleTriggerResult oracle_bridge_check_trigger(
     result.triggered_by_panic = hawkes_result->triggered_by_panic;
     result.ticks_since_last = current_tick - bridge->last_trigger_tick;
 
-    bool hawkes_fired = hawkes_result->should_trigger;
-    bool kl_fired = true;
+    /*═══════════════════════════════════════════════════════════════════════════
+     * OR-GATE WITH HAWKES ACCELERATOR
+     *
+     * KL is Ground Truth - it never lies about filter confusion.
+     * If PGAS fires too late (after RBPF collapses), the transition matrix
+     * PGAS works with will leave PGAS confused or completely lost.
+     *
+     * Logic:
+     *   1. KL > threshold         → trigger (filter confused NOW)
+     *   2. Hawkes hot + KL > 50%  → trigger (early warning, don't wait)
+     *   3. Panic                  → trigger (absolute override)
+     *
+     * Why OR-gate instead of AND-gate:
+     *   - AND-gate can miss quiet drift (Hawkes silent, KL rising)
+     *   - KL alone is sufficient (if filter wrong, must act)
+     *   - Hawkes just lowers the bar (market active = be more sensitive)
+     *   - No periodic fallback needed (KL will fire if Π fossilizes)
+     *═══════════════════════════════════════════════════════════════════════════*/
 
-    if (bridge->config.use_dual_gate)
-    {
-        kl_fired = (kl_surprise >= bridge->config.kl_threshold_sigma);
-    }
+    float kl_threshold = bridge->config.kl_threshold_sigma;
+    float kl_reduced = kl_threshold * bridge->config.hawkes_kl_boost;
+    bool hawkes_elevated = hawkes_result->should_trigger ||
+                           hawkes_result->surprise_sigma > 1.5f;
 
+    /* Priority 1: Panic override */
     if (hawkes_result->triggered_by_panic)
     {
         result.should_trigger = true;
-    }
-    else if (bridge->config.use_dual_gate)
-    {
-        result.should_trigger = hawkes_fired && kl_fired;
-    }
-    else
-    {
-        result.should_trigger = hawkes_fired;
+        result.trigger_reason = TRIGGER_PANIC;
+        return result;
     }
 
+    /* Priority 2: KL alone is sufficient (filter is confused) */
+    if (kl_surprise >= kl_threshold)
+    {
+        result.should_trigger = true;
+        result.trigger_reason = TRIGGER_KL_PRIMARY;
+        return result;
+    }
+
+    /* Priority 3: Hawkes accelerator (early warning)
+     * Market is active + filter showing early signs of confusion
+     * → Don't wait for full confusion, act now */
+    if (hawkes_elevated && kl_surprise >= kl_reduced)
+    {
+        result.should_trigger = true;
+        result.trigger_reason = TRIGGER_HAWKES_BOOST;
+        return result;
+    }
+
+    result.should_trigger = false;
+    result.trigger_reason = TRIGGER_NONE;
     return result;
 }
 
@@ -696,9 +727,9 @@ void oracle_bridge_print_state(const OracleBridge *bridge)
            bridge->last_trigger_tick, bridge->last_hawkes_surprise);
     printf("+-----------------------------------------------------------+\n");
     printf("| Config:                                                   |\n");
-    printf("|   Dual-gate: %s (KL threshold=%.1fσ)                     \n",
-           bridge->config.use_dual_gate ? "ON" : "OFF",
-           bridge->config.kl_threshold_sigma);
+    printf("|   KL threshold: %.1fσ (Hawkes boost: %.0f%%)              \n",
+           bridge->config.kl_threshold_sigma,
+           bridge->config.hawkes_kl_boost * 100);
     printf("|   Scout sweep: %s                                        \n",
            (bridge->config.use_scout_sweep && bridge->paris) ? "ON" : "OFF");
     printf("|   Tempered path: %s (flip=%.1f%%)                        \n",

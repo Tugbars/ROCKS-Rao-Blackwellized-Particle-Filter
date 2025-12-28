@@ -125,7 +125,6 @@ static int oracle_stack_init(OracleStack *stack, int K, int N, int T_max)
 
     /* Initialize Bridge (full pipeline, no scout since no PARIS) */
     OracleBridgeConfig bcfg = oracle_bridge_config_defaults();
-    bcfg.use_dual_gate = false;   /* Single-gate for easier testing */
     bcfg.use_scout_sweep = false; /* No PARIS in mock test */
     bcfg.use_tempered_path = true;
     bcfg.verbose = false;
@@ -493,9 +492,9 @@ static int test_thompson_transition(void)
  * TEST 5: Dual-Gate Trigger
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static int test_dual_gate_trigger(void)
+static int test_kl_primary_trigger(void)
 {
-    printf("Testing dual-gate trigger (Hawkes AND KL)\n\n");
+    printf("Testing KL-primary trigger (OR-gate with Hawkes boost)\n\n");
 
     int K = 4;
 
@@ -505,34 +504,49 @@ static int test_dual_gate_trigger(void)
         return 0;
     }
 
-    /* Enable dual-gate */
-    stack.bridge.config.use_dual_gate = true;
+    /* Configure trigger thresholds */
     stack.bridge.config.kl_threshold_sigma = 2.0f;
+    stack.bridge.config.hawkes_kl_boost = 0.5f; /* 50% reduction when Hawkes hot */
 
+    /* Test cases for OR-gate with Hawkes accelerator:
+     *   KL > threshold → trigger (filter confused)
+     *   Hawkes hot + KL > threshold * boost → trigger (early warning)
+     *   Panic → trigger (absolute override)
+     */
     struct
     {
         bool hawkes;
+        float hawkes_sigma;
         float kl;
         bool panic;
         bool expect;
         const char *desc;
     } cases[] = {
-        {false, 3.0f, false, false, "Hawkes=N, KL>thresh"},
-        {true, 1.0f, false, false, "Hawkes=Y, KL<thresh"},
-        {true, 2.5f, false, true, "Hawkes=Y, KL>thresh"},
-        {true, 0.5f, true, true, "Panic override"},
+        /* KL alone is sufficient (filter confused = must act) */
+        {false, 1.0f, 2.5f, false, true, "KL > thresh (no Hawkes needed)"},
+        {true, 2.0f, 2.5f, false, true, "KL > thresh + Hawkes (redundant)"},
+
+        /* Hawkes accelerator: lowers KL threshold by 50% */
+        {true, 2.0f, 1.2f, false, true, "Hawkes hot + KL > 50% (early warning)"},
+        {false, 1.0f, 1.2f, false, false, "KL > 50% but Hawkes cold (wait)"},
+        {true, 2.0f, 0.5f, false, false, "Hawkes hot but KL < 50% (too low)"},
+
+        /* Panic override */
+        {true, 1.0f, 0.5f, true, true, "Panic override"},
     };
 
+    int n_cases = sizeof(cases) / sizeof(cases[0]);
     int passed = 0;
-    for (int i = 0; i < 4; i++)
+
+    for (int i = 0; i < n_cases; i++)
     {
         HawkesIntegratorResult hr = {
             .should_trigger = cases[i].hawkes,
-            .surprise_sigma = 2.0f,
+            .surprise_sigma = cases[i].hawkes_sigma,
             .triggered_by_panic = cases[i].panic};
 
         OracleTriggerResult tr = oracle_bridge_check_trigger(
-            &stack.bridge, &hr, cases[i].kl, i * 100);
+            &stack.bridge, &hr, cases[i].kl, i * 200);
 
         bool match = (tr.should_trigger == cases[i].expect);
         printf("  %s: %s %s\n",
@@ -545,7 +559,7 @@ static int test_dual_gate_trigger(void)
 
     oracle_stack_free(&stack);
 
-    return (passed == 4);
+    return (passed == n_cases);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -665,7 +679,7 @@ int main(void)
     RUN_TEST(test_multiple_transitions);
     RUN_TEST(test_confidence_gamma);
     RUN_TEST(test_thompson_transition);
-    RUN_TEST(test_dual_gate_trigger);
+    RUN_TEST(test_kl_primary_trigger);
     RUN_TEST(test_statistics);
     RUN_TEST(test_print_state);
 
