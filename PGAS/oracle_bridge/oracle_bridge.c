@@ -34,12 +34,12 @@ OracleBridgeConfig oracle_bridge_config_defaults(void)
     cfg.hawkes_kl_boost = 0.5f; /* Hawkes lowers KL threshold by 50% */
     cfg.refractory_ticks = 100; /* Prevent spamming Oracle */
 
-    /* Scout sweep */
+    /* Scout sweep (diagnostic only) */
     cfg.use_scout_sweep = true;
     cfg.scout_sweeps = 5;
     cfg.scout_min_acceptance = 0.10f;
     cfg.scout_min_unique_frac = 0.25f;
-    cfg.scout_entropy_skip = 0.1f;
+    cfg.scout_low_entropy_gamma = 0.30f; /* γ when scout shows low entropy + KL fired */
 
     /* Tempered path */
     cfg.use_tempered_path = true;
@@ -148,12 +148,12 @@ void oracle_bridge_reset(OracleBridge *bridge)
     bridge->last_trigger_tick = -1000;
     bridge->total_oracle_calls = 0;
     bridge->successful_blends = 0;
-    bridge->scout_skip_count = 0;
+    bridge->scout_degenerate_count = 0;
     bridge->regime_change_count = 0;
     bridge->degeneracy_count = 0;
     bridge->cumulative_kl_change = 0.0f;
     bridge->last_scout_valid = false;
-    bridge->last_scout_skipped_pgas = false;
+    bridge->last_scout_entropy = 0.0f;
     memset(&bridge->last_confidence, 0, sizeof(bridge->last_confidence));
 }
 
@@ -340,10 +340,18 @@ OracleRunResult oracle_bridge_run(
     }
 
     /* ═══════════════════════════════════════════════════════════════════
-     * PHASE 1: SCOUT SWEEP (Pre-validation)
+     * PHASE 1: SCOUT SWEEP (Diagnostic Only)
+     *
+     * Scout measures particle consensus, NOT correctness.
+     * Low entropy = particles agree... but they could all be WRONG together.
+     *
+     * If KL fired (we're here), the model said "I'm confused".
+     * Scout CANNOT override that. PGAS MUST run.
+     *
+     * Scout informs:
+     *   - Whether particles are degenerate (scout INVALID → expect struggle)
+     *   - Entropy level (used later for γ weighting)
      * ═══════════════════════════════════════════════════════════════════*/
-
-    bool should_run_pgas = true;
 
 #if ORACLE_BRIDGE_USE_PARIS
     if (bridge->config.use_scout_sweep && bridge->paris)
@@ -361,50 +369,34 @@ OracleRunResult oracle_bridge_run(
         result.scout_unique_paths = scout.unique_paths;
 
         bridge->last_scout_valid = scout.is_valid;
+        bridge->last_scout_entropy = scout.entropy;
 
         if (!scout.is_valid)
         {
-            /* Scout degenerate - can't trust filter, force PGAS */
+            /* Scout degenerate - PGAS will struggle, but KL said we need help */
+            result.scout_degenerate_warning = true;
+            bridge->scout_degenerate_count++;
             if (bridge->config.verbose)
             {
-                printf("[OracleBridge] Scout INVALID: accept=%.2f unique=%d → force PGAS\n",
+                printf("[OracleBridge] Scout INVALID: accept=%.2f unique=%d "
+                       "→ PGAS will struggle but must run (KL fired)\n",
                        scout.acceptance_rate, scout.unique_paths);
             }
-            should_run_pgas = true;
         }
-        else if (scout.entropy < bridge->config.scout_entropy_skip)
+        else if (bridge->config.verbose)
         {
-            /* Scout valid + low entropy → filter confident, skip PGAS */
-            if (bridge->config.verbose)
-            {
-                printf("[OracleBridge] Scout VALID + low entropy (%.3f) → skip PGAS\n",
-                       scout.entropy);
-            }
-            result.scout_skipped_pgas = true;
-            bridge->last_scout_skipped_pgas = true;
-            bridge->scout_skip_count++;
-            should_run_pgas = false;
+            printf("[OracleBridge] Scout: entropy=%.3f unique=%d → diagnostic captured\n",
+                   scout.entropy, scout.unique_paths);
         }
-        else
-        {
-            if (bridge->config.verbose)
-            {
-                printf("[OracleBridge] Scout VALID + high entropy (%.3f) → run PGAS\n",
-                       scout.entropy);
-            }
-        }
+
+        /* Scout NEVER skips PGAS. KL is ground truth. */
     }
 #else
     /* PARIS disabled - scout sweep not available */
     (void)bridge->paris; /* Silence unused warning */
 #endif
 
-    if (!should_run_pgas)
-    {
-        /* Scout allowed skip - return early with success */
-        result.success = true;
-        return result;
-    }
+    /* PGAS always runs - KL already fired, we need Oracle's help */
 
     /* ═══════════════════════════════════════════════════════════════════
      * PHASE 2: PREPARE REFERENCE PATH (with tempering)
@@ -672,7 +664,7 @@ void oracle_bridge_get_stats(const OracleBridge *bridge, OracleBridgeStats *stat
 
     stats->total_oracle_calls = bridge->total_oracle_calls;
     stats->successful_blends = bridge->successful_blends;
-    stats->scout_skip_count = bridge->scout_skip_count;
+    stats->scout_degenerate_count = bridge->scout_degenerate_count;
     stats->regime_change_count = bridge->regime_change_count;
     stats->degeneracy_count = bridge->degeneracy_count;
 
@@ -710,7 +702,7 @@ void oracle_bridge_print_state(const OracleBridge *bridge)
     printf("| Statistics:                                               |\n");
     printf("|   Oracle calls:    %d (successful: %d)                    \n",
            stats.total_oracle_calls, stats.successful_blends);
-    printf("|   Scout skips:     %d                                     \n", stats.scout_skip_count);
+    printf("|   Scout degenerate: %d                                    \n", stats.scout_degenerate_count);
     printf("|   Regime changes:  %d                                     \n", stats.regime_change_count);
     printf("|   Degeneracies:    %d                                     \n", stats.degeneracy_count);
     printf("|   Avg KL change:   %.6f                                  \n", stats.avg_kl_change);

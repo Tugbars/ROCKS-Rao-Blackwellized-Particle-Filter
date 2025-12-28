@@ -602,7 +602,7 @@ static int test_statistics(void)
 
     printf("  Total calls: %d (expected: %d)\n", stats.total_oracle_calls, N_CALLS);
     printf("  Successful: %d\n", stats.successful_blends);
-    printf("  Scout skips: %d\n", stats.scout_skip_count);
+    printf("  Scout degenerate: %d\n", stats.scout_degenerate_count);
     printf("  Regime changes: %d\n", stats.regime_change_count);
     printf("  Degeneracies: %d\n", stats.degeneracy_count);
     printf("  Avg KL: %.6f\n", stats.avg_kl_change);

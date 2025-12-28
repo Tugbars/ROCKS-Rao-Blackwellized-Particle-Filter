@@ -95,12 +95,17 @@ extern "C"
         float hawkes_kl_boost;    /* KL threshold multiplier when Hawkes hot (default: 0.5) */
         int refractory_ticks;     /* Min ticks between Oracle triggers (default: 100) */
 
-        /* Scout sweep pre-validation */
-        bool use_scout_sweep;        /* Enable scout validation (default: true) */
-        int scout_sweeps;            /* Number of scout sweeps (default: 5) */
-        float scout_min_acceptance;  /* Minimum acceptance (default: 0.10) */
-        float scout_min_unique_frac; /* Minimum unique fraction (default: 0.25) */
-        float scout_entropy_skip;    /* Skip PGAS if entropy below (default: 0.1) */
+        /* Scout sweep (diagnostic only - informs γ, cannot skip PGAS)
+         *
+         * Scout measures particle consensus, NOT correctness.
+         * If KL fires, PGAS runs - scout cannot veto.
+         * Scout entropy informs γ: low entropy + KL fire = particles wrong together
+         */
+        bool use_scout_sweep;          /* Enable scout diagnostics (default: true) */
+        int scout_sweeps;              /* Number of scout sweeps (default: 5) */
+        float scout_min_acceptance;    /* Minimum acceptance for validity (default: 0.10) */
+        float scout_min_unique_frac;   /* Minimum unique fraction for validity (default: 0.25) */
+        float scout_low_entropy_gamma; /* γ penalty when scout entropy low (default: 0.3) */
 
         /* Reference path tempering */
         bool use_tempered_path; /* Enable anti-confirmation bias (default: true) */
@@ -144,14 +149,14 @@ extern "C"
         /* Last run diagnostics */
         PGASConfidence last_confidence;
         bool last_scout_valid;
-        bool last_scout_skipped_pgas;
+        float last_scout_entropy; /* For γ adjustment */
 
         /* Statistics */
         int total_oracle_calls;
         int successful_blends;
-        int scout_skip_count;    /* Times scout allowed PGAS skip */
-        int regime_change_count; /* Tier-2 resets triggered */
-        int degeneracy_count;    /* PGAS failures detected */
+        int scout_degenerate_count; /* Times scout indicated degeneracy */
+        int regime_change_count;    /* Tier-2 resets triggered */
+        int degeneracy_count;       /* PGAS failures detected */
         float cumulative_kl_change;
 
         /* Validation */
@@ -294,12 +299,12 @@ extern "C"
     {
         bool success; /* Oracle completed successfully */
 
-        /* Scout phase */
-        bool scout_ran;          /* Did scout run? */
-        bool scout_valid;        /* Was scout mixing adequate? */
-        bool scout_skipped_pgas; /* Did scout allow PGAS skip? */
-        float scout_entropy;     /* Scout path entropy */
-        int scout_unique_paths;  /* Scout unique path count */
+        /* Scout phase (diagnostic only - cannot skip PGAS) */
+        bool scout_ran;                /* Did scout run? */
+        bool scout_valid;              /* Was scout mixing adequate? */
+        bool scout_degenerate_warning; /* Scout indicated particles degenerate */
+        float scout_entropy;           /* Scout path entropy (low = consensus) */
+        int scout_unique_paths;        /* Scout unique path count */
 
         /* PGAS phase */
         bool pgas_ran;         /* Did PGAS run? */
@@ -377,7 +382,7 @@ extern "C"
     {
         int total_oracle_calls;
         int successful_blends;
-        int scout_skip_count;
+        int scout_degenerate_count; /* Times scout indicated degeneracy */
         int regime_change_count;
         int degeneracy_count;
         float avg_acceptance_rate;

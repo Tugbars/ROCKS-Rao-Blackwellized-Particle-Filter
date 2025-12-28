@@ -448,7 +448,7 @@ static int test_extended_statistics(void)
 
     printf("    Total calls: %d\n", stats.total_oracle_calls);
     printf("    Successful: %d\n", stats.successful_blends);
-    printf("    Scout skips: %d\n", stats.scout_skip_count);
+    printf("    Scout degenerate: %d\n", stats.scout_degenerate_count);
     printf("    Regime changes: %d\n", stats.regime_change_count);
     printf("    Degeneracies: %d\n", stats.degeneracy_count);
     printf("    Thompson explore ratio: %.1f%%\n", stats.thompson_explore_ratio * 100);
@@ -479,7 +479,7 @@ static int test_config_defaults(void)
     printf("    use_scout_sweep: %s\n", cfg.use_scout_sweep ? "YES" : "NO");
     printf("    use_tempered_path: %s\n", cfg.use_tempered_path ? "YES" : "NO");
     printf("    scout_sweeps: %d\n", cfg.scout_sweeps);
-    printf("    scout_entropy_skip: %.2f\n", cfg.scout_entropy_skip);
+    printf("    scout_low_entropy_gamma: %.2f\n", cfg.scout_low_entropy_gamma);
     printf("    gamma_on_regime_change: %.2f\n", cfg.gamma_on_regime_change);
     printf("    gamma_on_degeneracy: %.3f\n", cfg.gamma_on_degeneracy);
     printf("    thompson_exploit_thresh: %.0f\n", cfg.thompson_exploit_thresh);
