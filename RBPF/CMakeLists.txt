@@ -53,26 +53,8 @@ if(RBPF_ENABLE_STORVIK)
         
         # Preprocessor
         preprocess/rbpf_preprocess.c
-        
-        # MMPF (Multi-Model Particle Filter) - Institutional Grade
-        mmpf/mmpf_core.c
-        mmpf/mmpf_api.c
-        mmpf/mmpf_entropy.c
-        mmpf/mmpf_online_em.c
-    )
-    
-    # MCMC teleportation (optional, requires MKL)
-    if(MMPF_ENABLE_MCMC)
-        list(APPEND ROCKS_SOURCES
-            mmpf/mmpf_mcmc.c
-        )
-    endif()
 
-    if(RBPF_ENABLE_HDP_BEAM)
-    list(APPEND ROCKS_SOURCES
-        HDP-Beam/sticky_hdp_beam.c
     )
-    endif()
 endif()
 
 add_library(rocks STATIC ${ROCKS_SOURCES})
@@ -86,9 +68,6 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/preprocess
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
-        ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
-        ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam
-        ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS
 )
 
@@ -124,69 +103,6 @@ add_library(rbpf_ksc ALIAS rocks)
 #───────────────────────────────────────────────────────────────────────────────
 
 if(RBPF_BUILD_TESTS)
-
-    #───────────────────────────────────────────────────────────────────────────
-    # MMPF-level tests
-    #───────────────────────────────────────────────────────────────────────────
-
-    # MMPF correctness tests
-    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_correctness.c)
-        add_executable(test_mmpf_correctness
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_correctness.c
-        )
-        target_link_libraries(test_mmpf_correctness PRIVATE rocks)
-        target_compile_options(test_mmpf_correctness PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_mmpf_correctness PRIVATE ${COMMON_DEFS})
-    endif()
-
-    # MMPF vs Single RBPF comparison test
-    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_comparison.c)
-        add_executable(test_mmpf_comparison
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_mmpf_comparison.c
-        )
-        target_link_libraries(test_mmpf_comparison PRIVATE rocks)
-        target_compile_options(test_mmpf_comparison PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_mmpf_comparison PRIVATE ${COMMON_DEFS})
-    endif()
-
-    # MMPF real data integration test
-    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_real_data_test/test_mmpf_real_data.c)
-        add_executable(test_mmpf_real_data
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_real_data_test/test_mmpf_real_data.c
-        )
-        target_link_libraries(test_mmpf_real_data PRIVATE rocks)
-        target_compile_options(test_mmpf_real_data PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_mmpf_real_data PRIVATE ${COMMON_DEFS})
-    endif()
-
-    #───────────────────────────────────────────────────────────────────────────────
-    # HDP-Beam Benchmark
-    #───────────────────────────────────────────────────────────────────────────────
-
-    if(RBPF_BUILD_BENCH AND RBPF_ENABLE_HDP_BEAM)
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam/bench_sticky_hdp.c)
-        add_executable(bench_sticky_hdp
-            ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam/bench_sticky_hdp.c
-        )
-        target_link_libraries(bench_sticky_hdp PRIVATE rocks)
-        target_compile_options(bench_sticky_hdp PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(bench_sticky_hdp PRIVATE ${COMMON_DEFS})
-        endif()
-    endif()
-
-    #───────────────────────────────────────────────────────────────────────────
-    # MMPF Parameter Tuners
-    #───────────────────────────────────────────────────────────────────────────
-
-    # MMPF Stage 1 Tuner (Static parameters: swim lanes, ν, stickiness)
-    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_tuner.c)
-        add_executable(mmpf_tuner
-            ${CMAKE_CURRENT_SOURCE_DIR}/../test/mmpf_tuner.c
-        )
-        target_link_libraries(mmpf_tuner PRIVATE rocks)
-        target_compile_options(mmpf_tuner PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(mmpf_tuner PRIVATE ${COMMON_DEFS})
-    endif()
 
      # RBPF Parameter Tuner (Multi-threaded)
     if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_tuner_mp.c)
@@ -266,10 +182,6 @@ if(RBPF_ENABLE_STORVIK)
         storvik/p2_quantile.h
         storvik/rbpf_fixed_lag_smoother.h
         preprocess/rbpf_preprocess.h
-        mmpf/mmpf_internal.h
-        mmpf/mmpf_entropy.h
-        mmpf/mmpf_online_em.h
-        mmpf/mmpf_mcmc.h
     )
 endif()
 
