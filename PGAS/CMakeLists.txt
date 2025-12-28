@@ -81,6 +81,14 @@ target_link_libraries(pgas INTERFACE
     circular_buffer
 )
 
+add_library(pgas_sliding STATIC
+    pgas_sliding.c
+)
+target_include_directories(pgas_sliding PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pgas_sliding PUBLIC pgas_mkl MKL::MKL)
+target_compile_options(pgas_sliding PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(pgas_sliding PRIVATE ${COMMON_DEFS})
+
 #───────────────────────────────────────────────────────────────────────────────
 # Test Bench (tests and benchmarks)
 #───────────────────────────────────────────────────────────────────────────────

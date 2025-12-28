@@ -258,6 +258,12 @@ target_link_libraries(benchmark_trans_learning
 target_compile_options(benchmark_trans_learning PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(benchmark_trans_learning PRIVATE ${COMMON_DEFS})
 
+
+add_executable(test_pgas_sliding test_pgas_sliding.c)
+target_link_libraries(test_pgas_sliding PRIVATE pgas_sliding pgas_mkl MKL::MKL)
+target_compile_options(test_pgas_sliding PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(test_pgas_sliding PRIVATE ${COMMON_DEFS})
+
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
 #───────────────────────────────────────────────────────────────────────────────

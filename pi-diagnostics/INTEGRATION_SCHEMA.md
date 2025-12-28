@@ -725,6 +725,202 @@ void init_system(void) {
 
 ---
 
+## Confidence Metrics (pgas_confidence)
+
+### Role in System
+
+```
+PGAS runs (30 parallel sweeps)
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  pgas_confidence_compute()                                      │
+│                                                                 │
+│  Inputs:                          Outputs:                      │
+│  • ESS ratio                      • diversity_score             │
+│  • Acceptance rate                • exploration_score           │
+│  • Unique particle fraction       • innovation_score            │
+│  • Path divergence                • overall_score               │
+│  • Sweeps run                     • confidence_level            │
+│                                   • suggested_gamma             │
+│                                   • degeneracy_detected         │
+│                                   • regime_change_detected      │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+pi_staging holds (Π_oracle, confidence, Q_oracle)
+         │
+         ▼
+injection_decision uses confidence to determine γ
+```
+
+### Enhanced Confidence With Parallel Sweeps
+
+Single sweep gives limited information. With 30 parallel sweeps, you get **richer metrics**:
+
+| Single Sweep | Parallel Sweeps (30) |
+|--------------|----------------------|
+| `acceptance_rate` | `avg(acceptance_rate[0..29])` |
+| `ess_ratio` | `avg(ess_ratio[0..29])` |
+| `path_divergence` | `avg(path_divergence[0..29])` |
+| — | **Π variance across sweeps** (NEW) |
+| — | **Agreement ratio** (NEW) |
+| — | **Cross-chain R-hat** (NEW) |
+
+### Parallel Confidence Computation
+
+```c
+void pgas_parallel_compute_confidence(PGASParallel* pp, PGASConfidence* conf)
+{
+    const int n = pp->n_threads;
+    const int K = pp->K;
+    
+    /* 1. Average acceptance rate across threads */
+    float total_accept = 0;
+    for (int t = 0; t < n; t++) {
+        total_accept += pp->states[t]->acceptance_rate;
+    }
+    float avg_acceptance = total_accept / n;
+    
+    /* 2. Π variance across samples (parallel gives us this!) */
+    float Pi_mean[64], Pi_var[64];
+    pgas_parallel_aggregate(pp, Pi_mean, Pi_var);
+    
+    /* High variance = low confidence */
+    float max_var = 0;
+    for (int ij = 0; ij < K * K; ij++) {
+        if (Pi_var[ij] > max_var) max_var = Pi_var[ij];
+    }
+    float variance_penalty = 1.0f / (1.0f + 10.0f * max_var);
+    
+    /* 3. ESS from representative thread */
+    float ess_ratio = pgas_mkl_get_ess(pp->states[0], pp->states[0]->T - 1) 
+                      / pp->states[0]->N;
+    
+    /* 4. Compute base confidence */
+    pgas_confidence_compute_raw(
+        ess_ratio,
+        avg_acceptance,
+        unique_fraction,
+        path_divergence,
+        n * sweeps_per_thread,
+        conf,
+        NULL
+    );
+    
+    /* 5. Adjust score based on cross-thread agreement */
+    conf->overall_score *= variance_penalty;
+}
+```
+
+### Confidence Levels → Injection Gamma
+
+| Level | Score Range | Gamma | Action |
+|-------|-------------|-------|--------|
+| VERY_LOW | < 0.15 | 0.01 | Minimal injection (Oracle unreliable) |
+| LOW | 0.15 - 0.30 | 0.02 | Small injection |
+| MEDIUM | 0.30 - 0.55 | 0.05 | Moderate injection |
+| HIGH | 0.55 - 0.75 | 0.10 | Confident injection |
+| VERY_HIGH | > 0.75 | 0.15 | Strong injection |
+
+### Diagnostic Flags
+
+| Flag | Condition | Meaning |
+|------|-----------|---------|
+| `degeneracy_detected` | ESS < 0.10 OR unique < 0.10 | Particle collapse |
+| `reference_dominated` | acceptance < 0.05 AND divergence < 2% | PGAS stuck on reference |
+| `regime_change_detected` | divergence > 30% | Major path revision |
+
+---
+
+## Component Simplification
+
+### rbpf_trajectory: Seqlock → Double-Buffer
+
+The `rbpf_trajectory.c` seqlock mechanism was designed for **real-time streaming** where reader and writer operate concurrently. With parallel sweeps, this is overkill.
+
+**Old Design (streaming):**
+```
+RBPF writes continuously ←──────────────────────────┐
+                                                    │
+PGAS reads while RBPF writes (needs seqlock!)      │
+                                                    │
+Complex lock-free pattern required                  │
+```
+
+**New Design (parallel sweeps):**
+```
+RBPF accumulates trajectory
+        │
+        ▼
+Trigger condition met (every ~100 ticks)
+        │
+        ▼
+Take ONE snapshot ──► Initialize 30 PGAS states
+        │
+        ▼
+PGAS runs in parallel (doesn't read from RBPF during run)
+        │
+        ▼
+Aggregate results ──► Return Π_oracle
+```
+
+### Simplified Data Channel
+
+```c
+/* Combined channel for all RBPF → PGAS data */
+typedef struct {
+    /* Double buffer index */
+    _Atomic int write_idx;
+    _Atomic int ready;
+    
+    /* Buffer 0 and 1 */
+    struct {
+        float observations[ORACLE_WINDOW_MAX];
+        int ref_regimes[ORACLE_WINDOW_MAX];
+        float ref_h[ORACLE_WINDOW_MAX];
+        float Pi_operating[K_MAX * K_MAX];
+        float Q_storvik[K_MAX * K_MAX];
+        int T;
+        int64_t end_tick;
+    } buf[2];
+    
+} RBPFToPGASChannel;
+
+/* RBPF side: signal new data ready */
+void channel_signal_ready(RBPFToPGASChannel* ch) {
+    int idx = atomic_load(&ch->write_idx);
+    atomic_store(&ch->write_idx, 1 - idx);  /* Flip buffer */
+    atomic_store(&ch->ready, 1);
+}
+
+/* PGAS side: grab snapshot (called ONCE before parallel region) */
+bool channel_grab_snapshot(RBPFToPGASChannel* ch, PGASInputData* out) {
+    if (!atomic_exchange(&ch->ready, 0)) {
+        return false;  /* No new data */
+    }
+    int idx = 1 - atomic_load(&ch->write_idx);  /* Read other buffer */
+    
+    /* Copy to output (used to initialize all 30 PGAS states) */
+    out->T = ch->buf[idx].T;
+    memcpy(out->observations, ch->buf[idx].observations, ...);
+    memcpy(out->ref_regimes, ch->buf[idx].ref_regimes, ...);
+    ...
+    return true;
+}
+```
+
+### What Changes
+
+| Component | Before | After |
+|-----------|--------|-------|
+| `rbpf_trajectory.c` | Seqlock, complex atomics | Simple double-buffer |
+| `observation_buffer.c` | Lock-free circular | Keep (still useful for buffering) |
+| `pgas_confidence.c` | Single-sweep metrics | Enhanced with cross-sweep variance |
+| `pi_staging.c` | Holds single Π | Holds aggregated Π + variance |
+
+---
+
 ## Future Steps (After Validation)
 
 5. **Wire pi_divergence** - Compute D₁, D₂, D₃ between RBPF and PGAS
