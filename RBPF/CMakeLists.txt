@@ -59,14 +59,6 @@ set(ROCKS_SOURCES
     rao-blackwellized/rbpf_mh_jitter.c   # MH jittering (Stone #2 - informed exploration)
 )
 
-#───────────────────────────────────────────────────────────────────────────────
-# Soft Dirichlet Transition Learning (legacy, kept for testing/comparison)
-#───────────────────────────────────────────────────────────────────────────────
-
-list(APPEND ROCKS_SOURCES
-    soft_dirichlet/soft_dirichlet_transition.c
-)
-
 # Add Storvik parameter learning and related modules if enabled
 if(RBPF_ENABLE_STORVIK)
     list(APPEND ROCKS_SOURCES
@@ -121,7 +113,6 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/mmpf
         ${CMAKE_CURRENT_SOURCE_DIR}/HDP-Beam
         ${CMAKE_CURRENT_SOURCE_DIR}/Online-VI
-        ${CMAKE_CURRENT_SOURCE_DIR}/soft_dirichlet
         ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS
 )
@@ -322,11 +313,6 @@ set(ROCKS_HEADERS
     rao-blackwellized/rbpf_kl_tempering.h
     rbpf_fisher_rao.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../RBPF-BOCPD/bocpd.h
-)
-
-# Soft Dirichlet headers (legacy, kept for testing)
-list(APPEND ROCKS_HEADERS
-    soft_dirichlet/soft_dirichlet_transition.h
 )
 
 # Storvik and related headers
