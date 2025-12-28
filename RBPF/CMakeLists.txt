@@ -102,6 +102,18 @@ add_library(rbpf_ksc ALIAS rocks)
 # Test Executables
 #───────────────────────────────────────────────────────────────────────────────
 
+# Single RBPF Test (Storvik + KL Tempering + Smoothed Storvik + OCSN)
+      # Single RBPF Test (Storvik + KL Tempering + Smoothed Storvik + OCSN)
+    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_single_rbpf.c)
+        add_executable(test_single_rbpf
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/test_single_rbpf.c
+        )
+        target_link_libraries(test_single_rbpf PRIVATE rocks)
+        target_compile_options(test_single_rbpf PRIVATE ${COMMON_FLAGS})
+        target_compile_definitions(test_single_rbpf PRIVATE ${COMMON_DEFS})
+    endif()
+
+
 if(RBPF_BUILD_TESTS)
 
      # RBPF Parameter Tuner (Multi-threaded)
@@ -157,6 +169,7 @@ add_executable(test_stone1_diagnostic
     ${CMAKE_CURRENT_SOURCE_DIR}/../test/test_stone1_diagnostic.c
 )
 target_link_libraries(test_stone1_diagnostic PRIVATE rocks)
+
 
 #───────────────────────────────────────────────────────────────────────────────
 # Installation

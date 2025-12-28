@@ -1,26 +1,15 @@
 /*
  * ═══════════════════════════════════════════════════════════════════════════
- * RBPF Parameter Learning: Sleeping Storvik Implementation (OPTIMIZED)
+ * RBPF Parameter Learning: Storvik with Adaptive Forgetting (LEAN)
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * P99 Optimizations Applied:
- *   - Double-buffered StorvikSoA for pointer-swap resampling (no memcpy)
- *   - HFT intervals as default [50, 20, 5, 1]
- *   - Global tick-skip for 90% duty cycle reduction
- *   - Aligned memory for AVX-512
+ * Full Bayesian update every tick. No sleeping, no throttling.
  *
- * Adaptive Forgetting:
- *   - Source: RiskMetrics (1996), West & Harrison (1997)
- *   - Prevents model fossilization by discounting sufficient statistics
- *   - N_eff ≈ 1/(1-λ) where λ is the discount factor
- *   - Regime-adaptive forgetting rates supported
+ * Normal-Inverse-Gamma conjugate prior for (μ, σ²):
+ *   μ | σ² ~ N(m, σ²/κ)
+ *   σ²     ~ IG(α, β)
  *
- * Smoothed-Only Architecture (NEW - Session 14):
- *   - param_learn_reset_to_priors() for structural break handling
- *   - λ derived from transition matrix (no magic numbers)
- *   - Compatible with PARIS-smoothed Storvik updates
- *
- * Target: P99 < 25μs (down from 60μs)
+ * Sufficient statistics: (m, κ, α, β) updated with exponential forgetting.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -28,8 +17,9 @@
 #ifndef RBPF_PARAM_LEARN_H
 #define RBPF_PARAM_LEARN_H
 
-#include <stdbool.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C"
@@ -37,116 +27,111 @@ extern "C"
 #endif
 
     /*═══════════════════════════════════════════════════════════════════════════
-     * PRECISION & CONSTANTS
+     * CONFIGURATION
      *═══════════════════════════════════════════════════════════════════════════*/
-
-#ifndef PARAM_LEARN_REAL
-    typedef double param_real;
-#else
-typedef PARAM_LEARN_REAL param_real;
-#endif
 
 #define PARAM_LEARN_MAX_REGIMES 8
-#define PARAM_LEARN_MAX_PARTICLES 1024
-
-/* Memory alignment for AVX-512 */
+#define PARAM_LEARN_MAX_PARTICLES 4096
 #define PL_CACHE_LINE 64
+#define PL_RNG_BUFFER_SIZE 1024
 
-/* RNG buffer size - larger = fewer refills */
-#define PL_RNG_BUFFER_SIZE 4096
+    /* Precision */
+    typedef double param_real;
 
-/* Global tick-skip modulo (skip N-1 out of N ticks in calm regimes) */
-#define PL_GLOBAL_SKIP_MODULO 10
+/* Force inline */
+#if defined(_MSC_VER)
+#define PL_FORCE_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define PL_FORCE_INLINE __attribute__((always_inline)) inline
+#else
+#define PL_FORCE_INLINE inline
+#endif
+
+/* Restrict */
+#if defined(_MSC_VER)
+#define PL_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define PL_RESTRICT __restrict__
+#else
+#define PL_RESTRICT
+#endif
 
     /*═══════════════════════════════════════════════════════════════════════════
-     * METHOD SELECTION
+     * STRUCTURES
      *═══════════════════════════════════════════════════════════════════════════*/
 
-    typedef enum
+    /**
+     * Configuration
+     */
+    typedef struct
     {
-        PARAM_LEARN_SLEEPING_STORVIK, /* Primary: full Bayesian, adaptive sampling */
-        PARAM_LEARN_EWSS,             /* Comparison: point estimates only          */
-        PARAM_LEARN_FIXED             /* No adaptation: use priors                 */
-    } ParamLearnMethod;
+        /* Forgetting */
+        bool enable_forgetting;
+        param_real forgetting_lambda;      /* Global discount factor (fallback) */
+        param_real forgetting_kappa_floor; /* Prevent posterior collapse */
+        param_real forgetting_alpha_floor; /* Keep inverse-gamma proper */
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SAMPLING TRIGGERS
-     *═══════════════════════════════════════════════════════════════════════════*/
+        /* Per-regime forgetting (if enable_regime_adaptive_forgetting) */
+        bool enable_regime_adaptive_forgetting;
+        param_real forgetting_lambda_regime[PARAM_LEARN_MAX_REGIMES];
 
-    typedef enum
-    {
-        SAMPLE_TRIGGER_NONE = 0,
-        SAMPLE_TRIGGER_INTERVAL = 1 << 0,
-        SAMPLE_TRIGGER_REGIME_CHANGE = 1 << 1,
-        SAMPLE_TRIGGER_STRUCTURAL_BREAK = 1 << 2,
-        SAMPLE_TRIGGER_FORCED = 1 << 3,
-        SAMPLE_TRIGGER_RESAMPLING = 1 << 4,
-        SAMPLE_TRIGGER_FIRST = 1 << 5,
-    } SampleTrigger;
+        /* Bounds */
+        param_real sigma_floor_mult;
+        param_real sigma_ceil_mult;
+        param_real mu_drift_max;
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * PRIOR SPECIFICATION
-     *═══════════════════════════════════════════════════════════════════════════*/
+        /* Priors */
+        param_real prior_strength;
+        uint64_t rng_seed;
 
+        /* Compatibility stubs (not used in lean version - always update every tick) */
+        int sample_interval[PARAM_LEARN_MAX_REGIMES]; /* Ignored - always 1 */
+        bool sample_on_regime_change;                 /* Ignored - always sample */
+        bool sample_on_structural_break;              /* Ignored - always sample */
+        bool sample_after_resampling;                 /* Ignored - always sample */
+        bool enable_global_tick_skip;                 /* Ignored - never skip */
+        int global_skip_modulo;                       /* Ignored */
+    } ParamLearnConfig;
+
+    /**
+     * Per-regime prior specification
+     */
     typedef struct
     {
         param_real m;           /* Prior mean for μ */
-        param_real kappa;       /* Prior precision for μ (pseudo-observations) */
-        param_real alpha;       /* Inverse-Gamma shape for σ² */
-        param_real beta;        /* Inverse-Gamma scale for σ² */
-        param_real phi;         /* AR(1) persistence (fixed, not learned) */
-        param_real sigma_prior; /* Prior guess for σ (for initialization) */
+        param_real kappa;       /* Prior precision for μ */
+        param_real alpha;       /* IG shape for σ² */
+        param_real beta;        /* IG scale for σ² */
+        param_real phi;         /* AR(1) coefficient (fixed, not learned) */
+        param_real sigma_prior; /* Prior σ (for bounds) */
 
-        /* Precomputed (avoid division on hot path) */
+        /* Precomputed */
         param_real one_minus_phi;
         param_real one_minus_phi_sq;
         param_real inv_one_minus_phi;
         param_real inv_one_minus_phi_sq;
     } RegimePrior;
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SOA STORAGE: Double-Buffered for Pointer-Swap Resampling
-     *
-     * OPTIMIZATION: Instead of copying 7 arrays back after resampling,
-     * write to inactive buffer and swap pointers.
-     *
-     * Layout: array[regime_idx * n_particles + particle_idx]
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-/* Force inline for hot path */
-#if defined(__GNUC__) || defined(__clang__)
-#define PL_FORCE_INLINE __attribute__((always_inline)) inline
-#define PL_RESTRICT __restrict__
-#elif defined(_MSC_VER)
-#define PL_FORCE_INLINE __forceinline
-#define PL_RESTRICT __restrict
-#else
-#define PL_FORCE_INLINE inline
-#define PL_RESTRICT
-#endif
-
+    /**
+     * Sufficient statistics SoA layout
+     * Indexed as: particle_idx * n_regimes + regime
+     */
     typedef struct
     {
-        /* NIG Posterior Hyperparameters (updated every tick) */
-        param_real *PL_RESTRICT m;
-        param_real *PL_RESTRICT kappa;
-        param_real *PL_RESTRICT alpha;
-        param_real *PL_RESTRICT beta;
-
-        /* Cached Samples (updated only when "awake") */
-        param_real *PL_RESTRICT mu_cached;
-        param_real *PL_RESTRICT sigma2_cached;
-        param_real *PL_RESTRICT sigma_cached;
-
-        /* Tracking */
-        int *PL_RESTRICT n_obs;
-        int *PL_RESTRICT ticks_since_sample;
+        param_real *m;             /* Posterior mean for μ */
+        param_real *kappa;         /* Posterior precision for μ */
+        param_real *alpha;         /* IG shape */
+        param_real *beta;          /* IG scale */
+        param_real *mu_cached;     /* Last sampled μ */
+        param_real *sigma2_cached; /* Last sampled σ² */
+        param_real *sigma_cached;  /* Last sampled σ */
+        int *n_obs;                /* Observation count */
+        int *ticks_since_sample;   /* Ticks since last sample (for sleeping) */
     } StorvikSoA;
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * ENTROPY BUFFER
-     *═══════════════════════════════════════════════════════════════════════════*/
-
+    /**
+     * Entropy buffer for batched RNG
+     */
     typedef struct
     {
         param_real *normal;
@@ -155,429 +140,120 @@ typedef PARAM_LEARN_REAL param_real;
         int uniform_cursor;
         int buffer_size;
         uint64_t rng_state[2];
-#ifdef PARAM_LEARN_USE_MKL
-        void *mkl_stream;
-#endif
+        void *mkl_stream; /* VSLStreamStatePtr if MKL */
     } EntropyBuffer;
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * EWSS STATISTICS
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    typedef struct
-    {
-        param_real sum_z;
-        param_real sum_z_sq;
-        param_real eff_n;
-        param_real mu;
-        param_real sigma;
-    } EWSSStats;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * CONFIGURATION
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    typedef struct
-    {
-        ParamLearnMethod method;
-
-        /* Sleeping intervals by regime (HFT defaults: [50, 20, 5, 1]) */
-        int sample_interval[PARAM_LEARN_MAX_REGIMES];
-
-        /* Triggers */
-        bool sample_on_regime_change;
-        bool sample_on_structural_break;
-        bool sample_after_resampling;
-
-        /* Load throttling */
-        bool enable_load_throttling;
-        param_real load_skip_threshold;
-
-        /* EWSS config */
-        param_real ewss_lambda;
-        param_real ewss_min_eff_n;
-
-        /* Constraints */
-        param_real sigma_floor_mult;
-        param_real sigma_ceil_mult;
-        param_real mu_drift_max;
-
-        /* Prior strength */
-        param_real prior_strength;
-
-        /* RNG */
-        uint64_t rng_seed;
-
-        /*─────────────────────────────────────────────────────────────────────────
-         * P99 OPTIMIZATION: Global tick-skip
-         *
-         * When enabled, skip entire param_learn_update() call N-1 out of N ticks
-         * UNLESS a trigger condition is met (regime change, structural break).
-         *
-         * This reduces average latency from 19μs to ~2μs (90% skip rate).
-         * P99 remains ~19μs (when we do run), but average drops dramatically.
-         *───────────────────────────────────────────────────────────────────────*/
-        bool enable_global_tick_skip;
-        int global_skip_modulo; /* Run every N ticks (default: 10) */
-
-        /*─────────────────────────────────────────────────────────────────────────
-         * ADAPTIVE FORGETTING (RiskMetrics-style discount)
-         *
-         * Source: J.P. Morgan RiskMetrics (1996), West & Harrison (1997)
-         *
-         * Prevents model fossilization by exponentially discounting old data.
-         * Without forgetting, posteriors become too tight over time and the
-         * model cannot adapt to regime drift or structural changes.
-         *
-         * Effective sample size ≈ 1/(1-λ):
-         *   λ = 0.990 → N_eff ≈ 100  (fast adaptation, ~2 min memory)
-         *   λ = 0.995 → N_eff ≈ 200  (moderate)
-         *   λ = 0.997 → N_eff ≈ 333  (default, ~5 min memory)
-         *   λ = 0.999 → N_eff ≈ 1000 (slow, stable)
-         *
-         * Floors prevent posterior collapse:
-         *   κ → 0: posterior mean undefined (infinite variance)
-         *   α → 0: inverse-gamma becomes improper (no mode)
-         *───────────────────────────────────────────────────────────────────────*/
-        bool enable_forgetting;            /* Enable adaptive forgetting (default: true) */
-        param_real forgetting_lambda;      /* Discount factor (default: 0.997) */
-        param_real forgetting_kappa_floor; /* Min kappa to prevent collapse (default: 5.0) */
-        param_real forgetting_alpha_floor; /* Min alpha to keep proper (default: 3.0) */
-
-        /*─────────────────────────────────────────────────────────────────────────
-         * REGIME-ADAPTIVE FORGETTING
-         *
-         * Different decay rates per regime for asymmetric learning:
-         *   R0 (calm):   High λ (slow forgetting) → trust historical params
-         *   R3 (crisis): Low λ (fast forgetting) → adapt quickly
-         *
-         * Creates desirable behavior: stable in calm, adaptive in crisis.
-         *
-         * SESSION 14 UPDATE: Can now be derived from transition matrix:
-         *   λ_r = 1 - 1/(α × E[dwell_r])
-         *   E[dwell_r] = 1 / (1 - P_stay)
-         * See: rbpf_ext_compute_forgetting_from_transitions()
-         *───────────────────────────────────────────────────────────────────────*/
-        bool enable_regime_adaptive_forgetting;
-        param_real forgetting_lambda_regime[PARAM_LEARN_MAX_REGIMES];
-
-    } ParamLearnConfig;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * PARTICLE INFO
-     *═══════════════════════════════════════════════════════════════════════════*/
-
+    /**
+     * Particle info passed from RBPF
+     */
     typedef struct
     {
         int regime;
         int prev_regime;
-        param_real ell;
-        param_real ell_lag;
+        param_real ell;     /* Current log-vol */
+        param_real ell_lag; /* Previous log-vol */
         param_real weight;
     } ParticleInfo;
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * OUTPUT PARAMETERS
-     *═══════════════════════════════════════════════════════════════════════════*/
-
+    /**
+     * Output parameters
+     */
     typedef struct
     {
         param_real mu;
         param_real phi;
         param_real sigma;
         param_real sigma2;
-
-        param_real mu_post_mean;
-        param_real mu_post_std;
-        param_real sigma2_post_mean;
-        param_real sigma2_post_std;
-
         int n_obs;
-        int ticks_since_sample;
-        SampleTrigger last_trigger;
-        param_real confidence;
     } RegimeParams;
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * MAIN LEARNER STRUCTURE (with double-buffer support)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
+    /**
+     * Main learner state
+     */
     typedef struct
     {
         ParamLearnConfig config;
         int n_regimes;
         int n_particles;
-
-        RegimePrior priors[PARAM_LEARN_MAX_REGIMES];
-
-        /*─────────────────────────────────────────────────────────────────────────
-         * DOUBLE-BUFFERED STORVIK SOA
-         *
-         * storvik[0] and storvik[1] are alternating buffers.
-         * active_buffer indicates which one is currently live.
-         *
-         * On resampling: write to inactive buffer, then swap.
-         * Eliminates 7× memcpy (2.1μs → 0μs)
-         *───────────────────────────────────────────────────────────────────────*/
-        StorvikSoA storvik[2];
-        int active_buffer; /* 0 or 1 */
         int storvik_total_size;
 
-        /* Scratch for int arrays during resampling (n_obs, ticks_since_sample) */
-        int *resample_scratch_int;
+        /* Double-buffered SoA */
+        StorvikSoA storvik[2];
+        int active_buffer;
 
-        EntropyBuffer entropy;
-        EWSSStats ewss[PARAM_LEARN_MAX_REGIMES];
+        /* Priors */
+        RegimePrior priors[PARAM_LEARN_MAX_REGIMES];
+
+        /* RNG */
         uint64_t rng[2];
+        EntropyBuffer entropy;
 
-        /* Runtime state */
+        /* State */
         int tick;
         bool structural_break_flag;
-        param_real current_load;
 
-        /* Global tick-skip state */
-        int ticks_since_full_update;
-        bool force_next_update; /* Set by triggers to override skip */
-
-        /*─────────────────────────────────────────────────────────────────────────
-         * DIAGNOSTICS
-         *───────────────────────────────────────────────────────────────────────*/
+        /* Diagnostics */
         uint64_t total_stat_updates;
         uint64_t total_samples_drawn;
-        uint64_t samples_skipped_load;
-        uint64_t samples_triggered_regime;
-        uint64_t samples_triggered_break;
-        uint64_t ticks_skipped_global;
+        uint64_t total_resets;
 
-        /* Forgetting diagnostics */
-        uint64_t forgetting_floor_hits_kappa; /* Times kappa hit floor */
-        uint64_t forgetting_floor_hits_alpha; /* Times alpha hit floor */
-
-        /*─────────────────────────────────────────────────────────────────────────
-         * RESET STATISTICS (Session 14 - Smoothed-Only Architecture)
-         *
-         * Tracks how often priors are reset due to structural breaks.
-         * High reset count may indicate model mismatch or extreme volatility.
-         *───────────────────────────────────────────────────────────────────────*/
-        uint64_t total_resets; /* reset_to_priors() calls */
-
+        /* Compatibility stubs (not used in lean version) */
+        uint64_t samples_skipped_load; /* Always 0 */
+        uint64_t ticks_skipped_global; /* Always 0 */
     } ParamLearner;
 
     /*═══════════════════════════════════════════════════════════════════════════
-     * API: Configuration Presets
+     * API
      *═══════════════════════════════════════════════════════════════════════════*/
 
-    /**
-     * Default: HFT-optimized sleeping intervals [50, 20, 5, 1]
-     * Forgetting ENABLED by default (λ = 0.997, N_eff ≈ 333)
-     *
-     * CHANGED from always-awake to sleeping mode for P99 optimization.
-     * Use param_learn_config_full_bayesian() if you need every-tick updates.
-     */
+    /* Configuration */
     ParamLearnConfig param_learn_config_defaults(void);
 
-    /**
-     * Sleeping Storvik with moderate intervals.
-     */
-    ParamLearnConfig param_learn_config_sleeping(void);
-
-    /**
-     * Full Bayesian: sample every tick in all regimes.
-     * Forgetting DISABLED (true Bayesian accumulation).
-     * Highest accuracy, highest latency (~45μs).
-     */
-    ParamLearnConfig param_learn_config_full_bayesian(void);
-
-    /**
-     * HFT mode: Aggressive sleeping + global tick-skip.
-     * Forgetting ENABLED with regime-adaptive rates.
-     * Lowest latency (~5μs average), relies on triggers.
-     */
-    ParamLearnConfig param_learn_config_hft(void);
-
-    /**
-     * Stable mode: Slow forgetting (λ = 0.999, N_eff ≈ 1000).
-     * Good for assets with stable parameters.
-     */
-    ParamLearnConfig param_learn_config_stable(void);
-
-    /**
-     * No forgetting: Original behavior (parameters converge to global average).
-     * Not recommended for production on non-stationary data.
-     */
-    ParamLearnConfig param_learn_config_no_forgetting(void);
-
-    /**
-     * EWSS mode for comparison.
-     */
-    ParamLearnConfig param_learn_config_ewss(void);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Lifecycle
-     *═══════════════════════════════════════════════════════════════════════════*/
-
+    /* Lifecycle */
     int param_learn_init(ParamLearner *learner,
                          const ParamLearnConfig *config,
                          int n_particles,
                          int n_regimes);
-
     void param_learn_free(ParamLearner *learner);
     void param_learn_reset(ParamLearner *learner);
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Prior Specification
-     *═══════════════════════════════════════════════════════════════════════════*/
-
+    /* Prior specification */
     void param_learn_set_prior(ParamLearner *learner, int regime,
                                param_real mu, param_real phi, param_real sigma);
-
-    void param_learn_set_prior_nig(ParamLearner *learner, int regime,
-                                   param_real m, param_real kappa,
-                                   param_real alpha, param_real beta,
-                                   param_real phi);
-
     void param_learn_broadcast_priors(ParamLearner *learner);
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Main Update
-     *═══════════════════════════════════════════════════════════════════════════*/
+    /* Forgetting */
+    void param_learn_set_forgetting(ParamLearner *learner, bool enable, param_real lambda);
+    param_real param_learn_get_forgetting_lambda(const ParamLearner *learner, int regime);
+    param_real param_learn_get_effective_sample_size(const ParamLearner *learner, int regime);
 
+    /* Per-regime forgetting (compatibility stub - uses global λ) */
+    void param_learn_set_regime_forgetting(ParamLearner *learner, int regime, param_real lambda);
+
+    /* Main update (call every tick) */
     void param_learn_update(ParamLearner *learner,
                             const ParticleInfo *particles,
                             int n);
 
+    /* Structural break */
     void param_learn_signal_structural_break(ParamLearner *learner);
-    void param_learn_set_load(ParamLearner *learner, param_real load);
+    void param_learn_reset_to_priors(ParamLearner *learner);
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Get Parameters
-     *═══════════════════════════════════════════════════════════════════════════*/
+    /* Resampling */
+    void param_learn_apply_resampling(ParamLearner *learner, const int *ancestors, int n);
 
+    /* Get parameters */
     void param_learn_get_params(const ParamLearner *learner,
                                 int particle_idx, int regime,
                                 RegimeParams *params);
 
-    void param_learn_force_sample(ParamLearner *learner,
-                                  int particle_idx, int regime);
+    /* Accessors */
+    StorvikSoA *param_learn_get_active_soa(ParamLearner *learner);
+    const StorvikSoA *param_learn_get_active_soa_const(const ParamLearner *learner);
 
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Resampling Support
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void param_learn_copy_ancestor(ParamLearner *learner,
-                                   int dst_particle, int src_particle);
-
-    void param_learn_apply_resampling(ParamLearner *learner,
-                                      const int *ancestors, int n);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Adaptive Forgetting
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    /**
-     * Enable/disable adaptive forgetting at runtime
-     *
-     * @param learner  Parameter learner
-     * @param enable   true to enable, false to disable
-     * @param lambda   Discount factor (0 < λ ≤ 1), ignored if ≤ 0
-     */
-    void param_learn_set_forgetting(ParamLearner *learner, bool enable, param_real lambda);
-
-    /**
-     * Set regime-specific forgetting rate
-     *
-     * Enables regime-adaptive forgetting and sets λ for specified regime.
-     * Call for each regime you want to customize.
-     *
-     * @param learner  Parameter learner
-     * @param regime   Regime index
-     * @param lambda   Discount factor for this regime
-     */
-    void param_learn_set_regime_forgetting(ParamLearner *learner, int regime, param_real lambda);
-
-    /**
-     * Get forgetting lambda for a regime
-     *
-     * @param learner  Parameter learner
-     * @param regime   Regime index
-     * @return         Lambda value, or 1.0 if forgetting disabled
-     */
-    param_real param_learn_get_regime_forgetting(const ParamLearner *learner, int regime);
-
-    /**
-     * Get effective sample size for a regime
-     *
-     * N_eff ≈ 1/(1-λ) for exponential forgetting.
-     * Returns actual tick count if forgetting is disabled.
-     *
-     * @param learner  Parameter learner
-     * @param regime   Regime index (-1 for global λ)
-     * @return         Effective sample size
-     */
-    param_real param_learn_get_effective_sample_size(const ParamLearner *learner, int regime);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Reset to Priors (Session 14 - Smoothed-Only Architecture)
-     *
-     * Called during structural break (P² circuit breaker fires).
-     * Eliminates "arrogance" from old regime by resetting sufficient statistics
-     * to their prior values.
-     *
-     * After reset:
-     *   - m, κ, α, β return to prior values for all particles
-     *   - Posterior precision is minimal (maximally uncertain)
-     *   - Model ready to learn quickly from new regime
-     *
-     * The smoother will then warm-start with smoothed data from the buffer.
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    /**
-     * Reset all sufficient statistics to prior values
-     *
-     * Use case: Structural break detected, old parameters are invalid.
-     * This eliminates the "arrogant" precision accumulated in the old regime.
-     *
-     * @param learner   Storvik learner handle
-     */
-    void param_learn_reset_to_priors(ParamLearner *learner);
-
-    /**
-     * Print reset and forgetting statistics
-     *
-     * Shows:
-     *   - Total reset_to_priors() calls
-     *   - Per-regime λ values and effective memory
-     *
-     * @param learner   Storvik learner handle
-     */
-    void param_learn_print_reset_stats(const ParamLearner *learner);
-    
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * API: Diagnostics
-     *═══════════════════════════════════════════════════════════════════════════*/
-
+    /* Diagnostics */
     void param_learn_print_summary(const ParamLearner *learner);
     void param_learn_print_regime_stats(const ParamLearner *learner, int regime);
-
-    void param_learn_get_regime_summary(const ParamLearner *learner, int regime,
-                                        param_real *mu_mean, param_real *mu_std,
-                                        param_real *sigma_mean, param_real *sigma_std,
-                                        int *total_obs);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * INLINE HELPER: Get active StorvikSoA (avoids repeated indexing)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    static PL_FORCE_INLINE StorvikSoA *param_learn_get_active_soa(ParamLearner *learner)
-    {
-        return &learner->storvik[learner->active_buffer];
-    }
-
-    static PL_FORCE_INLINE const StorvikSoA *param_learn_get_active_soa_const(const ParamLearner *learner)
-    {
-        return &learner->storvik[learner->active_buffer];
-    }
 
 #ifdef __cplusplus
 }
