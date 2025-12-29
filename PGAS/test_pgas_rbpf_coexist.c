@@ -5,7 +5,7 @@
  * Goal: Verify they can run side-by-side without conflicts.
  *
  * - RBPF: Main thread, processes each tick
- * - PGAS: Background thread, builds Π from sliding window
+ * - PGAS: Background thread, builds Π from sliding window (8 P-cores)
  *
  * No wiring yet - just coexistence.
  *
@@ -13,6 +13,7 @@
 
 #include "rbpf_ksc_param_integration.h"
 #include "pgas_oracle.h"
+#include "mkl_tuning.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 static double g_timer_freq = 0.0;
 static void init_timer(void)
 {
@@ -53,7 +56,8 @@ static inline double get_time_us(void)
  * PCG32 RNG
  *───────────────────────────────────────────────────────────────────────────*/
 
-typedef struct {
+typedef struct
+{
     uint64_t state;
     uint64_t inc;
 } pcg32_t;
@@ -76,7 +80,8 @@ static double pcg32_gaussian(pcg32_t *rng)
 {
     double u1 = pcg32_double(rng);
     double u2 = pcg32_double(rng);
-    if (u1 < 1e-10) u1 = 1e-10;
+    if (u1 < 1e-10)
+        u1 = 1e-10;
     return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979 * u2);
 }
 
@@ -84,7 +89,8 @@ static double pcg32_gaussian(pcg32_t *rng)
  * SYNTHETIC DATA (simplified)
  *───────────────────────────────────────────────────────────────────────────*/
 
-typedef struct {
+typedef struct
+{
     double *returns;
     double *true_log_vol;
     int *true_regime;
@@ -110,9 +116,11 @@ static SyntheticData *generate_data(int n_ticks, int seed)
     int regime = 0;
     int next_switch = 200 + (int)(pcg32_double(&rng) * 300);
 
-    for (int t = 0; t < n_ticks; t++) {
+    for (int t = 0; t < n_ticks; t++)
+    {
         /* Regime switching */
-        if (t >= next_switch) {
+        if (t >= next_switch)
+        {
             int delta = (pcg32_double(&rng) < 0.5) ? -1 : 1;
             regime = (regime + delta + 4) % 4;
             next_switch = t + 200 + (int)(pcg32_double(&rng) * 300);
@@ -134,7 +142,8 @@ static SyntheticData *generate_data(int n_ticks, int seed)
 
 static void free_data(SyntheticData *data)
 {
-    if (!data) return;
+    if (!data)
+        return;
     free(data->returns);
     free(data->true_log_vol);
     free(data->true_regime);
@@ -150,10 +159,35 @@ int main(int argc, char **argv)
     int seed = 42;
     int n_ticks = 10000;
 
-    if (argc > 1) seed = atoi(argv[1]);
-    if (argc > 2) n_ticks = atoi(argv[2]);
+    if (argc > 1)
+        seed = atoi(argv[1]);
+    if (argc > 2)
+        n_ticks = atoi(argv[2]);
 
     init_timer();
+
+    /* Initialize MKL tuning for RBPF (single-threaded for latency)
+     * PGAS will set its own thread count in background thread */
+    mkl_tuning_flush_denormals();
+    mkl_set_num_threads(1); /* RBPF stays single-threaded */
+    mkl_set_dynamic(0);
+    mkl_cbwr_set(MKL_CBWR_AVX2);
+#ifdef _WIN32
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    timeBeginPeriod(1);
+#endif
+
+    printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                      MKL TUNING CONFIGURATION                         ║\n");
+    printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
+    printf("  Denormals:     FLUSH TO ZERO (FTZ+DAZ enabled)\n");
+    printf("  MKL threads:   %d (RBPF single-threaded)\n", mkl_get_max_threads());
+    printf("  PGAS threads:  8 (set in background thread)\n");
+    printf("  MKL dynamic:   OFF\n");
+    printf("  MKL CBWR:      AVX2\n");
+#ifdef _WIN32
+    printf("  Windows:       HIGH priority, timer=1ms\n");
+#endif
 
     printf("═══════════════════════════════════════════════════════════════\n");
     printf("  PGAS + RBPF Coexistence Test\n");
@@ -175,23 +209,30 @@ int main(int argc, char **argv)
     const int N_REGIMES = 4;
 
     RBPF_Extended *rbpf = rbpf_ext_create(RBPF_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
+    rbpf_ext_enable_kl_tempering(rbpf);
 
+    /* Enable PARIS smoothed Storvik (L=5 tick lag) */
+    rbpf_ext_enable_smoothed_storvik(rbpf, 5);
+
+    /* Regime params (θ, μ, σ) */
     rbpf_ext_set_regime_params(rbpf, 0, 0.0030f, -4.299f, 0.080f);
     rbpf_ext_set_regime_params(rbpf, 1, 0.0420f, -3.465f, 0.267f);
     rbpf_ext_set_regime_params(rbpf, 2, 0.0810f, -2.954f, 0.453f);
     rbpf_ext_set_regime_params(rbpf, 3, 0.1200f, -2.171f, 0.640f);
 
+    /* Transition matrix (stickiness=0.92) */
     rbpf_real_t trans[16] = {
         0.920f, 0.056f, 0.020f, 0.004f,
         0.032f, 0.920f, 0.036f, 0.012f,
         0.012f, 0.036f, 0.920f, 0.032f,
-        0.004f, 0.020f, 0.056f, 0.920f
-    };
+        0.004f, 0.020f, 0.056f, 0.920f};
     rbpf_ext_build_transition_lut(rbpf, trans);
 
+    /* Adaptive forgetting */
     rbpf_ext_enable_adaptive_forgetting_mode(rbpf, ADAPT_SIGNAL_REGIME);
     rbpf_ext_enable_circuit_breaker(rbpf, 0.999, 100);
 
+    /* Robust OCSN */
     rbpf->robust_ocsn.enabled = 1;
     rbpf->robust_ocsn.regime[0].prob = 0.02f;
     rbpf->robust_ocsn.regime[0].variance = 100.0f;
@@ -210,13 +251,14 @@ int main(int argc, char **argv)
     printf("Creating PGAS Oracle...\n");
     const int PGAS_WINDOW = 500;
     const int PGAS_SLIDE = 50;
-    const int PGAS_PARTICLES = 64;
-    const int PGAS_SWEEPS = 2;
+    const int PGAS_PARTICLES = 64; /* Keep lightweight for throughput */
+    const int PGAS_SWEEPS = 2;     /* 2 sweeps = fast iterations */
 
     PGASOracleState *oracle = pgas_oracle_alloc(
         PGAS_WINDOW, PGAS_SLIDE, PGAS_PARTICLES, N_REGIMES, PGAS_SWEEPS, seed);
 
-    if (!oracle) {
+    if (!oracle)
+    {
         fprintf(stderr, "Failed to allocate PGAS Oracle\n");
         rbpf_ext_destroy(rbpf);
         free_data(data);
@@ -225,18 +267,23 @@ int main(int argc, char **argv)
 
     /* Configure PGAS model (same regime params) */
     double pgas_trans[16];
-    for (int i = 0; i < 16; i++) pgas_trans[i] = (double)trans[i];
+    for (int i = 0; i < 16; i++)
+        pgas_trans[i] = (double)trans[i];
     double mu_vol[4] = {-4.299, -3.465, -2.954, -2.171};
     double sigma_vol[4] = {0.080, 0.267, 0.453, 0.640};
     pgas_oracle_set_model(oracle, pgas_trans, mu_vol, sigma_vol, 0.97);
     pgas_oracle_set_prior(oracle, 1.0f, 50.0f);
     pgas_oracle_set_recency(oracle, 0.001f);
 
+    /* Pin PGAS to 8 P-cores (cores 0-7) */
+    pgas_oracle_set_affinity(oracle, 0, 8);
+
     /* ═══════════════════════════════════════════════════════════════════════
      * START PGAS BACKGROUND THREAD
      * ═══════════════════════════════════════════════════════════════════════*/
-    printf("Starting PGAS background thread...\n");
-    if (pgas_oracle_start(oracle) != 0) {
+    printf("Starting PGAS background thread (8 P-cores)...\n");
+    if (pgas_oracle_start(oracle) != 0)
+    {
         fprintf(stderr, "Failed to start PGAS Oracle\n");
         pgas_oracle_free(oracle);
         rbpf_ext_destroy(rbpf);
@@ -260,7 +307,8 @@ int main(int argc, char **argv)
 
     double t_loop_start = get_time_us();
 
-    for (int t = 0; t < n_ticks; t++) {
+    for (int t = 0; t < n_ticks; t++)
+    {
         float obs = (float)data->returns[t];
 
         /* ─────────────────────────────────────────────────────────────────
@@ -271,7 +319,8 @@ int main(int argc, char **argv)
         /* ─────────────────────────────────────────────────────────────────
          * STEP 2: Check for PGAS output (NO INJECTION YET)
          * ─────────────────────────────────────────────────────────────────*/
-        if (pgas_oracle_try_hot_swap(oracle, false, pgas_pi, &pgas_tick)) {
+        if (pgas_oracle_try_hot_swap(oracle, false, pgas_pi, &pgas_tick))
+        {
             pgas_swaps++;
             /* NOT injecting - just counting */
         }
@@ -286,15 +335,18 @@ int main(int argc, char **argv)
 
         double latency = t_rbpf_end - t_rbpf_start;
         rbpf_total_time += latency;
-        if (latency > rbpf_max_latency) rbpf_max_latency = latency;
+        if (latency > rbpf_max_latency)
+            rbpf_max_latency = latency;
 
         /* Track accuracy (map 4 regimes to simplified) */
         int rbpf_regime = rbpf_out.dominant_regime;
         int true_regime = data->true_regime[t];
-        if (rbpf_regime == true_regime) rbpf_regime_correct++;
+        if (rbpf_regime == true_regime)
+            rbpf_regime_correct++;
 
         /* Progress */
-        if ((t + 1) % 2000 == 0) {
+        if ((t + 1) % 2000 == 0)
+        {
             printf("  Tick %d: RBPF regime=%d (true=%d), PGAS swaps=%d\n",
                    t + 1, rbpf_regime, true_regime, pgas_swaps);
         }
@@ -347,6 +399,9 @@ int main(int argc, char **argv)
     pgas_oracle_free(oracle);
     rbpf_ext_destroy(rbpf);
     free_data(data);
+#ifdef _WIN32
+    timeEndPeriod(1);
+#endif
 
     return 0;
 }
