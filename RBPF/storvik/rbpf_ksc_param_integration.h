@@ -314,6 +314,8 @@ extern "C"
         RBPF_AssetPreset current_preset;
         uint64_t tick_count;
 
+        int last_resampled;
+
     } RBPF_Extended;
 
     /*═══════════════════════════════════════════════════════════════════════════

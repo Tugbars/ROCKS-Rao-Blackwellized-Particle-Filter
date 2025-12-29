@@ -22,6 +22,7 @@
 #include "rbpf_sprt.h"
 #include "rbpf_dirichlet_transition.h"
 #include "rbpf_kl_tempering.h"
+#include "rbpf_apf_kick.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -416,6 +417,15 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     ext->flush_count = 0;
     ext->reset_count = 0;
 
+    /* KL Tempering (disabled by default, but allocated) */
+    ext->kl_state = (RBPF_KL_State *)calloc(1, sizeof(RBPF_KL_State));
+    if (ext->kl_state)
+    {
+        rbpf_kl_init(ext->kl_state, n_particles);
+    }
+    ext->kl_tempering_enabled = 0;
+    ext->last_resampled = 0;
+
     /* Misc */
     ext->current_preset = RBPF_PRESET_CUSTOM;
     ext->tick_count = 0;
@@ -442,6 +452,9 @@ void rbpf_ext_destroy(RBPF_Extended *ext)
         param_learn_free(&ext->storvik);
     if (ext->smoother)
         fls_destroy(ext->smoother);
+
+    /* KL Tempering state */
+    free(ext->kl_state);
 
 #if defined(_MSC_VER)
     _aligned_free(ext->particle_info);
@@ -487,7 +500,7 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
     if (ext->smoother)
     {
         fls_reset(ext->smoother);
-        
+
         /* Sync model params to smoother for PARIS backward kernel */
         if (ext->smoothed_storvik_enabled)
         {
@@ -495,8 +508,8 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
             double trans[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
             double mu_vol[RBPF_MAX_REGIMES];
             double sigma_vol[RBPF_MAX_REGIMES];
-            double phi = 1.0 - ext->rbpf->params[0].theta;  /* Assume same θ */
-            
+            double phi = 1.0 - ext->rbpf->params[0].theta; /* Assume same θ */
+
             for (int i = 0; i < nr; i++)
             {
                 mu_vol[i] = ext->rbpf->params[i].mu_vol;
@@ -510,6 +523,13 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
         }
     }
     ext->cooldown_remaining = 0;
+
+    /* Reset KL tempering state */
+    if (ext->kl_state)
+    {
+        rbpf_kl_reset(ext->kl_state);
+    }
+    ext->last_resampled = 0;
 
     /* Initialize policy engine state */
     ext->prev_sprt_regime = 0;
@@ -540,10 +560,8 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 2: RBPF FORWARD PASS
+     * PHASE 1: TRANSFORM OBSERVATION
      *═══════════════════════════════════════════════════════════════════════*/
-
-    /* Transform: y = log(r²) */
     rbpf_real_t y;
     if (rbpf_fabs(obs) < RBPF_REAL(1e-10))
     {
@@ -554,7 +572,27 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
         y = rbpf_log(obs * obs);
     }
 
-    rbpf_ksc_transition(rbpf);
+    /*═══════════════════════════════════════════════════════════════════════
+     * PHASE 2: REGIME TRANSITION (APF Kick when Hawkes fires)
+     *
+     * Standard: sample blindly from Π[old→new]
+     * APF Kick: weight by p(y|regime) → immediate crisis detection
+     *═══════════════════════════════════════════════════════════════════════*/
+    int apf_active = ext->hawkes.enabled &&
+                     (ext->hawkes.intensity > ext->hawkes.threshold);
+
+    if (apf_active)
+    {
+        rbpf_ksc_transition_apf(rbpf, y);
+    }
+    else
+    {
+        rbpf_ksc_transition(rbpf);
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * PHASE 3: KALMAN PREDICT + UPDATE
+     *═══════════════════════════════════════════════════════════════════════*/
     rbpf_ksc_predict(rbpf);
 
     rbpf_real_t marginal_lik;
@@ -567,11 +605,45 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
         marginal_lik = rbpf_ksc_update(rbpf, y);
     }
 
-    rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
-    output->resampled = rbpf_ksc_resample(rbpf);
+    /*═══════════════════════════════════════════════════════════════════════
+     * PHASE 4: KL TEMPERING
+     *
+     * When enabled, weights are applied with tempering factor β.
+     * Prevents particle collapse from extreme observations.
+     * Zombie detection triggers structural break.
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (ext->kl_tempering_enabled && ext->kl_state)
+    {
+#ifndef RBPF_USE_DOUBLE
+        RBPF_KL_Result kl_result = rbpf_kl_step(
+            ext->kl_state,
+            rbpf->log_weight,
+            rbpf->log_lik_increment,
+            n,
+            ext->last_resampled);
+
+        if (kl_result.zombie_detected)
+        {
+            ext->structural_break_signaled = 1;
+        }
+#else
+        /* KL tempering requires float mode */
+        /* TODO: Add double-precision wrapper if needed */
+#endif
+    }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 4: OUTLIER FRACTION
+     * PHASE 5: COMPUTE OUTPUTS + RESAMPLE
+     *═══════════════════════════════════════════════════════════════════════*/
+    rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
+    output->resampled = rbpf_ksc_resample(rbpf);
+    output->apf_active = apf_active;
+
+    /* Track for next tick's KL tempering */
+    ext->last_resampled = output->resampled;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * PHASE 6: OUTLIER FRACTION
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->robust_ocsn.enabled)
     {
@@ -582,13 +654,10 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     {
         ext->last_outlier_fraction = RBPF_REAL(0.0);
     }
-    if (output)
-    {
-        output->outlier_fraction = ext->last_outlier_fraction;
-    }
+    output->outlier_fraction = ext->last_outlier_fraction;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 5: ADAPTIVE FORGETTING
+     * PHASE 7: ADAPTIVE FORGETTING
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->adaptive_forgetting.enabled)
     {
@@ -615,22 +684,11 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 5.5: POLICY ENGINE (Regime Change Detection)
-     *
-     * The Extended layer owns the decision logic. Core only computes signals.
+     * PHASE 8: POLICY ENGINE (Regime Change Detection)
      *
      * Two independent detectors:
      *   1. P² Circuit Breaker: "Tail event - old world is dead"
      *   2. SPRT Transition: "Statistically confirmed regime flip"
-     *
-     * P² fires on 99.9th percentile surprise (data-driven, no heuristics).
-     * SPRT fires on accumulated log-likelihood evidence.
-     *
-     * When P² fires, we synchronize SPRT with the particle filter's
-     * dominant regime to prevent "ghost evidence" fighting the new reality.
-     *
-     * NOTE: Must run AFTER adaptive forgetting (which sets P² flag for
-     * THIS tick) but BEFORE Storvik (which needs structural_break_signaled).
      *═══════════════════════════════════════════════════════════════════════*/
     {
         int p2_tail_event = rbpf_ext_structural_break_detected(ext);
@@ -638,39 +696,18 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
 
         if (p2_tail_event)
         {
-            /*───────────────────────────────────────────────────────────────
-             * PATH 1: UNPRECEDENTED SURPRISE (Circuit Breaker)
-             *
-             * The P² algorithm says this tick is in the extreme tail.
-             * The old world model is dead. Full reset.
-             *───────────────────────────────────────────────────────────────*/
             output->regime_changed = 1;
             output->change_type = 1; /* Tail event */
 
-            /* Synchronize SPRT with reality:
-             * - Reset accumulated evidence (no "ghost" from old regime)
-             * - Force to particle filter's dominant regime
-             * - SPRT now validates the NEW regime instead of fighting it */
             sprt_multi_force_regime(&rbpf->sprt, output->dominant_regime);
-
-            /* Signal smoother for emergency flush (if enabled) */
             ext->structural_break_signaled = 1;
-
-            /* Update our tracking */
             ext->prev_sprt_regime = output->dominant_regime;
         }
         else if (sprt_flip)
         {
-            /*───────────────────────────────────────────────────────────────
-             * PATH 2: STATISTICAL TRANSITION (Drift/Regime Switch)
-             *
-             * SPRT has accumulated enough evidence to confirm a regime
-             * change. This is a "normal" transition - learn from it.
-             *───────────────────────────────────────────────────────────────*/
             output->regime_changed = 1;
             output->change_type = 2; /* SPRT transition */
 
-            /* Learn from this transition (Soft Dirichlet update) */
             if (rbpf->trans_prior_enabled)
             {
                 dirichlet_transition_update(&rbpf->trans_prior,
@@ -679,35 +716,17 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
                 rbpf_rebuild_trans_lut_from_dirichlet(rbpf);
             }
 
-            /* Update tracking */
             ext->prev_sprt_regime = output->smoothed_regime;
         }
         else
         {
-            /*───────────────────────────────────────────────────────────────
-             * PATH 3: STEADY STATE
-             *
-             * Normal operation. No regime change detected.
-             *───────────────────────────────────────────────────────────────*/
             output->regime_changed = 0;
             output->change_type = 0;
         }
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 6: STORVIK PARAMETER LEARNING (FILTERED + RESET-ON-BREAK)
-     *
-     * Architecture B: Filtered primary with reset on structural break.
-     *
-     * Why not smoothed-only:
-     *   - PARIS every tick = 5ms overhead
-     *   - L-tick lag kills crisis detection (3.3% accuracy!)
-     *   - No real-time learning = model always behind
-     *
-     * This approach:
-     *   - Filtered Storvik every tick (real-time, ~20μs)
-     *   - On structural break: reset to priors (clean slate)
-     *   - Crisis detection works (53% → back to normal)
+     * PHASE 9: STORVIK PARAMETER LEARNING
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->storvik_initialized)
     {
@@ -716,19 +735,9 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
             param_learn_apply_resampling(&ext->storvik, rbpf->indices, n);
         }
 
-        /*───────────────────────────────────────────────────────────────────
-         * ALWAYS: Filtered Storvik update (real-time parameter learning)
-         *───────────────────────────────────────────────────────────────────*/
         extract_particle_info_optimized(ext, output->resampled);
         param_learn_update(&ext->storvik, ext->particle_info, n);
 
-        /*───────────────────────────────────────────────────────────────────
-         * ON STRUCTURAL BREAK: Reset to priors
-         *
-         * P² circuit breaker fired → old regime is dead.
-         * Reset eliminates "arrogance" from old parameters.
-         * Model starts fresh, learns new regime quickly.
-         *───────────────────────────────────────────────────────────────────*/
         if (ext->structural_break_signaled)
         {
             param_learn_reset_to_priors(&ext->storvik);
@@ -739,7 +748,7 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     ext->structural_break_signaled = 0;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 7: TRANSITION LEARNING
+     * PHASE 10: TRANSITION LEARNING
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->trans_learn_enabled)
     {
@@ -773,13 +782,13 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 8: LAG BUFFERS & SYNC
+     * PHASE 11: LAG BUFFERS & SYNC
      *═══════════════════════════════════════════════════════════════════════*/
     update_lag_buffers(ext);
     sync_storvik_to_rbpf_optimized(ext);
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 9: POPULATE OUTPUT
+     * PHASE 12: POPULATE OUTPUT
      *═══════════════════════════════════════════════════════════════════════*/
     for (int r = 0; r < rbpf->n_regimes; r++)
     {
@@ -877,17 +886,6 @@ void rbpf_ext_signal_structural_break(RBPF_Extended *ext)
 
 /*═══════════════════════════════════════════════════════════════════════════
  * FORGETTING FACTOR DERIVATION FROM TRANSITION MATRIX
- *
- * Principle: λ should reflect expected regime duration.
- *   - If regime typically lasts D ticks, effective memory ≈ D × α
- *   - λ = 1 - 1/(α × E[dwell])
- *   - E[dwell] = 1 / (1 - P_stay)
- *
- * With α = 3 (memory spans ~3 regime durations), this gives:
- *   - High stickiness (P_stay = 0.98) → E[dwell] = 50 → λ ≈ 0.9933
- *   - Low stickiness (P_stay = 0.92) → E[dwell] = 12.5 → λ ≈ 0.9733
- *
- * This is principled: no magic numbers, derived from transition dynamics.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 void rbpf_ext_compute_forgetting_from_transitions(RBPF_Extended *ext, float alpha)
@@ -895,45 +893,32 @@ void rbpf_ext_compute_forgetting_from_transitions(RBPF_Extended *ext, float alph
     if (!ext || !ext->rbpf || !ext->storvik_initialized)
         return;
     if (alpha <= 0.0f)
-        alpha = 3.0f; /* Default: memory = 3× dwell time */
+        alpha = 3.0f;
 
     const int nr = ext->rbpf->n_regimes;
 
     for (int r = 0; r < nr; r++)
     {
-        /* Get P(stay in regime r) from base transition matrix */
         float p_stay = ext->base_trans_matrix[r * nr + r];
 
-        /* Sanity bounds */
         if (p_stay < 0.5f)
-            p_stay = 0.5f; /* Minimum 2-tick expected dwell */
+            p_stay = 0.5f;
         if (p_stay > 0.999f)
-            p_stay = 0.999f; /* Maximum 1000-tick expected dwell */
+            p_stay = 0.999f;
 
-        /* Expected dwell time in regime r */
         float expected_dwell = 1.0f / (1.0f - p_stay);
-
-        /* Memory horizon = α × expected dwell */
         float memory_ticks = alpha * expected_dwell;
-
-        /* Forgetting factor: λ = 1 - 1/memory */
         float lambda = 1.0f - 1.0f / memory_ticks;
 
-        /* Clamp to [0.95, 0.9999] for numerical stability */
         if (lambda < 0.95f)
             lambda = 0.95f;
         if (lambda > 0.9999f)
             lambda = 0.9999f;
 
-        /* Apply to Storvik */
         param_learn_set_regime_forgetting(&ext->storvik, r, lambda);
     }
 }
 
-/**
- * Auto-configure forgetting from current transition matrix
- * Uses default α = 3 (memory = 3× expected regime duration)
- */
 void rbpf_ext_auto_configure_forgetting(RBPF_Extended *ext)
 {
     rbpf_ext_compute_forgetting_from_transitions(ext, 3.0f);
@@ -1079,120 +1064,7 @@ void rbpf_ext_get_learning_stats(const RBPF_Extended *ext,
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * ADAPTIVE FORGETTING
- *
- * NOTE: Main functions (rbpf_ext_enable_adaptive_forgetting,
- *       rbpf_ext_enable_adaptive_forgetting_mode, rbpf_ext_enable_circuit_breaker)
- *       are implemented in rbpf_adaptive_forgetting.c
- *═══════════════════════════════════════════════════════════════════════════*/
-
-/*═══════════════════════════════════════════════════════════════════════════
- * DIAGNOSTICS
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void rbpf_ext_print_config(const RBPF_Extended *ext)
-{
-    if (!ext)
-        return;
-
-    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║   RBPF-KSC Extended Configuration                            ║\n");
-    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
-
-    const char *mode_str;
-    switch (ext->param_mode)
-    {
-    case RBPF_PARAM_DISABLED:
-        mode_str = "DISABLED";
-        break;
-    case RBPF_PARAM_LIU_WEST:
-        mode_str = "LIU-WEST";
-        break;
-    case RBPF_PARAM_STORVIK:
-        mode_str = "STORVIK";
-        break;
-    case RBPF_PARAM_HYBRID:
-        mode_str = "HYBRID";
-        break;
-    default:
-        mode_str = "UNKNOWN";
-        break;
-    }
-
-    printf("Parameter Learning: %s\n", mode_str);
-    printf("Particles:          %d\n", ext->rbpf->n_particles);
-    printf("Regimes:            %d\n", ext->rbpf->n_regimes);
-
-#if defined(USE_AVX512)
-    printf("SIMD:               AVX-512\n");
-#elif defined(USE_AVX2)
-    printf("SIMD:               AVX2\n");
-#else
-    printf("SIMD:               Scalar\n");
-#endif
-
-    if (ext->storvik_initialized)
-    {
-        printf("\nStorvik Sampling Intervals:\n");
-        for (int r = 0; r < ext->rbpf->n_regimes; r++)
-        {
-            printf("  R%d: every %d ticks\n", r,
-                   ext->storvik.config.sample_interval[r]);
-        }
-    }
-
-    printf("\n  Hawkes Self-Excitation:\n");
-    if (ext->hawkes.enabled)
-    {
-        printf("    Enabled:     YES\n");
-        printf("    μ (base):    %.4f\n", (float)ext->hawkes.mu);
-        printf("    α (jump):    %.4f\n", (float)ext->hawkes.alpha);
-        printf("    β (decay):   %.4f (half-life: %.1f ticks)\n",
-               (float)ext->hawkes.beta, 0.693f / (float)ext->hawkes.beta);
-        printf("    Threshold:   %.2f%%\n", (float)ext->hawkes.threshold * 100);
-    }
-    else
-    {
-        printf("    Enabled:     NO\n");
-    }
-
-    printf("\n  Robust OCSN (11th Component):\n");
-    if (ext->robust_ocsn.enabled)
-    {
-        printf("    Enabled:     YES\n");
-        for (int r = 0; r < ext->rbpf->n_regimes; r++)
-        {
-            printf("      R%d: prob=%.1f%%, var=%.1f\n", r,
-                   (float)ext->robust_ocsn.regime[r].prob * 100,
-                   (float)ext->robust_ocsn.regime[r].variance);
-        }
-    }
-    else
-    {
-        printf("    Enabled:     NO\n");
-    }
-
-    /* Print smoother config */
-    rbpf_ext_print_smoother_config(ext);
-
-    printf("\n");
-}
-
-void rbpf_ext_print_storvik_stats(const RBPF_Extended *ext, int regime)
-{
-    if (!ext || !ext->storvik_initialized)
-        return;
-    printf("\nStorvik Statistics (Regime %d):\n", regime);
-    param_learn_print_regime_stats(&ext->storvik, regime);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
  * KL TEMPERING API
- *
- * Information-geometric weight normalization. When enabled:
- * - rbpf_ksc_update() stores log_lik_increment but doesn't apply
- * - rbpf_kl_step() computes KL divergence and applies tempered weights
- * - Zombie detection triggers structural break signals
  *═══════════════════════════════════════════════════════════════════════════*/
 
 void rbpf_ext_enable_kl_tempering(RBPF_Extended *ext)
@@ -1201,11 +1073,14 @@ void rbpf_ext_enable_kl_tempering(RBPF_Extended *ext)
         return;
 
     ext->kl_tempering_enabled = 1;
-
-    /* Enable deferred weight mode on underlying RBPF */
     rbpf_ksc_set_deferred_weight_mode(ext->rbpf, 1);
 
-    /* Re-initialize KL state if it exists */
+    /* Allocate if not already done */
+    if (!ext->kl_state)
+    {
+        ext->kl_state = (RBPF_KL_State *)calloc(1, sizeof(RBPF_KL_State));
+    }
+
     if (ext->kl_state)
     {
         rbpf_kl_init(ext->kl_state, ext->rbpf->n_particles);
@@ -1218,8 +1093,6 @@ void rbpf_ext_disable_kl_tempering(RBPF_Extended *ext)
         return;
 
     ext->kl_tempering_enabled = 0;
-
-    /* Disable deferred weight mode - weights applied immediately */
     rbpf_ksc_set_deferred_weight_mode(ext->rbpf, 0);
 }
 
@@ -1311,4 +1184,122 @@ void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext)
     }
 
     printf("═══════════════════════════════════════════════════════════════\n");
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * DIAGNOSTICS
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void rbpf_ext_print_config(const RBPF_Extended *ext)
+{
+    if (!ext)
+        return;
+
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║   RBPF-KSC Extended Configuration                            ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    const char *mode_str;
+    switch (ext->param_mode)
+    {
+    case RBPF_PARAM_DISABLED:
+        mode_str = "DISABLED";
+        break;
+    case RBPF_PARAM_LIU_WEST:
+        mode_str = "LIU-WEST";
+        break;
+    case RBPF_PARAM_STORVIK:
+        mode_str = "STORVIK";
+        break;
+    case RBPF_PARAM_HYBRID:
+        mode_str = "HYBRID";
+        break;
+    default:
+        mode_str = "UNKNOWN";
+        break;
+    }
+
+    printf("Parameter Learning: %s\n", mode_str);
+    printf("Particles:          %d\n", ext->rbpf->n_particles);
+    printf("Regimes:            %d\n", ext->rbpf->n_regimes);
+
+#if defined(USE_AVX512)
+    printf("SIMD:               AVX-512\n");
+#elif defined(USE_AVX2)
+    printf("SIMD:               AVX2\n");
+#else
+    printf("SIMD:               Scalar\n");
+#endif
+
+    if (ext->storvik_initialized)
+    {
+        printf("\nStorvik Sampling Intervals:\n");
+        for (int r = 0; r < ext->rbpf->n_regimes; r++)
+        {
+            printf("  R%d: every %d ticks\n", r,
+                   ext->storvik.config.sample_interval[r]);
+        }
+    }
+
+    printf("\n  Hawkes Self-Excitation:\n");
+    if (ext->hawkes.enabled)
+    {
+        printf("    Enabled:     YES\n");
+        printf("    μ (base):    %.4f\n", (float)ext->hawkes.mu);
+        printf("    α (jump):    %.4f\n", (float)ext->hawkes.alpha);
+        printf("    β (decay):   %.4f (half-life: %.1f ticks)\n",
+               (float)ext->hawkes.beta, 0.693f / (float)ext->hawkes.beta);
+        printf("    Threshold:   %.2f%%\n", (float)ext->hawkes.threshold * 100);
+    }
+    else
+    {
+        printf("    Enabled:     NO\n");
+    }
+
+    printf("\n  Robust OCSN (11th Component):\n");
+    if (ext->robust_ocsn.enabled)
+    {
+        printf("    Enabled:     YES\n");
+        for (int r = 0; r < ext->rbpf->n_regimes; r++)
+        {
+            printf("      R%d: prob=%.1f%%, var=%.1f\n", r,
+                   (float)ext->robust_ocsn.regime[r].prob * 100,
+                   (float)ext->robust_ocsn.regime[r].variance);
+        }
+    }
+    else
+    {
+        printf("    Enabled:     NO\n");
+    }
+
+    printf("\n  KL Tempering:\n");
+    if (ext->kl_tempering_enabled)
+    {
+        printf("    Enabled:     YES\n");
+        if (ext->kl_state)
+        {
+            printf("    Last β:      %.4f\n", ext->kl_state->last_beta);
+            printf("    Last KL:     %.4f nats\n", ext->kl_state->last_kl);
+        }
+    }
+    else
+    {
+        printf("    Enabled:     NO\n");
+    }
+
+    printf("\n  APF Kick:\n");
+    printf("    Available:   YES (activates when Hawkes > threshold)\n");
+
+    /* Print smoother config */
+    rbpf_ext_print_smoother_config(ext);
+
+    printf("\n");
+}
+
+void rbpf_ext_print_storvik_stats(const RBPF_Extended *ext, int regime)
+{
+    if (!ext || !ext->storvik_initialized)
+        return;
+    printf("\nStorvik Statistics (Regime %d):\n", regime);
+    param_learn_print_regime_stats(&ext->storvik, regime);
 }

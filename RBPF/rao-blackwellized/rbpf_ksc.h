@@ -896,6 +896,8 @@ typedef float rbpf_real_t;
          *  SKEPTICAL: Watch for ρ → 0 (stiffening) */
         double vi_rho;
 
+        int apf_active;
+
     } RBPF_KSC_Output;
 
     /*─────────────────────────────────────────────────────────────────────────────
@@ -1570,6 +1572,10 @@ typedef float rbpf_real_t;
      * @param Pi_flat    Row-major K×K transition matrix
      */
     void rbpf_ksc_update_transition_matrix_threadsafe(RBPF_KSC *rbpf, const float *Pi_flat);
+
+    void rbpf_ksc_set_deferred_weight_mode(RBPF_KSC *rbpf, int enable);
+
+    void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf);
     
 
 #ifdef __cplusplus

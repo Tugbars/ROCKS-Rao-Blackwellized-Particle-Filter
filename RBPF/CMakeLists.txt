@@ -28,6 +28,8 @@ set(ROCKS_SOURCES
     rao-blackwellized/rbpf_ksc_output.c
     rao-blackwellized/rbpf_ksc_student_t.c
     rao-blackwellized/rbpf_kl_tempering.c
+
+    rao-blackwellized/rbpf_apf_kick.c
     
     # Adaptive components
     rao-blackwellized/rbpf_silverman.c   # Silverman bandwidth for regularization
@@ -212,6 +214,7 @@ set(ROCKS_HEADERS
     rao-blackwellized/rbpf_sprt.h
     rao-blackwellized/rbpf_mh_jitter.h
     rao-blackwellized/rbpf_kl_tempering.h
+    rao-blackwellized/rbpf_apf_kick.h
     rbpf_fisher_rao.h
 )
 
