@@ -147,7 +147,15 @@ if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_viz_e
     target_compile_definitions(rbpf_viz_export PRIVATE ${COMMON_DEFS})
 endif()
 
-
+add_executable(test_pgas_injection test/test_pgas_injection.c)
+target_link_libraries(test_pgas_injection PRIVATE
+    rocks
+    pgas_oracle
+    pgas_sliding
+    MKL::MKL
+)
+target_compile_options(test_pgas_injection PRIVATE ${COMMON_FLAGS})
+target_compile_definitions(test_pgas_injection PRIVATE ${COMMON_DEFS})
 #───────────────────────────────────────────────────────────────────────────────
 # Benchmark Executables
 #───────────────────────────────────────────────────────────────────────────────

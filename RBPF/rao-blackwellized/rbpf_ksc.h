@@ -1570,6 +1570,7 @@ typedef float rbpf_real_t;
      * @param Pi_flat    Row-major K×K transition matrix
      */
     void rbpf_ksc_update_transition_matrix_threadsafe(RBPF_KSC *rbpf, const float *Pi_flat);
+    
 
 #ifdef __cplusplus
 }
