@@ -43,7 +43,7 @@
 #define N_PARTICLES 512
 #define N_REGIMES 4
 #define PGAS_WINDOW 500
-#define PGAS_SLIDE 50
+#define PGAS_SLIDE 55
 #define PGAS_PARTICLES 64
 #define PGAS_SWEEPS 2
 #define PGAS_THREADS 8
@@ -683,7 +683,7 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
     /* Create RBPF */
     RBPF_Extended *ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
     rbpf_ext_enable_kl_tempering(ext);
-    rbpf_ext_enable_smoothed_storvik(ext, 5);
+    rbpf_ext_enable_smoothed_storvik(ext, 50);
 
     /* Regime params */
     rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.299f, 0.080f);
