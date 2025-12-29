@@ -30,6 +30,7 @@
 
 #include "rbpf_ksc.h"
 #include "rbpf_param_learn.h"
+#include "hawkes_integrator.h"
 #include "p2_quantile.h"
 
 #include <stdint.h>
@@ -69,39 +70,6 @@ extern "C"
         RBPF_PRESET_COMMODITIES,
         RBPF_PRESET_BONDS
     } RBPF_AssetPreset;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * HAWKES STATE
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    typedef struct
-    {
-        int enabled;
-
-        /* Core parameters */
-        rbpf_real_t mu;        /* Baseline intensity */
-        rbpf_real_t alpha;     /* Jump magnitude */
-        rbpf_real_t beta;      /* Decay rate */
-        rbpf_real_t threshold; /* |return| threshold for excitation */
-
-        /* State */
-        rbpf_real_t intensity;      /* Current λ(t) */
-        rbpf_real_t intensity_prev; /* Previous for hysteresis */
-
-        /* Transition modification */
-        rbpf_real_t boost_scale; /* How much to boost transitions */
-        rbpf_real_t boost_cap;   /* Maximum boost */
-        int lut_dirty;           /* 1 if LUT was modified */
-
-        /* Adaptive decay (regime-dependent β) */
-        int adaptive_beta_enabled;
-        rbpf_real_t beta_regime_scale[RBPF_MAX_REGIMES];
-
-    } RBPF_HawkesState;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * NOTE: RBPF_OutlierParams and RBPF_RobustOCSN are defined in rbpf_ksc.h
-     *═══════════════════════════════════════════════════════════════════════════*/
 
     /*═══════════════════════════════════════════════════════════════════════════
      * FORWARD DECLARATION (full struct in rbpf_fixed_lag_smoother.h)
@@ -236,7 +204,6 @@ extern "C"
         /*───────────────────────────────────────────────────────────────────────
          * HAWKES SELF-EXCITATION
          *───────────────────────────────────────────────────────────────────────*/
-        RBPF_HawkesState hawkes;
         rbpf_real_t base_trans_matrix[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
         rbpf_real_t last_hawkes_intensity;
 
@@ -315,6 +282,11 @@ extern "C"
         uint64_t tick_count;
 
         int last_resampled;
+
+        HawkesIntegrator hawkes_integrator;
+        int apf_kick_enabled;
+        float apf_surprise_threshold;
+
 
     } RBPF_Extended;
 
@@ -639,6 +611,20 @@ extern "C"
      * @brief Print KL tempering diagnostics
      */
     void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext);
+
+    /* APF Kick Configuration */
+    void rbpf_ext_enable_apf_kick(RBPF_Extended *ext, int enable);
+    int rbpf_ext_apf_kick_enabled(const RBPF_Extended *ext);
+    void rbpf_ext_configure_hawkes(RBPF_Extended *ext, const HawkesIntegratorConfig *cfg);
+    void rbpf_ext_configure_hawkes_params(RBPF_Extended *ext,
+                                          float mu, float alpha, float beta,
+                                          float event_threshold);
+    float rbpf_ext_get_hawkes_intensity(const RBPF_Extended *ext);
+    float rbpf_ext_get_hawkes_surprise(const RBPF_Extended *ext);
+    int rbpf_ext_hawkes_is_ready(const RBPF_Extended *ext);
+    void rbpf_ext_print_hawkes_state(const RBPF_Extended *ext);
+    void rbpf_ext_set_apf_surprise_threshold(RBPF_Extended *ext, float threshold);
+float rbpf_ext_get_apf_surprise_threshold(const RBPF_Extended *ext);
 
 #ifdef __cplusplus
 }

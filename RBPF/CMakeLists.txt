@@ -45,6 +45,9 @@ if(RBPF_ENABLE_STORVIK)
         storvik/rbpf_adaptive_forgetting.c
         storvik/rbpf_fixed_lag_smoother.c 
 
+
+        storvik/rbpf_ext_config.c 
+        storvik/rbpf_ext_diagnostics.c
         storvik/rbpf_ksc_param_integration.c      # Core: lifecycle, step, config
         storvik/rbpf_ext_smoothed_storvik.c       # PARIS smoothed Storvik
 
@@ -71,11 +74,14 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/hawkes_signal  # ADD THIS
+
 )
 
 target_link_libraries(rocks 
     PUBLIC 
         MKL::MKL
+        hawkes_integrator 
 )
 
 target_compile_options(rocks PRIVATE ${COMMON_FLAGS})

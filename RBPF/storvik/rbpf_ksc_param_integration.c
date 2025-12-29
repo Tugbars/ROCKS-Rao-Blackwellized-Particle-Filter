@@ -1,18 +1,17 @@
 /**
  * @file rbpf_ksc_param_integration.c
- * @brief Core: Lifecycle, Step Function, Basic Configuration
+ * @brief Core: Lifecycle + Step Function + Internal Helpers
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * This file contains:
  *   - rbpf_ext_create(), rbpf_ext_destroy(), rbpf_ext_init()
  *   - rbpf_ext_step() - the hot path
- *   - Basic configuration functions
- *   - Transition learning
- *   - Parameter access
- *   - Diagnostics
+ *   - Internal helpers (SIMD, sync, lag buffers, transition counts)
  *
  * Related files:
- *   - rbpf_ext_hawkes.c         Hawkes + Robust OCSN + Presets
+ *   - rbpf_ext_config.c             Configuration functions
+ *   - rbpf_ext_diagnostics.c        Getters and print functions
+ *   - rbpf_ext_hawkes.c             Hawkes + Robust OCSN + Presets
  *   - rbpf_ext_smoothed_storvik.c   PARIS fixed-lag smoother
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -23,11 +22,15 @@
 #include "rbpf_dirichlet_transition.h"
 #include "rbpf_kl_tempering.h"
 #include "rbpf_apf_kick.h"
+#include "hawkes_integrator.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <inttypes.h>
+
+/* Forward declarations */
+extern void rbpf_rebuild_trans_lut_from_dirichlet(RBPF_KSC *rbpf);
 
 /*═══════════════════════════════════════════════════════════════════════════
  * SIMD AND CACHE CONFIGURATION
@@ -376,26 +379,11 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     /* Per-particle parameter mode */
     ext->rbpf->use_learned_params = 1;
 
-    /* Hawkes defaults (disabled) */
-    ext->hawkes.enabled = 0;
-    ext->hawkes.mu = RBPF_REAL(0.05);
-    ext->hawkes.alpha = RBPF_REAL(0.3);
-    ext->hawkes.beta = RBPF_REAL(0.1);
-    ext->hawkes.threshold = RBPF_REAL(0.03);
-    ext->hawkes.intensity = ext->hawkes.mu;
-    ext->hawkes.intensity_prev = ext->hawkes.mu;
-    ext->hawkes.boost_scale = RBPF_REAL(0.1);
-    ext->hawkes.boost_cap = RBPF_REAL(0.25);
-    ext->hawkes.lut_dirty = 0;
-    ext->hawkes.adaptive_beta_enabled = 1;
-    for (int r = 0; r < RBPF_MAX_REGIMES; r++)
-    {
-        ext->hawkes.beta_regime_scale[r] = RBPF_REAL(1.0);
-    }
-    ext->hawkes.beta_regime_scale[0] = RBPF_REAL(2.0);
-    ext->hawkes.beta_regime_scale[1] = RBPF_REAL(1.5);
-    ext->hawkes.beta_regime_scale[2] = RBPF_REAL(1.0);
-    ext->hawkes.beta_regime_scale[3] = RBPF_REAL(0.5);
+    /* Hawkes Integrator for APF Kick */
+    HawkesIntegratorConfig hawkes_cfg = hawkes_integrator_config_defaults();
+    hawkes_integrator_init(&ext->hawkes_integrator, &hawkes_cfg);
+    ext->apf_kick_enabled = 0;          /* Off by default */
+    ext->apf_surprise_threshold = 0.5f; /* APF activates when surprise > this */
 
     memset(ext->base_trans_matrix, 0, sizeof(ext->base_trans_matrix));
 
@@ -455,6 +443,9 @@ void rbpf_ext_destroy(RBPF_Extended *ext)
 
     /* KL Tempering state */
     free(ext->kl_state);
+
+    /* Hawkes Integrator */
+    hawkes_integrator_free(&ext->hawkes_integrator);
 
 #if defined(_MSC_VER)
     _aligned_free(ext->particle_info);
@@ -531,6 +522,9 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
     }
     ext->last_resampled = 0;
 
+    /* Reset Hawkes integrator */
+    hawkes_integrator_reset(&ext->hawkes_integrator);
+
     /* Initialize policy engine state */
     ext->prev_sprt_regime = 0;
     ext->structural_break_signaled = 0;
@@ -573,13 +567,31 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 2: REGIME TRANSITION (APF Kick when Hawkes fires)
+     * PHASE 2: HAWKES UPDATE + REGIME TRANSITION (APF Kick when crisis)
      *
-     * Standard: sample blindly from Π[old→new]
-     * APF Kick: weight by p(y|regime) → immediate crisis detection
+     * Hawkes detects sustained intensity elevation.
+     * APF kick activates while intensity is elevated above baseline,
+     * weighting transitions by p(y|regime) for immediate crisis detection.
+     * Deactivates when intensity decays back to baseline (crisis over).
      *═══════════════════════════════════════════════════════════════════════*/
-    int apf_active = ext->hawkes.enabled &&
-                     (ext->hawkes.intensity > ext->hawkes.threshold);
+    int apf_active = 0;
+
+    if (ext->apf_kick_enabled)
+    {
+        /* Update Hawkes with observed return */
+        HawkesIntegratorResult hawkes_result = hawkes_integrator_update(
+            &ext->hawkes_integrator,
+            (float)ext->tick_count,
+            (float)obs);
+
+        /* APF kick while intensity is elevated above baseline
+         * surprise_sigma > 0 means intensity > EMA baseline
+         * Use configurable threshold to avoid noise */
+        apf_active = (hawkes_result.surprise_sigma > ext->apf_surprise_threshold);
+
+        /* Store for diagnostics */
+        ext->last_hawkes_intensity = (rbpf_real_t)hawkes_result.integrated_intensity;
+    }
 
     if (apf_active)
     {
@@ -637,7 +649,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
      *═══════════════════════════════════════════════════════════════════════*/
     rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
     output->resampled = rbpf_ksc_resample(rbpf);
-    output->apf_active = apf_active;
 
     /* Track for next tick's KL tempering */
     ext->last_resampled = output->resampled;
@@ -796,510 +807,4 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
                                     &output->learned_mu_vol[r],
                                     &output->learned_sigma_vol[r]);
     }
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * BASIC CONFIGURATION
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void rbpf_ext_set_regime_params(RBPF_Extended *ext, int regime,
-                                rbpf_real_t theta, rbpf_real_t mu_vol,
-                                rbpf_real_t sigma_vol)
-{
-    if (!ext || regime < 0 || regime >= RBPF_MAX_REGIMES)
-        return;
-
-    rbpf_ksc_set_regime_params(ext->rbpf, regime, theta, mu_vol, sigma_vol);
-
-    if (ext->storvik_initialized)
-    {
-        rbpf_real_t phi = RBPF_REAL(1.0) - theta;
-        param_learn_set_prior(&ext->storvik, regime, mu_vol, phi, sigma_vol);
-    }
-}
-
-void rbpf_ext_build_transition_lut(RBPF_Extended *ext, const rbpf_real_t *trans_matrix)
-{
-    if (!ext)
-        return;
-
-    const int n = ext->rbpf->n_regimes;
-    memcpy(ext->base_trans_matrix, trans_matrix, n * n * sizeof(rbpf_real_t));
-    rbpf_ksc_build_transition_lut(ext->rbpf, trans_matrix);
-    ext->hawkes.lut_dirty = 0;
-}
-
-void rbpf_ext_set_storvik_interval(RBPF_Extended *ext, int regime, int interval)
-{
-    if (!ext || !ext->storvik_initialized)
-        return;
-    if (regime < 0 || regime >= PARAM_LEARN_MAX_REGIMES)
-        return;
-    ext->storvik.config.sample_interval[regime] = interval;
-}
-
-void rbpf_ext_set_hft_mode(RBPF_Extended *ext, int enable)
-{
-    if (!ext || !ext->storvik_initialized)
-        return;
-
-    if (enable)
-    {
-        ext->storvik.config.sample_interval[0] = 100;
-        ext->storvik.config.sample_interval[1] = 50;
-        ext->storvik.config.sample_interval[2] = 20;
-        ext->storvik.config.sample_interval[3] = 5;
-    }
-    else
-    {
-        for (int r = 0; r < PARAM_LEARN_MAX_REGIMES; r++)
-        {
-            ext->storvik.config.sample_interval[r] = 1;
-        }
-    }
-}
-
-void rbpf_ext_set_full_update_mode(RBPF_Extended *ext)
-{
-    if (!ext || !ext->storvik_initialized)
-        return;
-
-    for (int r = 0; r < PARAM_LEARN_MAX_REGIMES; r++)
-    {
-        ext->storvik.config.sample_interval[r] = 1;
-    }
-    ext->storvik.config.enable_global_tick_skip = false;
-    ext->storvik.config.enable_forgetting = true;
-    ext->storvik.config.forgetting_lambda = 0.997;
-}
-
-void rbpf_ext_signal_structural_break(RBPF_Extended *ext)
-{
-    if (!ext)
-        return;
-    ext->structural_break_signaled = 1;
-    if (ext->storvik_initialized)
-    {
-        param_learn_signal_structural_break(&ext->storvik);
-    }
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * FORGETTING FACTOR DERIVATION FROM TRANSITION MATRIX
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void rbpf_ext_compute_forgetting_from_transitions(RBPF_Extended *ext, float alpha)
-{
-    if (!ext || !ext->rbpf || !ext->storvik_initialized)
-        return;
-    if (alpha <= 0.0f)
-        alpha = 3.0f;
-
-    const int nr = ext->rbpf->n_regimes;
-
-    for (int r = 0; r < nr; r++)
-    {
-        float p_stay = ext->base_trans_matrix[r * nr + r];
-
-        if (p_stay < 0.5f)
-            p_stay = 0.5f;
-        if (p_stay > 0.999f)
-            p_stay = 0.999f;
-
-        float expected_dwell = 1.0f / (1.0f - p_stay);
-        float memory_ticks = alpha * expected_dwell;
-        float lambda = 1.0f - 1.0f / memory_ticks;
-
-        if (lambda < 0.95f)
-            lambda = 0.95f;
-        if (lambda > 0.9999f)
-            lambda = 0.9999f;
-
-        param_learn_set_regime_forgetting(&ext->storvik, r, lambda);
-    }
-}
-
-void rbpf_ext_auto_configure_forgetting(RBPF_Extended *ext)
-{
-    rbpf_ext_compute_forgetting_from_transitions(ext, 3.0f);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * TRANSITION LEARNING
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void rbpf_ext_enable_transition_learning(RBPF_Extended *ext, int enable)
-{
-    if (!ext)
-        return;
-    ext->trans_learn_enabled = enable;
-    if (enable)
-        rbpf_ext_reset_transition_counts(ext);
-}
-
-void rbpf_ext_configure_transition_learning(RBPF_Extended *ext,
-                                            double forgetting,
-                                            double prior_diag,
-                                            double prior_off,
-                                            int update_interval)
-{
-    if (!ext)
-        return;
-    ext->trans_forgetting = forgetting;
-    ext->trans_prior_diag = prior_diag;
-    ext->trans_prior_off = prior_off;
-    ext->trans_update_interval = update_interval;
-}
-
-void rbpf_ext_reset_transition_counts(RBPF_Extended *ext)
-{
-    if (!ext)
-        return;
-    memset(ext->trans_counts, 0, sizeof(ext->trans_counts));
-    ext->trans_ticks_since_update = 0;
-}
-
-double rbpf_ext_get_transition_prob(const RBPF_Extended *ext, int from, int to)
-{
-    if (!ext || !ext->rbpf)
-        return 0.0;
-    if (from < 0 || from >= ext->rbpf->n_regimes)
-        return 0.0;
-    if (to < 0 || to >= ext->rbpf->n_regimes)
-        return 0.0;
-
-    const int nr = ext->rbpf->n_regimes;
-    const double prior = (from == to) ? ext->trans_prior_diag : ext->trans_prior_off;
-
-    double row_sum = 0.0;
-    for (int j = 0; j < nr; j++)
-    {
-        double p = (from == j) ? ext->trans_prior_diag : ext->trans_prior_off;
-        row_sum += ext->trans_counts[from][j] + p;
-    }
-
-    return (ext->trans_counts[from][to] + prior) / row_sum;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * PARAMETER ACCESS
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void rbpf_ext_get_learned_params(const RBPF_Extended *ext, int regime,
-                                 rbpf_real_t *mu_vol, rbpf_real_t *sigma_vol)
-{
-    if (!ext || regime < 0 || regime >= RBPF_MAX_REGIMES)
-    {
-        if (mu_vol)
-            *mu_vol = RBPF_REAL(-4.6);
-        if (sigma_vol)
-            *sigma_vol = RBPF_REAL(0.1);
-        return;
-    }
-
-    switch (ext->param_mode)
-    {
-    case RBPF_PARAM_STORVIK:
-    case RBPF_PARAM_HYBRID:
-        if (ext->storvik_initialized)
-        {
-            RegimeParams params;
-            param_learn_get_params(&ext->storvik, 0, regime, &params);
-            if (mu_vol)
-                *mu_vol = (rbpf_real_t)params.mu;
-            if (sigma_vol)
-                *sigma_vol = (rbpf_real_t)params.sigma;
-        }
-        else
-        {
-            if (mu_vol)
-                *mu_vol = ext->rbpf->params[regime].mu_vol;
-            if (sigma_vol)
-                *sigma_vol = ext->rbpf->params[regime].sigma_vol;
-        }
-        break;
-
-    default:
-        if (mu_vol)
-            *mu_vol = ext->rbpf->params[regime].mu_vol;
-        if (sigma_vol)
-            *sigma_vol = ext->rbpf->params[regime].sigma_vol;
-        break;
-    }
-}
-
-void rbpf_ext_get_storvik_summary(const RBPF_Extended *ext, int regime,
-                                  RegimeParams *summary)
-{
-    if (!ext || !summary || !ext->storvik_initialized)
-    {
-        if (summary)
-            memset(summary, 0, sizeof(RegimeParams));
-        return;
-    }
-    param_learn_get_params(&ext->storvik, 0, regime, summary);
-}
-
-void rbpf_ext_get_learning_stats(const RBPF_Extended *ext,
-                                 uint64_t *stat_updates,
-                                 uint64_t *samples_drawn,
-                                 uint64_t *samples_skipped)
-{
-    if (!ext || !ext->storvik_initialized)
-    {
-        if (stat_updates)
-            *stat_updates = 0;
-        if (samples_drawn)
-            *samples_drawn = 0;
-        if (samples_skipped)
-            *samples_skipped = 0;
-        return;
-    }
-    if (stat_updates)
-        *stat_updates = ext->storvik.total_stat_updates;
-    if (samples_drawn)
-        *samples_drawn = ext->storvik.total_samples_drawn;
-    if (samples_skipped)
-        *samples_skipped = ext->storvik.samples_skipped_load;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * KL TEMPERING API
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void rbpf_ext_enable_kl_tempering(RBPF_Extended *ext)
-{
-    if (!ext)
-        return;
-
-    ext->kl_tempering_enabled = 1;
-    rbpf_ksc_set_deferred_weight_mode(ext->rbpf, 1);
-
-    /* Allocate if not already done */
-    if (!ext->kl_state)
-    {
-        ext->kl_state = (RBPF_KL_State *)calloc(1, sizeof(RBPF_KL_State));
-    }
-
-    if (ext->kl_state)
-    {
-        rbpf_kl_init(ext->kl_state, ext->rbpf->n_particles);
-    }
-}
-
-void rbpf_ext_disable_kl_tempering(RBPF_Extended *ext)
-{
-    if (!ext)
-        return;
-
-    ext->kl_tempering_enabled = 0;
-    rbpf_ksc_set_deferred_weight_mode(ext->rbpf, 0);
-}
-
-int rbpf_ext_kl_tempering_enabled(const RBPF_Extended *ext)
-{
-    return ext ? ext->kl_tempering_enabled : 0;
-}
-
-float rbpf_ext_get_last_beta(const RBPF_Extended *ext)
-{
-    if (!ext || !ext->kl_state)
-        return 1.0f;
-    return ext->kl_state->last_beta;
-}
-
-float rbpf_ext_get_last_kl(const RBPF_Extended *ext)
-{
-    if (!ext || !ext->kl_state)
-        return 0.0f;
-    return ext->kl_state->last_kl;
-}
-
-uint64_t rbpf_ext_get_zombie_resets(const RBPF_Extended *ext)
-{
-    if (!ext || !ext->kl_state)
-        return 0;
-    return ext->kl_state->zombie_resets;
-}
-
-void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext)
-{
-    if (!ext)
-    {
-        printf("KL Tempering: ext is NULL\n");
-        return;
-    }
-
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  KL Tempering Diagnostics\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  Enabled:           %s\n", ext->kl_tempering_enabled ? "YES" : "NO");
-
-    if (ext->kl_tempering_enabled && ext->kl_state)
-    {
-        RBPF_KL_State *kl = ext->kl_state;
-
-        printf("  KL ceiling:        %.4f nats (log N)\n", kl->kl_ceiling);
-        printf("  Beta floor:        %.2f\n", kl->beta_floor);
-        printf("\n");
-        printf("  Last tick:\n");
-        printf("    KL divergence:   %.4f nats\n", kl->last_kl);
-        printf("    Beta applied:    %.4f\n", kl->last_beta);
-        printf("    log(Z_old):      %.4f\n", kl->log_Z_old);
-        printf("\n");
-        printf("  Counters:\n");
-        printf("    Ticks processed: %" PRIu64 "\n", kl->ticks_processed);
-        printf("    Hard clamps:     %" PRIu64 " (%.3f%%)\n",
-               kl->hard_clamp_count,
-               kl->ticks_processed > 0 ? 100.0 * kl->hard_clamp_count / kl->ticks_processed : 0.0);
-        printf("    Soft dampens:    %" PRIu64 " (%.3f%%)\n",
-               kl->soft_damp_count,
-               kl->ticks_processed > 0 ? 100.0 * kl->soft_damp_count / kl->ticks_processed : 0.0);
-        printf("    Zombie resets:   %" PRIu64 "\n", kl->zombie_resets);
-        printf("\n");
-        printf("  Zombie state:\n");
-        printf("    Consecutive low: %d / %d\n",
-               kl->consecutive_damped_ticks, kl->max_damped_before_reset);
-        printf("    Currently zombie: %s\n",
-               kl->consecutive_damped_ticks >= kl->max_damped_before_reset ? "YES" : "NO");
-        printf("\n");
-        printf("  P² Quantile (p95):\n");
-        printf("    Warmup:          %s (%" PRIu64 " ticks)\n",
-               kl->warmup_complete ? "COMPLETE" : "IN PROGRESS",
-               kl->ticks_processed);
-        printf("    Current p95:     %.4f nats\n", kl->kl_p95);
-        printf("\n");
-        printf("  Extremes:\n");
-        printf("    Min beta seen:   %.4f\n", kl->min_beta_seen);
-        printf("    Max KL seen:     %.4f nats\n", kl->max_kl_seen);
-    }
-    else if (!ext->kl_tempering_enabled)
-    {
-        printf("  (Enable with rbpf_ext_enable_kl_tempering())\n");
-    }
-    else
-    {
-        printf("  KL state not initialized\n");
-    }
-
-    printf("═══════════════════════════════════════════════════════════════\n");
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * DIAGNOSTICS
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void rbpf_ext_print_config(const RBPF_Extended *ext)
-{
-    if (!ext)
-        return;
-
-    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║   RBPF-KSC Extended Configuration                            ║\n");
-    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
-
-    const char *mode_str;
-    switch (ext->param_mode)
-    {
-    case RBPF_PARAM_DISABLED:
-        mode_str = "DISABLED";
-        break;
-    case RBPF_PARAM_LIU_WEST:
-        mode_str = "LIU-WEST";
-        break;
-    case RBPF_PARAM_STORVIK:
-        mode_str = "STORVIK";
-        break;
-    case RBPF_PARAM_HYBRID:
-        mode_str = "HYBRID";
-        break;
-    default:
-        mode_str = "UNKNOWN";
-        break;
-    }
-
-    printf("Parameter Learning: %s\n", mode_str);
-    printf("Particles:          %d\n", ext->rbpf->n_particles);
-    printf("Regimes:            %d\n", ext->rbpf->n_regimes);
-
-#if defined(USE_AVX512)
-    printf("SIMD:               AVX-512\n");
-#elif defined(USE_AVX2)
-    printf("SIMD:               AVX2\n");
-#else
-    printf("SIMD:               Scalar\n");
-#endif
-
-    if (ext->storvik_initialized)
-    {
-        printf("\nStorvik Sampling Intervals:\n");
-        for (int r = 0; r < ext->rbpf->n_regimes; r++)
-        {
-            printf("  R%d: every %d ticks\n", r,
-                   ext->storvik.config.sample_interval[r]);
-        }
-    }
-
-    printf("\n  Hawkes Self-Excitation:\n");
-    if (ext->hawkes.enabled)
-    {
-        printf("    Enabled:     YES\n");
-        printf("    μ (base):    %.4f\n", (float)ext->hawkes.mu);
-        printf("    α (jump):    %.4f\n", (float)ext->hawkes.alpha);
-        printf("    β (decay):   %.4f (half-life: %.1f ticks)\n",
-               (float)ext->hawkes.beta, 0.693f / (float)ext->hawkes.beta);
-        printf("    Threshold:   %.2f%%\n", (float)ext->hawkes.threshold * 100);
-    }
-    else
-    {
-        printf("    Enabled:     NO\n");
-    }
-
-    printf("\n  Robust OCSN (11th Component):\n");
-    if (ext->robust_ocsn.enabled)
-    {
-        printf("    Enabled:     YES\n");
-        for (int r = 0; r < ext->rbpf->n_regimes; r++)
-        {
-            printf("      R%d: prob=%.1f%%, var=%.1f\n", r,
-                   (float)ext->robust_ocsn.regime[r].prob * 100,
-                   (float)ext->robust_ocsn.regime[r].variance);
-        }
-    }
-    else
-    {
-        printf("    Enabled:     NO\n");
-    }
-
-    printf("\n  KL Tempering:\n");
-    if (ext->kl_tempering_enabled)
-    {
-        printf("    Enabled:     YES\n");
-        if (ext->kl_state)
-        {
-            printf("    Last β:      %.4f\n", ext->kl_state->last_beta);
-            printf("    Last KL:     %.4f nats\n", ext->kl_state->last_kl);
-        }
-    }
-    else
-    {
-        printf("    Enabled:     NO\n");
-    }
-
-    printf("\n  APF Kick:\n");
-    printf("    Available:   YES (activates when Hawkes > threshold)\n");
-
-    /* Print smoother config */
-    rbpf_ext_print_smoother_config(ext);
-
-    printf("\n");
-}
-
-void rbpf_ext_print_storvik_stats(const RBPF_Extended *ext, int regime)
-{
-    if (!ext || !ext->storvik_initialized)
-        return;
-    printf("\nStorvik Statistics (Regime %d):\n", regime);
-    param_learn_print_regime_stats(&ext->storvik, regime);
 }

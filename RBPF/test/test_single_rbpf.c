@@ -361,6 +361,13 @@ static void run_single_rbpf(SyntheticData *data, TickRecord *records,
     rbpf_ext_enable_adaptive_forgetting_mode(ext, ADAPT_SIGNAL_REGIME);
     rbpf_ext_enable_circuit_breaker(ext, 0.999, 100);
 
+    /* Option 2: Custom Hawkes config */
+    HawkesIntegratorConfig cfg = hawkes_integrator_config_responsive();
+    rbpf_ext_configure_hawkes(ext, &cfg);
+
+    //rbpf_ext_enable_apf_kick(ext, 1);
+    //rbpf_ext_set_apf_surprise_threshold(ext, 1.2f); /* Default, tune as needed */
+
     /* Robust OCSN */
     ext->robust_ocsn.enabled = 1;
     ext->robust_ocsn.regime[0].prob = 0.02f;
