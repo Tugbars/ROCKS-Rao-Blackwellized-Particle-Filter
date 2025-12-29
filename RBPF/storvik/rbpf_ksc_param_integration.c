@@ -789,14 +789,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     }
 }
 
-void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
-                       rbpf_real_t obs_next, RBPF_KSC_Output *output)
-{
-    /* APF disabled - fallback to standard step */
-    rbpf_ext_step(ext, obs_current, output);
-    (void)obs_next;
-}
-
 /*═══════════════════════════════════════════════════════════════════════════
  * BASIC CONFIGURATION
  *═══════════════════════════════════════════════════════════════════════════*/
