@@ -849,8 +849,7 @@ void rbpf_ksc_update_transition_matrix_threadsafe(RBPF_KSC *rbpf, const float *P
     rbpf_real_t trans[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
     int K = rbpf->n_regimes;
     
-    for (int i = 0; i < K * K; i++)
-    {
+    for (int i = 0; i < K * K; i++) {
         trans[i] = (rbpf_real_t)Pi_flat[i];
     }
     
