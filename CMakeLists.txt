@@ -84,6 +84,9 @@ add_subdirectory(RBPF)
 # PGAS + PARIS library (offline smoothing / lifeboat)
 add_subdirectory(PGAS)
 
+# Hawkes MLE subdirectory
+add_subdirectory(Hawkes_MLE)
+
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
 #───────────────────────────────────────────────────────────────────────────────

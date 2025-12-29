@@ -178,6 +178,27 @@ add_executable(test_stone1_diagnostic
 )
 target_link_libraries(test_stone1_diagnostic PRIVATE rocks)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test: Hawkes Timing Test (MLE calibration + timing validation)
+# ═══════════════════════════════════════════════════════════════════════════════
+add_executable(test_hawkes_timing
+    test/test_hawkes_timing.c
+)
+
+target_include_directories(test_hawkes_timing PRIVATE
+    ${CMAKE_SOURCE_DIR}/PGAS/hawkes_signal      # hawkes_integrator.h
+    ${CMAKE_SOURCE_DIR}/Hawkes_MLE              # smc2_hawkes_mle.h
+)
+
+target_link_libraries(test_hawkes_timing PRIVATE
+    hawkes_integrator    # Real-time Hawkes (from PGAS/hawkes_signal)
+    hawkes_mle           # MLE calibration (from Hawkes_MLE)
+)
+
+target_compile_options(test_hawkes_timing PRIVATE ${COMMON_FLAGS})
+
+# Register with CTest
+add_test(NAME hawkes_timing COMMAND test_hawkes_timing)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Installation
