@@ -4,26 +4,9 @@
  *
  * Architecture from Integration Schema:
  *
- *   PGAS = Parameter Server. Provides the physics (Π).
+ *   PGAS = Parameter Server. Provides the physics (Pi).
  *   RBPF = Game Client. Plays the game with given physics.
  *   Hawkes = Circuit Breaker. Disconnects during crisis.
- *
- * This module implements:
- *   1. Background PGAS loop (Cores 2-31, OpenMP)
- *   2. Double-buffer channel for lock-free Π publication
- *   3. Integration points for tick loop hot swap
- *
- * Threading:
- *   ┌─────────────────────────────────────────────────────────────────┐
- *   │   RBPF (2 pthreads)              PGAS Oracle (30 OpenMP)       │
- *   │   Cores 0-1                      Cores 2-31                    │
- *   │   40μs per tick                  ~100ms-1s per batch           │
- *   └─────────────────────────────────────────────────────────────────┘
- *
- * Data Flow:
- *   Tick Loop:  push observation → [ring buffer] 
- *   PGAS Loop:  [ring buffer] → extract → sweeps → Π → [channel]
- *   Tick Loop:  [channel] → hot swap (if ready AND not crisis)
  */
 
 #ifndef PGAS_ORACLE_H
@@ -31,277 +14,177 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdatomic.h>
-#include <pthread.h>
+#include "pgas_compat.h"
 
-#ifdef __cplusplus
-extern "C" {
+/*===========================================================================
+ * PLATFORM-SPECIFIC THREADING
+ *===========================================================================*/
+
+#ifdef _MSC_VER
+/* Windows threading */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+typedef HANDLE pgas_thread_t;
+typedef CRITICAL_SECTION pgas_mutex_t;
+typedef CONDITION_VARIABLE pgas_cond_t;
+
+#define PGAS_ALIGN(x) __declspec(align(x))
+#else
+/* POSIX threading */
+#include <pthread.h>
+typedef pthread_t pgas_thread_t;
+typedef pthread_mutex_t pgas_mutex_t;
+typedef pthread_cond_t pgas_cond_t;
+
+#define PGAS_ALIGN(x) __attribute__((aligned(x)))
 #endif
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * FORWARD DECLARATIONS
- *═══════════════════════════════════════════════════════════════════════════════*/
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
-typedef struct PGASSlidingState PGASSlidingState;
+    /*===========================================================================
+     * FORWARD DECLARATIONS
+     *===========================================================================*/
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * CONFIGURATION
- *═══════════════════════════════════════════════════════════════════════════════*/
+    typedef struct PGASSlidingState PGASSlidingState;
 
-#define PGAS_ORACLE_MAX_K       8
-#define PGAS_ORACLE_ALIGN       64
-
-/*═══════════════════════════════════════════════════════════════════════════════
- * DOUBLE BUFFER CHANNEL (PGAS → RBPF)
- *
- * Lock-free publication of transition matrix.
- * Writer (PGAS) and reader (tick loop) never block.
- *═══════════════════════════════════════════════════════════════════════════════*/
-
-typedef struct {
-    float Pi[PGAS_ORACLE_MAX_K * PGAS_ORACLE_MAX_K];
-    int64_t tick;                   /* Window end tick */
-    float acceptance_rate;          /* Mixing diagnostic */
-    int sweeps_used;
-    int windows_completed;          /* How many windows PGAS has processed */
-    float avg_acceptance;           /* Running average acceptance rate */
-} PGASChannelBuffer;
-
-typedef struct {
-    _Atomic int write_idx;          /* Which buffer PGAS is writing to */
-    _Atomic int ready;              /* New data available for consumption */
-    
-    PGASChannelBuffer buf[2] __attribute__((aligned(64)));
-    
-    /* Metadata */
-    int K;                          /* Regime count */
-    int64_t last_consumed_tick;     /* Last tick consumed by RBPF */
-    
-} PGASChannel;
-
-/*═══════════════════════════════════════════════════════════════════════════════
- * PGAS ORACLE STATE
- *═══════════════════════════════════════════════════════════════════════════════*/
-
-typedef struct PGASOracleState {
-    /* ═══════════════════════════════════════════════════════════════════════
-     * OWNED COMPONENTS
-     * ═══════════════════════════════════════════════════════════════════════*/
-    PGASSlidingState* sliding;      /* Sliding window PGAS */
-    PGASChannel channel;            /* Double-buffer output */
-    
-    /* ═══════════════════════════════════════════════════════════════════════
-     * THREAD CONTROL
-     * ═══════════════════════════════════════════════════════════════════════*/
-    pthread_t thread;
-    _Atomic int running;            /* 0 = stop, 1 = run */
-    _Atomic int started;            /* Thread has started */
-    
-    /* ═══════════════════════════════════════════════════════════════════════
+    /*===========================================================================
      * CONFIGURATION
-     * ═══════════════════════════════════════════════════════════════════════*/
-    int n_sweeps;                   /* Gibbs sweeps per iteration */
-    int core_start;                 /* First core for affinity (e.g., 2) */
-    int n_cores;                    /* Number of cores to use (e.g., 30) */
-    
-    /* ═══════════════════════════════════════════════════════════════════════
-     * DIAGNOSTICS
-     * ═══════════════════════════════════════════════════════════════════════*/
-    _Atomic int64_t iterations;     /* Windows processed */
-    _Atomic int64_t observations_pushed;
-    float avg_acceptance_rate;
-    float avg_iteration_time_ms;
-    
-} PGASOracleState;
+     *===========================================================================*/
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * LIFECYCLE
- *═══════════════════════════════════════════════════════════════════════════════*/
+#define PGAS_ORACLE_MAX_K 8
+#define PGAS_ORACLE_ALIGN 64
 
-/**
- * Allocate PGAS Oracle
- *
- * @param window_size   PGAS window length (e.g., 2000)
- * @param slide_step    Observations per slide (e.g., 500)
- * @param N             Particles (e.g., 256)
- * @param K             Regimes (e.g., 4)
- * @param n_sweeps      Gibbs sweeps per iteration (e.g., 5)
- * @param seed          RNG seed
- * @return              Allocated oracle, or NULL on failure
- */
-PGASOracleState* pgas_oracle_alloc(int window_size, int slide_step,
-                                    int N, int K, int n_sweeps,
-                                    uint32_t seed);
+    /*===========================================================================
+     * DOUBLE BUFFER CHANNEL (PGAS -> RBPF)
+     *===========================================================================*/
 
-/**
- * Free PGAS Oracle
- */
-void pgas_oracle_free(PGASOracleState* oracle);
+    typedef struct
+    {
+        float Pi[PGAS_ORACLE_MAX_K * PGAS_ORACLE_MAX_K];
+        int64_t tick;          /* Window end tick */
+        float acceptance_rate; /* Mixing diagnostic */
+        int sweeps_used;
+        int windows_completed; /* How many windows PGAS has processed */
+        float avg_acceptance;  /* Running average acceptance rate */
+    } PGASChannelBuffer;
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * MODEL CONFIGURATION
- *═══════════════════════════════════════════════════════════════════════════════*/
+    typedef struct
+    {
+        pgas_atomic_int32 write_idx; /* Which buffer PGAS is writing to */
+        pgas_atomic_int32 ready;     /* New data available for consumption */
 
-/**
- * Set model parameters (before starting thread)
- */
-void pgas_oracle_set_model(PGASOracleState* oracle,
-                           const double* trans,
-                           const double* mu_vol,
-                           const double* sigma_vol,
-                           double phi);
+#ifdef _MSC_VER
+        __declspec(align(64)) PGASChannelBuffer buf[2];
+#else
+    PGASChannelBuffer buf[2] __attribute__((aligned(64)));
+#endif
 
-/**
- * Set sticky prior (before starting thread)
- */
-void pgas_oracle_set_prior(PGASOracleState* oracle,
-                           float alpha, float kappa);
+        /* Metadata */
+        int K;                      /* Regime count */
+        int64_t last_consumed_tick; /* Last tick consumed by RBPF */
 
-/**
- * Set recency weighting (before starting thread)
- */
-void pgas_oracle_set_recency(PGASOracleState* oracle, float lambda);
+    } PGASChannel;
 
-/**
- * Set core affinity range (before starting thread)
- *
- * @param oracle      Oracle state
- * @param core_start  First core ID (e.g., 2)
- * @param n_cores     Number of cores (e.g., 30)
- */
-void pgas_oracle_set_affinity(PGASOracleState* oracle,
-                              int core_start, int n_cores);
+    /*===========================================================================
+     * PGAS ORACLE STATE
+     *===========================================================================*/
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * THREAD CONTROL
- *═══════════════════════════════════════════════════════════════════════════════*/
+    typedef struct PGASOracleState
+    {
+        /* OWNED COMPONENTS */
+        PGASSlidingState *sliding; /* Sliding window PGAS */
+        PGASChannel channel;       /* Double-buffer output */
 
-/**
- * Start background PGAS thread
- *
- * Thread will:
- *   1. Wait for window to fill
- *   2. Run Gibbs sweeps
- *   3. Publish Π to channel
- *   4. Slide window
- *   5. Loop
- */
-int pgas_oracle_start(PGASOracleState* oracle);
+        /* THREAD CONTROL */
+        pgas_thread_t thread;
+        pgas_atomic_int32 running; /* 0 = stop, 1 = run */
+        pgas_atomic_int32 started; /* Thread has started */
 
-/**
- * Stop background thread (blocking)
- */
-void pgas_oracle_stop(PGASOracleState* oracle);
+        /* CONFIGURATION */
+        int n_sweeps;   /* Gibbs sweeps per iteration */
+        int core_start; /* First core for affinity (e.g., 2) */
+        int n_cores;    /* Number of cores to use (e.g., 30) */
 
-/**
- * Check if oracle thread is running
- */
-bool pgas_oracle_is_running(const PGASOracleState* oracle);
+        /* DIAGNOSTICS */
+        pgas_atomic_int64 iterations; /* Windows processed */
+        pgas_atomic_int64 observations_pushed;
+        float avg_acceptance_rate;
+        float avg_iteration_time_ms;
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * OBSERVATION INPUT (Tick Loop)
- *═══════════════════════════════════════════════════════════════════════════════*/
+    } PGASOracleState;
 
-/**
- * Push observation to oracle's ring buffer
- *
- * Thread-safe: Called from tick loop while PGAS thread runs.
- *
- * @param oracle  Oracle state
- * @param obs     Observation (y_t = log(r_t²))
- * @param tick    Global tick number
- * @return        true if accepted, false if overflow
- */
-bool pgas_oracle_push(PGASOracleState* oracle, float obs, int64_t tick);
+    /*===========================================================================
+     * LIFECYCLE
+     *===========================================================================*/
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * CHANNEL ACCESS (Tick Loop)
- *═══════════════════════════════════════════════════════════════════════════════*/
+    PGASOracleState *pgas_oracle_alloc(int window_size, int slide_step,
+                                       int N, int K, int n_sweeps,
+                                       uint32_t seed);
 
-/**
- * Check if new Π is available
- *
- * Thread-safe: Called from tick loop.
- */
-bool pgas_oracle_ready(const PGASOracleState* oracle);
+    void pgas_oracle_free(PGASOracleState *oracle);
 
-/**
- * Consume Π from channel (marks as read)
- *
- * Thread-safe: Called from tick loop.
- *
- * @param oracle   Oracle state
- * @param pi_out   Output buffer [K*K]
- * @param tick_out Output: window end tick, or NULL
- * @return         true if consumed, false if not ready
- */
-bool pgas_oracle_consume(PGASOracleState* oracle, float* pi_out, int64_t* tick_out);
+    /*===========================================================================
+     * MODEL CONFIGURATION
+     *===========================================================================*/
 
-/**
- * Get channel metadata (non-consuming peek)
- */
-void pgas_oracle_peek(const PGASOracleState* oracle,
-                      float* acceptance_rate_out,
-                      int* sweeps_out);
+    void pgas_oracle_set_model(PGASOracleState *oracle,
+                               const double *trans,
+                               const double *mu_vol,
+                               const double *sigma_vol,
+                               double phi);
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * HOT SWAP INTEGRATION (Tick Loop)
- *
- * These functions implement the hot swap logic from the integration schema.
- * Called from tick_update() after Hawkes check.
- *═══════════════════════════════════════════════════════════════════════════════*/
+    void pgas_oracle_set_prior(PGASOracleState *oracle,
+                               float alpha, float kappa);
 
-/**
- * Attempt hot swap: consume Π if ready AND not in crisis
- *
- * Implements the integration schema logic:
- *   if (oracle_ready AND !crisis) {
- *       swap Pi from channel
- *       reset_sufficient_statistics()
- *   }
- *
- * @param oracle    Oracle state
- * @param crisis    Hawkes crisis flag (if true, veto swap)
- * @param pi_out    Output buffer [K*K], receives Π if swapped
- * @param tick_out  Output: window end tick
- * @return          true if swapped, false if vetoed or not ready
- */
-bool pgas_oracle_try_hot_swap(PGASOracleState* oracle,
-                              bool crisis,
-                              float* pi_out,
-                              int64_t* tick_out);
+    void pgas_oracle_set_recency(PGASOracleState *oracle, float lambda);
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * VALIDATION
- *═══════════════════════════════════════════════════════════════════════════════*/
+    void pgas_oracle_set_affinity(PGASOracleState *oracle,
+                                  int core_start, int n_cores);
 
-/**
- * Validate Π matrix (row stochastic, no NaN)
- *
- * @param pi  Transition matrix [K*K]
- * @param K   Number of regimes
- * @return    true if valid
- */
-bool pgas_oracle_validate_pi(const float* pi, int K);
+    /*===========================================================================
+     * THREAD CONTROL
+     *===========================================================================*/
 
-/*═══════════════════════════════════════════════════════════════════════════════
- * DIAGNOSTICS
- *═══════════════════════════════════════════════════════════════════════════════*/
+    int pgas_oracle_start(PGASOracleState *oracle);
+    void pgas_oracle_stop(PGASOracleState *oracle);
+    bool pgas_oracle_is_running(const PGASOracleState *oracle);
 
-/**
- * Get iteration count
- */
-int64_t pgas_oracle_get_iterations(const PGASOracleState* oracle);
+    /*===========================================================================
+     * OBSERVATION INPUT (Tick Loop)
+     *===========================================================================*/
 
-/**
- * Get observations pushed count
- */
-int64_t pgas_oracle_get_observations(const PGASOracleState* oracle);
+    bool pgas_oracle_push(PGASOracleState *oracle, float obs, int64_t tick);
 
-/**
- * Print diagnostics
- */
-void pgas_oracle_print_diagnostics(const PGASOracleState* oracle);
+    /*===========================================================================
+     * CHANNEL ACCESS (Tick Loop)
+     *===========================================================================*/
+
+    bool pgas_oracle_ready(const PGASOracleState *oracle);
+    bool pgas_oracle_consume(PGASOracleState *oracle, float *pi_out, int64_t *tick_out);
+    void pgas_oracle_peek(const PGASOracleState *oracle,
+                          float *acceptance_rate_out,
+                          int *sweeps_out);
+
+    /*===========================================================================
+     * HOT SWAP INTEGRATION (Tick Loop)
+     *===========================================================================*/
+
+    bool pgas_oracle_try_hot_swap(PGASOracleState *oracle,
+                                  bool crisis,
+                                  float *pi_out,
+                                  int64_t *tick_out);
+
+    /*===========================================================================
+     * VALIDATION & DIAGNOSTICS
+     *===========================================================================*/
+
+    bool pgas_oracle_validate_pi(const float *pi, int K);
+    int64_t pgas_oracle_get_iterations(const PGASOracleState *oracle);
+    int64_t pgas_oracle_get_observations(const PGASOracleState *oracle);
+    void pgas_oracle_print_diagnostics(const PGASOracleState *oracle);
 
 #ifdef __cplusplus
 }

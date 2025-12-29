@@ -70,6 +70,28 @@ target_compile_options(paris_mkl PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(paris_mkl PRIVATE ${COMMON_DEFS})
 
 #───────────────────────────────────────────────────────────────────────────────
+# PGAS Oracle - Background thread for sliding window PGAS
+#───────────────────────────────────────────────────────────────────────────────
+
+add_library(pgas_oracle STATIC
+    pgas_oracle.c
+)
+
+target_include_directories(pgas_oracle PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(pgas_oracle 
+    PUBLIC 
+        pgas_sliding
+        MKL::MKL
+        Threads::Threads
+)
+
+target_compile_options(pgas_oracle PRIVATE ${PGAS_COMPILE_FLAGS})
+target_compile_definitions(pgas_oracle PRIVATE ${COMMON_DEFS})
+
+#───────────────────────────────────────────────────────────────────────────────
 # Combined PGAS Library (convenience interface target)
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -88,6 +110,32 @@ target_include_directories(pgas_sliding PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(pgas_sliding PUBLIC pgas_mkl MKL::MKL)
 target_compile_options(pgas_sliding PRIVATE ${PGAS_COMPILE_FLAGS})
 target_compile_definitions(pgas_sliding PRIVATE ${COMMON_DEFS})
+
+#───────────────────────────────────────────────────────────────────────────────
+# PGAS + RBPF Coexistence Test
+#───────────────────────────────────────────────────────────────────────────────
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_pgas_rbpf_coexist.c)
+    add_executable(test_pgas_rbpf_coexist
+        test_pgas_rbpf_coexist.c
+    )
+    target_link_libraries(test_pgas_rbpf_coexist PRIVATE 
+        pgas_oracle
+        pgas_sliding
+        pgas_mkl
+        rocks
+        MKL::MKL
+        Threads::Threads
+    )
+    target_include_directories(test_pgas_rbpf_coexist PRIVATE
+        ${CMAKE_SOURCE_DIR}/RBPF
+        ${CMAKE_SOURCE_DIR}/RBPF/rao-blackwellized
+        ${CMAKE_SOURCE_DIR}/RBPF/storvik
+        ${CMAKE_SOURCE_DIR}/RBPF/ocsn
+    )
+    target_compile_options(test_pgas_rbpf_coexist PRIVATE ${PGAS_COMPILE_FLAGS})
+    target_compile_definitions(test_pgas_rbpf_coexist PRIVATE ${COMMON_DEFS})
+endif()
 
 #───────────────────────────────────────────────────────────────────────────────
 # Test Bench (tests and benchmarks)
