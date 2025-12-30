@@ -56,6 +56,24 @@ CrisisDetectorConfig crisis_detector_config_default(void)
     /* Warmup */
     cfg.warmup_ticks = 200;
 
+    /* Robust warmup (v3) */
+    cfg.use_robust_warmup = true;
+    cfg.warmup_outlier_k = 3.0f;   /* Reject > 3 MAD during warmup */
+    cfg.warmup_winsorize_k = 4.0f; /* Winsorize at 4 MAD */
+    cfg.warmup_min_clean = 50;     /* Need 50 clean obs before baseline */
+
+    /* Sanity anchor (v3.1) - THE CIRCUIT BREAKER */
+    /* This is a HARD LIMIT derived from asset fundamentals.
+     * For 1-minute equity bars: ~0.015 per bar ≈ 15% annualized vol is high but "peace"
+     * Anything above ~2-3% per bar is definitely crisis territory.
+     *
+     * IMPORTANT: Adjust this based on your asset class and bar frequency!
+     * - For tick data: lower (e.g., 0.001)
+     * - For 1-min bars: ~0.015
+     * - For daily bars: ~0.03
+     */
+    cfg.max_peace_sigma = 0.015f; /* 1.5% per bar - conservative anchor */
+
     return cfg;
 }
 
@@ -243,6 +261,108 @@ CrisisState crisis_detector_update_full(CrisisDetector *cd, float obs,
     }
 
     /* ═══════════════════════════════════════════════════════════════════
+     * STEP 0: Robust Warmup (v3) - Handle cold start during crisis
+     * ═══════════════════════════════════════════════════════════════════ */
+    if (cd->cfg.use_robust_warmup && !cd->warmup_baseline_set)
+    {
+        float abs_obs = fabsf(obs);
+        int idx = cd->warmup_obs_count % 256;
+
+        /* First few observations: bootstrap median/MAD estimates */
+        if (cd->warmup_obs_count < 10)
+        {
+            cd->warmup_obs_buffer[idx] = abs_obs;
+            cd->warmup_obs_count++;
+
+            /* Simple initial estimate from first 10 obs */
+            if (cd->warmup_obs_count == 10)
+            {
+                /* Sort to find median */
+                float sorted[10];
+                for (int i = 0; i < 10; i++)
+                    sorted[i] = cd->warmup_obs_buffer[i];
+                for (int i = 0; i < 9; i++)
+                {
+                    for (int j = i + 1; j < 10; j++)
+                    {
+                        if (sorted[j] < sorted[i])
+                        {
+                            float tmp = sorted[i];
+                            sorted[i] = sorted[j];
+                            sorted[j] = tmp;
+                        }
+                    }
+                }
+                cd->warmup_median = (sorted[4] + sorted[5]) / 2.0f;
+
+                /* MAD = median of |x - median| */
+                float deviations[10];
+                for (int i = 0; i < 10; i++)
+                {
+                    deviations[i] = fabsf(sorted[i] - cd->warmup_median);
+                }
+                for (int i = 0; i < 9; i++)
+                {
+                    for (int j = i + 1; j < 10; j++)
+                    {
+                        if (deviations[j] < deviations[i])
+                        {
+                            float tmp = deviations[i];
+                            deviations[i] = deviations[j];
+                            deviations[j] = tmp;
+                        }
+                    }
+                }
+                cd->warmup_mad = (deviations[4] + deviations[5]) / 2.0f;
+                if (cd->warmup_mad < 1e-8f)
+                    cd->warmup_mad = cd->warmup_median * 0.5f;
+            }
+            return cd->state; /* Stay in IDLE during bootstrap */
+        }
+
+        /* After bootstrap: apply outlier rejection */
+        float threshold = cd->cfg.warmup_outlier_k * cd->warmup_mad * 1.4826f; /* MAD→σ */
+        bool is_outlier = (abs_obs > cd->warmup_median + threshold);
+
+        if (is_outlier)
+        {
+            /* Winsorize instead of reject completely */
+            float winsor_limit = cd->cfg.warmup_winsorize_k * cd->warmup_mad * 1.4826f;
+            abs_obs = fminf(abs_obs, cd->warmup_median + winsor_limit);
+        }
+        else
+        {
+            cd->warmup_clean_count++;
+        }
+
+        /* Update running estimates with exponential smoothing */
+        float alpha = 0.05f;
+        cd->warmup_median = (1.0f - alpha) * cd->warmup_median + alpha * abs_obs;
+        float dev = fabsf(abs_obs - cd->warmup_median);
+        cd->warmup_mad = (1.0f - alpha) * cd->warmup_mad + alpha * dev;
+        if (cd->warmup_mad < 1e-8f)
+            cd->warmup_mad = 1e-6f;
+
+        /* Accumulate for σ estimate */
+        cd->warmup_sum_clean += abs_obs * abs_obs;
+        cd->warmup_obs_buffer[idx] = abs_obs;
+        cd->warmup_obs_count++;
+
+        /* Check if we have enough clean observations to set baseline */
+        if (cd->warmup_clean_count >= cd->cfg.warmup_min_clean &&
+            cd->warmup_obs_count >= cd->cfg.warmup_ticks / 2)
+        {
+            /* Set σ_peace from clean observations */
+            float sigma_est = sqrtf(cd->warmup_sum_clean / cd->warmup_obs_count);
+            dual_sr_set_sigma_peace(&cd->dual_sr, sigma_est);
+            cd->warmup_baseline_set = true;
+
+            /* Also update event detector baseline */
+            /* (P² will have adapted, but at least SR is clean now) */
+        }
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
      * STEP 1: Event Detection (P² quantile-based)
      * ═══════════════════════════════════════════════════════════════════ */
     bool is_event = event_detector_update_full(&cd->event_det, obs, volume, imbalance);
@@ -299,6 +419,60 @@ CrisisState crisis_detector_update_full(CrisisDetector *cd, float obs,
     if (cd->tick_count < cd->cfg.warmup_ticks)
     {
         return cd->state;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * STEP 5.1: POST-WARMUP SANITY AUDIT (v3.1 - The Anchor)
+     *
+     * At the end of warmup, verify that learned baseline is physically
+     * consistent with a "peace" regime. If not, we have a COLD START
+     * DURING CRISIS - reject the learned baseline and force to ACTIVE.
+     * ═══════════════════════════════════════════════════════════════════ */
+    if (!cd->warmup_audit_done)
+    {
+        cd->warmup_audit_done = true;
+
+        /* Get what we learned during warmup */
+        float learned_sigma = cd->dual_sr.sigma_peace;
+
+        /* THE AUDIT: Is this physically consistent with "peace"? */
+        if (learned_sigma > cd->cfg.max_peace_sigma)
+        {
+
+            /* ═══════════════════════════════════════════════════════════
+             * VIOLATION: Cold Start During Crisis
+             * The learned baseline is too high to be "peace".
+             * We cannot trust anything we learned.
+             * ═══════════════════════════════════════════════════════════ */
+            cd->cold_start_crisis = true;
+
+            /* A. Override σ_peace with the Sanity Anchor */
+            dual_sr_set_sigma_peace(&cd->dual_sr, cd->cfg.max_peace_sigma);
+
+            /* B. Set σ_crisis to what we actually observed (high vol) */
+            /*    This ensures SR_down (exit) works correctly */
+            cd->sigma_crisis = learned_sigma;
+
+            /* C. Wipe the toxic P² memory - replace with theoretical dist */
+            event_detector_force_theoretical_distribution(
+                &cd->event_det,
+                (double)cd->cfg.max_peace_sigma);
+
+            /* D. Force immediate state transition to CRISIS_ACTIVE */
+            enter_state(cd, CRISIS_ACTIVE, tick);
+            cd->total_crises++;
+
+            /* E. Freeze the (now safe) baseline */
+            freeze_baseline(cd);
+
+            /* F. Reset confirmation/cooldown state */
+            cd->confirmation_count = 0;
+            cd->cooldown_remaining = 0;
+            cd->ticks_in_state = 0;
+
+            /* Return immediately - we're now in crisis mode */
+            return cd->state;
+        }
     }
 
     float sr_alert_level = cd->cfg.sr_alert_fraction * log_H;
