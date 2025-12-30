@@ -122,6 +122,20 @@ extern "C"
         /* Warmup */
         int warmup_ticks; /* Ticks before detection enabled (default: 200) */
 
+        /* ═══════════════════════════════════════════════════════════════════
+         * ROBUST WARMUP (v3) - Handles cold start during crisis
+         * ═══════════════════════════════════════════════════════════════════ */
+        bool use_robust_warmup;   /* Enable outlier rejection during warmup (default: true) */
+        float warmup_outlier_k;   /* Reject |obs| > k × MAD during warmup (default: 3.0) */
+        float warmup_winsorize_k; /* Winsorize at k × MAD during warmup (default: 4.0) */
+        int warmup_min_clean;     /* Min clean observations before baseline set (default: 50) */
+
+        /* ═══════════════════════════════════════════════════════════════════
+         * SANITY ANCHOR (v3.1) - Fundamental prior / circuit breaker
+         * ═══════════════════════════════════════════════════════════════════ */
+        float max_peace_sigma; /* Hard limit: σ above this is NEVER peace (default: 0.002 = 20bps) */
+                               /* Derived from asset fundamentals, not learned */
+
     } CrisisDetectorConfig;
 
     CrisisDetectorConfig crisis_detector_config_default(void);
@@ -155,6 +169,19 @@ extern "C"
 
         /* Cooldown tracking: ticks remaining in cooldown */
         int cooldown_remaining; /* Decrements each tick, 0 = not in cooldown */
+
+        /* ═══════════════════════════════════════════════════════════════════
+         * ROBUST WARMUP STATE (v3)
+         * ═══════════════════════════════════════════════════════════════════ */
+        float warmup_obs_buffer[256]; /* Ring buffer for warmup observations */
+        int warmup_obs_count;         /* Total observations seen */
+        int warmup_clean_count;       /* Observations that passed outlier filter */
+        float warmup_median;          /* Running median estimate */
+        float warmup_mad;             /* Running MAD estimate */
+        float warmup_sum_clean;       /* Sum of clean (winsorized) observations² */
+        bool warmup_baseline_set;     /* Has baseline been established? */
+        bool warmup_audit_done;       /* Has post-warmup sanity check been performed? */
+        bool cold_start_crisis;       /* Did we detect cold start during crisis? */
 
         /* Frozen baseline (during crisis) */
         float sigma_peace_frozen;
