@@ -18,6 +18,14 @@ option(RBPF_ENABLE_HDP_BEAM "Enable Sticky HDP-HMM Beam Sampling" ON)
 option(RBPF_ENABLE_ONLINE_VI "Enable Online VI transition learning" OFF)
 
 #───────────────────────────────────────────────────────────────────────────────
+# Subdirectories (must come before ROCKS_SOURCES to populate variables)
+#───────────────────────────────────────────────────────────────────────────────
+
+if(RBPF_ENABLE_STORVIK)
+    add_subdirectory(extended)
+endif()
+
+#───────────────────────────────────────────────────────────────────────────────
 # ROCKS Core Library
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -28,7 +36,6 @@ set(ROCKS_SOURCES
     rao-blackwellized/rbpf_ksc_output.c
     rao-blackwellized/rbpf_ksc_student_t.c
     rao-blackwellized/rbpf_kl_tempering.c
-
     rao-blackwellized/rbpf_apf_kick.c
     
     # Adaptive components
@@ -40,15 +47,13 @@ set(ROCKS_SOURCES
 # Add Storvik parameter learning and related modules if enabled
 if(RBPF_ENABLE_STORVIK)
     list(APPEND ROCKS_SOURCES
+        # Extended integration layer (from subdirectory)
+        ${EXTENDED_SOURCES}
+        
         # Storvik online parameter learning
         storvik/rbpf_param_learn.c
         storvik/rbpf_adaptive_forgetting.c
-        storvik/rbpf_fixed_lag_smoother.c 
-
-
-        storvik/rbpf_ext_config.c 
-        storvik/rbpf_ext_diagnostics.c
-        storvik/rbpf_ksc_param_integration.c      # Core: lifecycle, step, config
+        storvik/rbpf_fixed_lag_smoother.c
         storvik/rbpf_ext_smoothed_storvik.c       # PARIS smoothed Storvik
 
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/paris_mkl.c
@@ -58,7 +63,6 @@ if(RBPF_ENABLE_STORVIK)
         
         # Preprocessor
         preprocess/rbpf_preprocess.c
-
     )
 endif()
 
@@ -69,13 +73,13 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/rao-blackwellized
         ${CMAKE_CURRENT_SOURCE_DIR}/storvik
+        ${CMAKE_CURRENT_SOURCE_DIR}/extended
         ${CMAKE_CURRENT_SOURCE_DIR}/ocsn
         ${CMAKE_CURRENT_SOURCE_DIR}/preprocess
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS
-        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/hawkes_signal  # ADD THIS
-
+        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/hawkes_signal
 )
 
 target_link_libraries(rocks 
@@ -111,20 +115,18 @@ add_library(rbpf_ksc ALIAS rocks)
 #───────────────────────────────────────────────────────────────────────────────
 
 # Single RBPF Test (Storvik + KL Tempering + Smoothed Storvik + OCSN)
-      # Single RBPF Test (Storvik + KL Tempering + Smoothed Storvik + OCSN)
-    if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_single_rbpf.c)
-        add_executable(test_single_rbpf
-            ${CMAKE_CURRENT_SOURCE_DIR}/test/test_single_rbpf.c
-        )
-        target_link_libraries(test_single_rbpf PRIVATE rocks)
-        target_compile_options(test_single_rbpf PRIVATE ${COMMON_FLAGS})
-        target_compile_definitions(test_single_rbpf PRIVATE ${COMMON_DEFS})
-    endif()
-
+if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_single_rbpf.c)
+    add_executable(test_single_rbpf
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/test_single_rbpf.c
+    )
+    target_link_libraries(test_single_rbpf PRIVATE rocks)
+    target_compile_options(test_single_rbpf PRIVATE ${COMMON_FLAGS})
+    target_compile_definitions(test_single_rbpf PRIVATE ${COMMON_DEFS})
+endif()
 
 if(RBPF_BUILD_TESTS)
 
-     # RBPF Parameter Tuner (Multi-threaded)
+    # RBPF Parameter Tuner (Multi-threaded)
     if(RBPF_ENABLE_STORVIK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_tuner_mp.c)
         add_executable(rbpf_tuner_mp
             ${CMAKE_CURRENT_SOURCE_DIR}/../test/rbpf_tuner_mp.c
@@ -164,6 +166,7 @@ target_link_libraries(test_pgas_injection PRIVATE
 )
 target_compile_options(test_pgas_injection PRIVATE ${COMMON_FLAGS})
 target_compile_definitions(test_pgas_injection PRIVATE ${COMMON_DEFS})
+
 #───────────────────────────────────────────────────────────────────────────────
 # Benchmark Executables
 #───────────────────────────────────────────────────────────────────────────────
@@ -227,13 +230,13 @@ set(ROCKS_HEADERS
 # Storvik and related headers
 if(RBPF_ENABLE_STORVIK)
     list(APPEND ROCKS_HEADERS
-        storvik/rbpf_ksc_param_integration.h
         storvik/rbpf_param_learn.h
         storvik/rbpf_adaptive_forgetting.h
         storvik/p2_quantile.h
         storvik/rbpf_fixed_lag_smoother.h
         preprocess/rbpf_preprocess.h
     )
+    # Extended headers installed via extended/CMakeLists.txt
 endif()
 
 install(FILES ${ROCKS_HEADERS}
