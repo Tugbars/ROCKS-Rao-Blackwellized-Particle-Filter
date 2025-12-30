@@ -1,0 +1,402 @@
+/*
+ * crisis_detector.c - Crisis Detection Integration Layer
+ * 
+ * Implements the v3.1 two-stage detonator:
+ *   Stage 1: EventDetector + Hawkes (fast, early warning)
+ *   Stage 2: DualSR (principled hypothesis testing)
+ * 
+ * Uses the existing HawkesIntegrator implementation.
+ */
+
+#include "crisis_detector.h"
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * CONFIGURATION DEFAULTS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+CrisisDetectorConfig crisis_detector_config_default(void) {
+    CrisisDetectorConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    
+    /* Event detector: P90 quantile */
+    cfg.event_cfg = event_detector_config_default();
+    
+    /* Hawkes: use existing defaults, but set event_threshold = 0 
+     * so we control events via EventDetector */
+    cfg.hawkes_cfg = hawkes_integrator_config_defaults();
+    cfg.hawkes_cfg.hawkes.event_threshold = 0.0f;
+    
+    /* SR: Gaussian with winsorization */
+    cfg.sr_cfg = sr_config_default();
+    
+    /* Adaptive threshold */
+    cfg.threshold_cfg = adaptive_threshold_config_default();
+    
+    /* State machine */
+    cfg.sr_alert_fraction = 0.5f;      /* ALERT when SR > 50% of threshold */
+    cfg.sr_exit_threshold = 3.0f;      /* log(20) ≈ 20:1 odds for exit */
+    cfg.sr_reentry_fraction = 0.7f;    /* Re-trigger at 70% of threshold */
+    
+    /* Crisis sigma learning */
+    cfg.sigma_crisis_ema_alpha = 0.01f;
+    
+    /* Initial sigma */
+    cfg.initial_sigma_peace = 0.01f;   /* 1% */
+    
+    /* Warmup */
+    cfg.warmup_ticks = 200;
+    
+    return cfg;
+}
+
+CrisisDetectorConfig crisis_detector_config_sensitive(void) {
+    CrisisDetectorConfig cfg = crisis_detector_config_default();
+    
+    cfg.event_cfg = event_detector_config_sensitive();
+    cfg.hawkes_cfg = hawkes_integrator_config_responsive();
+    cfg.hawkes_cfg.hawkes.event_threshold = 0.0f;
+    
+    cfg.threshold_cfg.log_H_base = 4.0f;  /* Lower threshold */
+    cfg.sr_alert_fraction = 0.4f;
+    cfg.warmup_ticks = 100;
+    
+    return cfg;
+}
+
+CrisisDetectorConfig crisis_detector_config_conservative(void) {
+    CrisisDetectorConfig cfg = crisis_detector_config_default();
+    
+    cfg.hawkes_cfg = hawkes_integrator_config_conservative();
+    cfg.hawkes_cfg.hawkes.event_threshold = 0.0f;
+    
+    cfg.threshold_cfg.log_H_base = 6.0f;  /* Higher threshold */
+    cfg.threshold_cfg.wolf_penalty = 3.0f;
+    cfg.sr_alert_fraction = 0.6f;
+    cfg.warmup_ticks = 500;
+    
+    return cfg;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * INITIALIZATION
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int crisis_detector_init(CrisisDetector *cd, const CrisisDetectorConfig *cfg) {
+    if (!cd) return -1;
+    
+    memset(cd, 0, sizeof(*cd));
+    
+    if (cfg) {
+        cd->cfg = *cfg;
+    } else {
+        cd->cfg = crisis_detector_config_default();
+    }
+    
+    /* Initialize event detector */
+    event_detector_init(&cd->event_det, &cd->cfg.event_cfg);
+    
+    /* Initialize Hawkes using the existing API */
+    if (hawkes_integrator_init(&cd->hawkes, &cd->cfg.hawkes_cfg) != 0) {
+        return -1;
+    }
+    
+    /* Initialize dual SR */
+    dual_sr_init(&cd->dual_sr, &cd->cfg.sr_cfg, cd->cfg.initial_sigma_peace);
+    
+    /* Initialize adaptive threshold */
+    adaptive_threshold_init(&cd->adaptive_th, &cd->cfg.threshold_cfg);
+    
+    /* State */
+    cd->state = CRISIS_IDLE;
+    cd->sigma_crisis = cd->cfg.sr_cfg.sigma_multiple * cd->cfg.initial_sigma_peace;
+    
+    return 0;
+}
+
+void crisis_detector_reset(CrisisDetector *cd) {
+    if (!cd) return;
+    
+    CrisisDetectorConfig cfg = cd->cfg;
+    crisis_detector_init(cd, &cfg);
+}
+
+void crisis_detector_free(CrisisDetector *cd) {
+    if (!cd) return;
+    
+    hawkes_integrator_free(&cd->hawkes);
+    /* Other components don't need explicit free */
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SIGMA ACCESS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+float crisis_detector_get_sigma_peace(const CrisisDetector *cd) {
+    if (!cd) return 0.01f;
+    
+    if (cd->baseline_frozen) {
+        return cd->sigma_peace_frozen;
+    }
+    return cd->dual_sr.sigma_peace;
+}
+
+void crisis_detector_set_sigma_peace(CrisisDetector *cd, float sigma) {
+    if (!cd) return;
+    
+    if (cd->baseline_frozen) {
+        return;  /* Ignore during crisis */
+    }
+    dual_sr_set_sigma_peace(&cd->dual_sr, sigma);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * STATE MACHINE HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void enter_state(CrisisDetector *cd, CrisisState new_state, int64_t tick) {
+    if (cd->state != new_state) {
+        cd->state = new_state;
+        cd->last_state_change_tick = tick;
+        cd->ticks_in_state = 0;
+    }
+}
+
+static void freeze_baseline(CrisisDetector *cd) {
+    if (!cd->baseline_frozen) {
+        cd->sigma_peace_frozen = cd->dual_sr.sigma_peace;
+        cd->baseline_frozen = true;
+    }
+}
+
+static void unfreeze_baseline(CrisisDetector *cd) {
+    cd->baseline_frozen = false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * CORE UPDATE
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+CrisisState crisis_detector_update(CrisisDetector *cd, float obs, int64_t tick) {
+    return crisis_detector_update_full(cd, obs, 0.0f, NAN, tick);
+}
+
+CrisisState crisis_detector_update_full(CrisisDetector *cd, float obs,
+                                         float volume, float imbalance,
+                                         int64_t tick) {
+    if (!cd) return CRISIS_IDLE;
+    
+    cd->tick_count++;
+    cd->ticks_in_state++;
+    
+    /* ═══════════════════════════════════════════════════════════════════
+     * STEP 1: Event Detection (P² quantile-based)
+     * ═══════════════════════════════════════════════════════════════════ */
+    bool is_event = event_detector_update_full(&cd->event_det, obs, volume, imbalance);
+    cd->last_was_event = is_event;
+    cd->last_return_threshold = (float)event_detector_get_threshold(&cd->event_det);
+    
+    /* ═══════════════════════════════════════════════════════════════════
+     * STEP 2: Hawkes Update
+     * 
+     * Key insight: We pass the return to Hawkes only when EventDetector
+     * says it's a meaningful event. Otherwise pass 0.
+     * 
+     * Since we set event_threshold = 0 in Hawkes config, passing 0 means
+     * no event is added to Hawkes buffer, while passing |obs| > 0 adds it.
+     * ═══════════════════════════════════════════════════════════════════ */
+    float hawkes_return = is_event ? obs : 0.0f;
+    HawkesIntegratorResult hawkes_result = hawkes_integrator_update(
+        &cd->hawkes, (float)tick, hawkes_return);
+    
+    cd->last_hawkes_result = hawkes_result;
+    cd->last_hawkes_surprise = hawkes_result.surprise_sigma;
+    
+    /* Hawkes is "armed" if in ARMED state or if should_trigger fired */
+    bool hawkes_armed = (hawkes_result.state == HAWKES_TRIG_ARMED) || 
+                        hawkes_result.should_trigger;
+    
+    /* ═══════════════════════════════════════════════════════════════════
+     * STEP 3: Dual SR Update (state-dependent)
+     * ═══════════════════════════════════════════════════════════════════ */
+    switch (cd->state) {
+        case CRISIS_IDLE:
+        case CRISIS_ALERT:
+            /* SR_up active: testing peace → crisis */
+            dual_sr_update_entry(&cd->dual_sr, obs);
+            break;
+            
+        case CRISIS_ACTIVE:
+            /* SR_down active: testing crisis → peace, learn sigma_crisis */
+            dual_sr_update_exit(&cd->dual_sr, obs);
+            /* Update crisis sigma EMA */
+            cd->sigma_crisis = (1.0f - cd->cfg.sigma_crisis_ema_alpha) * cd->sigma_crisis
+                             + cd->cfg.sigma_crisis_ema_alpha * fabsf(obs);
+            break;
+            
+        case CRISIS_RECOVERING:
+            /* Both active for hysteresis */
+            dual_sr_update_both(&cd->dual_sr, obs);
+            break;
+    }
+    
+    cd->last_log_sr_up = cd->dual_sr.log_sr_up;
+    cd->last_log_sr_down = cd->dual_sr.log_sr_down;
+    
+    /* ═══════════════════════════════════════════════════════════════════
+     * STEP 4: Adaptive Threshold
+     * ═══════════════════════════════════════════════════════════════════ */
+    float log_H = adaptive_threshold_compute(&cd->adaptive_th);
+    cd->last_log_H = log_H;
+    
+    /* ═══════════════════════════════════════════════════════════════════
+     * STEP 5: State Machine
+     * ═══════════════════════════════════════════════════════════════════ */
+    
+    /* Skip state transitions during warmup */
+    if (cd->tick_count < cd->cfg.warmup_ticks) {
+        return cd->state;
+    }
+    
+    float sr_alert_level = cd->cfg.sr_alert_fraction * log_H;
+    float sr_reentry_level = cd->cfg.sr_reentry_fraction * log_H;
+    float sr_exit_threshold = cd->cfg.sr_exit_threshold;
+    
+    switch (cd->state) {
+        
+        case CRISIS_IDLE:
+            adaptive_threshold_tick(&cd->adaptive_th);
+            
+            /* Enter ALERT if:
+             * - Hawkes armed/triggered OR
+             * - SR_up elevated above alert level */
+            if (hawkes_armed || cd->dual_sr.log_sr_up > sr_alert_level) {
+                enter_state(cd, CRISIS_ALERT, tick);
+            }
+            break;
+            
+        case CRISIS_ALERT:
+            /* Confirm crisis if SR crosses threshold */
+            if (cd->dual_sr.log_sr_up > log_H) {
+                enter_state(cd, CRISIS_ACTIVE, tick);
+                freeze_baseline(cd);
+                dual_sr_reset_up(&cd->dual_sr);
+                cd->total_crises++;
+            }
+            /* Abort if SR goes negative and we've been in ALERT for a bit */
+            else if (cd->dual_sr.log_sr_up < 0.0f && cd->ticks_in_state > 5) {
+                enter_state(cd, CRISIS_IDLE, tick);
+                adaptive_threshold_false_alarm(&cd->adaptive_th);
+                cd->false_alarms++;
+            }
+            break;
+            
+        case CRISIS_ACTIVE:
+            /* Check exit condition via SR_down */
+            if (cd->dual_sr.log_sr_down > sr_exit_threshold) {
+                enter_state(cd, CRISIS_RECOVERING, tick);
+            }
+            break;
+            
+        case CRISIS_RECOVERING:
+            /* Clean exit if SR_down confirms AND SR_up is low */
+            if (cd->dual_sr.log_sr_down > sr_exit_threshold && 
+                cd->dual_sr.log_sr_up < sr_alert_level) {
+                enter_state(cd, CRISIS_IDLE, tick);
+                unfreeze_baseline(cd);
+                dual_sr_reset(&cd->dual_sr);
+                adaptive_threshold_clean_exit(&cd->adaptive_th);
+                cd->clean_exits++;
+            }
+            /* False exit - crisis re-triggering */
+            else if (cd->dual_sr.log_sr_up > sr_reentry_level) {
+                enter_state(cd, CRISIS_ACTIVE, tick);
+                dual_sr_reset_down(&cd->dual_sr);
+                cd->re_triggers++;
+            }
+            break;
+    }
+    
+    return cd->state;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DIAGNOSTICS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+void crisis_detector_get_info(const CrisisDetector *cd, CrisisDetectorInfo *info) {
+    if (!cd || !info) return;
+    
+    memset(info, 0, sizeof(*info));
+    
+    info->state = cd->state;
+    info->ticks_in_state = cd->ticks_in_state;
+    
+    /* Event detector */
+    info->is_event = cd->last_was_event;
+    info->return_threshold = cd->last_return_threshold;
+    info->event_rate = event_detector_get_rate(&cd->event_det);
+    
+    /* Hawkes (from existing implementation) */
+    info->hawkes_intensity = hawkes_integrator_get_intensity(&cd->hawkes);
+    info->hawkes_surprise = cd->last_hawkes_surprise;
+    info->hawkes_state = hawkes_integrator_get_state(&cd->hawkes);
+    info->hawkes_should_trigger = cd->last_hawkes_result.should_trigger;
+    
+    /* SR */
+    info->log_sr_up = cd->last_log_sr_up;
+    info->log_sr_down = cd->last_log_sr_down;
+    info->log_H = cd->last_log_H;
+    info->sigma_peace = crisis_detector_get_sigma_peace(cd);
+    info->sigma_crisis = cd->sigma_crisis;
+    
+    /* Statistics */
+    info->total_crises = cd->total_crises;
+    info->false_alarms = cd->false_alarms;
+    info->clean_exits = cd->clean_exits;
+    info->re_triggers = cd->re_triggers;
+}
+
+void crisis_detector_print_state(const CrisisDetector *cd) {
+    if (!cd) return;
+    
+    CrisisDetectorInfo info;
+    crisis_detector_get_info(cd, &info);
+    
+    printf("\n");
+    printf("+===========================================================+\n");
+    printf("|              CRISIS DETECTOR STATE                        |\n");
+    printf("+===========================================================+\n");
+    printf("| State: %-12s  Ticks in state: %ld\n", 
+           crisis_state_name(info.state), (long)info.ticks_in_state);
+    printf("+-----------------------------------------------------------+\n");
+    printf("| Event Detector:\n");
+    printf("|   Last event: %s  Threshold: %.6f\n", 
+           info.is_event ? "YES" : "NO", info.return_threshold);
+    printf("|   Event rate: %.2f%%\n", info.event_rate * 100.0);
+    printf("+-----------------------------------------------------------+\n");
+    printf("| Hawkes:\n");
+    printf("|   Intensity: %.4f  Surprise: %.2f σ\n", 
+           info.hawkes_intensity, info.hawkes_surprise);
+    printf("|   State: %s  Should trigger: %s\n",
+           info.hawkes_state == HAWKES_TRIG_ARMED ? "ARMED" : 
+           info.hawkes_state == HAWKES_TRIG_IDLE ? "IDLE" : 
+           info.hawkes_state == HAWKES_TRIG_REFRACTORY ? "REFRACTORY" : "FIRED",
+           info.hawkes_should_trigger ? "YES" : "NO");
+    printf("+-----------------------------------------------------------+\n");
+    printf("| Shiryaev-Roberts:\n");
+    printf("|   log_SR_up: %.2f  log_SR_down: %.2f\n", 
+           info.log_sr_up, info.log_sr_down);
+    printf("|   log_H (threshold): %.2f\n", info.log_H);
+    printf("|   σ_peace: %.6f  σ_crisis: %.6f\n", 
+           info.sigma_peace, info.sigma_crisis);
+    printf("+-----------------------------------------------------------+\n");
+    printf("| Statistics:\n");
+    printf("|   Crises: %d  False alarms: %d\n", 
+           info.total_crises, info.false_alarms);
+    printf("|   Clean exits: %d  Re-triggers: %d\n", 
+           info.clean_exits, info.re_triggers);
+    printf("+===========================================================+\n");
+}
