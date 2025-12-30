@@ -8,19 +8,56 @@
  *
  * RBPF_Extended wraps RBPF_KSC with:
  *   1. Storvik online parameter learning (μ_vol, σ_vol per regime)
- *   2. Hawkes self-excitation (jump-sensitive transitions)
+ *   2. Hawkes self-excitation (jump-sensitive transitions via APF kick)
  *   3. Robust OCSN (11th mixture component for outliers)
  *   4. PARIS smoothed Storvik (fixed-lag backward smoother)
- *   5. Adaptive forgetting (regime-aware λ with circuit breaker)
+ *   5. Adaptive forgetting (regime-aware λ with P² circuit breaker)
  *   6. Transition learning (online Dirichlet updates)
+ *   7. KL tempering (information-geometric weight normalization)
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * FILE ORGANIZATION
+ * HEADER ORGANIZATION
  * ═══════════════════════════════════════════════════════════════════════════
  *
- *   rbpf_ksc_param_integration.c      Core lifecycle + step function
- *   rbpf_ext_hawkes.c                 Hawkes + Robust OCSN + Presets
- *   rbpf_ext_smoothed_storvik.c       PARIS fixed-lag smoother
+ *   rbpf_ext_types.h    Constants, enums, struct definitions
+ *   rbpf_ext_api.h      All function declarations (documented)
+ *
+ * This header includes both for backward compatibility.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SOURCE FILE ORGANIZATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   rbpf_ksc_param_integration.c   Core: create, destroy, init, step
+ *   rbpf_ext_config.c              Configuration functions
+ *   rbpf_ext_diagnostics.c         Getters and print functions
+ *   rbpf_ext_hawkes.c              Hawkes + Robust OCSN + Presets
+ *   rbpf_ext_smoothed_storvik.c    PARIS fixed-lag smoother
+ *   rbpf_adaptive_forgetting.c     Adaptive λ with P² circuit breaker
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * QUICK START
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   // Create with Storvik learning
+ *   RBPF_Extended *ext = rbpf_ext_create(1024, 4, RBPF_PARAM_STORVIK);
+ *
+ *   // Configure regimes (or use preset)
+ *   rbpf_ext_apply_preset(ext, RBPF_PRESET_EQUITY_INDEX);
+ *
+ *   // Initialize
+ *   rbpf_ext_init(ext, -4.6f, 0.5f);
+ *
+ *   // Process observations
+ *   RBPF_KSC_Output output;
+ *   for (int t = 0; t < n_obs; t++) {
+ *       rbpf_ext_step(ext, returns[t], &output);
+ *       printf("vol = %.4f, regime = %d\n", 
+ *              output.vol_mean, output.smoothed_regime);
+ *   }
+ *
+ *   // Cleanup
+ *   rbpf_ext_destroy(ext);
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -28,606 +65,10 @@
 #ifndef RBPF_KSC_PARAM_INTEGRATION_H
 #define RBPF_KSC_PARAM_INTEGRATION_H
 
-#include "rbpf_ksc.h"
-#include "rbpf_param_learn.h"
-#include "hawkes_integrator.h"
-#include "p2_quantile.h"
-
-#include <stdint.h>
-#include <stdbool.h>
-
-#ifdef __cplusplus
-extern "C"
-{
-#endif
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * CONSTANTS
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-#define RBPF_MAX_REGIMES 8
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * ENUMS
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    typedef enum
-    {
-        RBPF_PARAM_DISABLED = 0,
-        RBPF_PARAM_LIU_WEST,
-        RBPF_PARAM_STORVIK,
-        RBPF_PARAM_HYBRID
-    } RBPF_ParamMode;
-
-    typedef enum
-    {
-        RBPF_PRESET_CUSTOM = 0,
-        RBPF_PRESET_EQUITY_INDEX,
-        RBPF_PRESET_SINGLE_STOCK,
-        RBPF_PRESET_FX_G10,
-        RBPF_PRESET_FX_EM,
-        RBPF_PRESET_CRYPTO,
-        RBPF_PRESET_COMMODITIES,
-        RBPF_PRESET_BONDS
-    } RBPF_AssetPreset;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * FORWARD DECLARATION (full struct in rbpf_fixed_lag_smoother.h)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    struct RBPF_FixedLagSmoother;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * FORWARD DECLARATION (full struct in rbpf_kl_tempering.h)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    struct RBPF_KL_State;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * ADAPTIVE SIGNAL SOURCE
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    typedef enum
-    {
-        ADAPT_SIGNAL_REGIME = 0,          /* Regime-only (baseline λ) */
-        ADAPT_SIGNAL_OUTLIER_FRAC,        /* Outlier fraction only */
-        ADAPT_SIGNAL_PREDICTIVE_SURPRISE, /* Z-score only */
-        ADAPT_SIGNAL_COMBINED             /* Max of outlier + surprise (recommended) */
-    } RBPF_AdaptSignal;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * ADAPTIVE FORGETTING STATE
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    typedef struct
-    {
-        int enabled;
-        RBPF_AdaptSignal signal_source;
-
-        /* Regime baselines */
-        rbpf_real_t lambda_per_regime[RBPF_MAX_REGIMES];
-
-        /* Surprise tracking */
-        rbpf_real_t surprise_baseline;
-        rbpf_real_t surprise_var;
-        rbpf_real_t surprise_ema_alpha;
-        rbpf_real_t signal_ema;
-        rbpf_real_t signal_ema_alpha;
-
-        /* Sigmoid response */
-        rbpf_real_t sigmoid_center;
-        rbpf_real_t sigmoid_steepness;
-        rbpf_real_t max_discount;
-
-        /* Bounds */
-        rbpf_real_t lambda_floor;
-        rbpf_real_t lambda_ceiling;
-
-        /* Cooldown */
-        int cooldown_ticks;
-        int cooldown_remaining;
-
-        /* Circuit breaker (P² quantile) */
-        int enable_circuit_breaker;
-        double trigger_percentile;
-        int min_ticks_for_lambda;
-        int warmup_ticks;
-        uint64_t ticks_since_last_break;
-        P2Quantile surprise_quantile;
-        uint64_t circuit_breaker_trips;
-        int structural_break_detected;
-        rbpf_real_t last_trigger_percentile_value;
-        rbpf_real_t emergency_lambda_used;
-
-        /* Output */
-        rbpf_real_t lambda_current;
-        rbpf_real_t surprise_current;
-        rbpf_real_t surprise_zscore;
-        rbpf_real_t discount_applied;
-
-        /* ═══════════════════════════════════════════════════════════════════════
-         * LAMBDA OVERRIDE / RESTORE STATE (v3)
-         *
-         * When circuit breaker fires, we override ALL lambda sources with
-         * emergency_lambda. These fields track the original values so we
-         * can restore them after the crisis passes.
-         * ═══════════════════════════════════════════════════════════════════════ */
-
-        /** Flag: emergency lambda override is currently active */
-        int lambda_override_active;
-
-        /** Saved global lambda before override */
-        rbpf_real_t saved_lambda_global;
-
-        /** Saved per-regime lambdas before override */
-        rbpf_real_t saved_lambda_regime[RBPF_MAX_REGIMES];
-
-        /** Number of ticks to blend from emergency → saved lambdas */
-        int restore_blend_ticks;
-
-        /** Ticks elapsed since restoration started */
-        int restore_ticks_elapsed;
-
-        /* Statistics */
-        uint64_t interventions;
-        rbpf_real_t max_surprise_seen;
-        
-
-    } RBPF_AdaptiveForgetting;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * RBPF_Extended: MAIN STRUCTURE
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    typedef struct RBPF_Extended
-    {
-
-        /*───────────────────────────────────────────────────────────────────────
-         * CORE RBPF
-         *───────────────────────────────────────────────────────────────────────*/
-        RBPF_KSC *rbpf;
-        RBPF_ParamMode param_mode;
-
-        /*───────────────────────────────────────────────────────────────────────
-         * STORVIK PARAMETER LEARNING
-         *───────────────────────────────────────────────────────────────────────*/
-        ParamLearner storvik;
-        int storvik_initialized;
-
-        /*───────────────────────────────────────────────────────────────────────
-         * PARTICLE INFO WORKSPACE
-         *───────────────────────────────────────────────────────────────────────*/
-        ParticleInfo *particle_info; /* [N] current tick info */
-        rbpf_real_t *ell_lag_buffer; /* [N] previous tick ℓ values */
-        int *prev_regime;            /* [N] previous tick regimes */
-
-        /*───────────────────────────────────────────────────────────────────────
-         * HAWKES SELF-EXCITATION
-         *───────────────────────────────────────────────────────────────────────*/
-        rbpf_real_t base_trans_matrix[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
-        rbpf_real_t last_hawkes_intensity;
-
-        /*───────────────────────────────────────────────────────────────────────
-         * ROBUST OCSN (11th Component)
-         *───────────────────────────────────────────────────────────────────────*/
-        RBPF_RobustOCSN robust_ocsn;
-        rbpf_real_t last_outlier_fraction;
-
-        /*───────────────────────────────────────────────────────────────────────
-         * ADAPTIVE FORGETTING
-         *───────────────────────────────────────────────────────────────────────*/
-        RBPF_AdaptiveForgetting adaptive_forgetting;
-
-        /*───────────────────────────────────────────────────────────────────────
-         * TRANSITION LEARNING (Online Dirichlet)
-         *───────────────────────────────────────────────────────────────────────*/
-        int trans_learn_enabled;
-        double trans_counts[RBPF_MAX_REGIMES][RBPF_MAX_REGIMES];
-        double trans_forgetting;
-        double trans_prior_diag;
-        double trans_prior_off;
-        int trans_update_interval;
-        int trans_ticks_since_update;
-
-        /*───────────────────────────────────────────────────────────────────────
-         * SMOOTHED STORVIK (PARIS Fixed-Lag)
-         *
-         * When enabled, Storvik receives smoothed (ℓ̃, ℓ̃_lag) from PARIS
-         * instead of filtered values. Reduces parameter oscillation.
-         *
-         * Architecture:
-         *   - Forward pass: RBPF gives IMMEDIATE vol_mean for trading
-         *   - Backward pass: PARIS smooths L-tick window for Storvik
-         *───────────────────────────────────────────────────────────────────────*/
-        int smoothed_storvik_enabled;           /* 0 = filtered, 1 = smoothed */
-        int smoothed_storvik_lag;               /* L = smoothing lag (default: 50) */
-        struct RBPF_FixedLagSmoother *smoother; /* NULL when disabled */
-
-        /* Cooldown state (prevents flush cascade during volatility waterfall) */
-        int cooldown_remaining;   /* Ticks until next flush allowed */
-        int min_buffer_for_flush; /* Min ticks before flush (default: 10) */
-
-        /* ESS collapse threshold for buffer reset */
-        float ess_collapse_threshold; /* Default: N/20 */
-
-        /* Diagnostics */
-        uint64_t flush_count; /* Emergency flushes (P² triggered) */
-        uint64_t reset_count; /* ESS-collapse resets */
-
-        /*───────────────────────────────────────────────────────────────────────
-         * POLICY ENGINE STATE
-         *
-         * The Extended layer owns the decision logic for regime change detection.
-         * Core layer (KSC) only computes raw signals; this layer interprets them.
-         *───────────────────────────────────────────────────────────────────────*/
-        int prev_sprt_regime; /* Previous SPRT-confirmed regime */
-
-        /*───────────────────────────────────────────────────────────────────────
-         * KL TEMPERING (Information-Geometric Weight Normalization)
-         *
-         * Prevents "numerical genocide" of particles by limiting how much
-         * a single observation can change the weight distribution.
-         *
-         * The KL divergence between proposed and current weights is clamped
-         * to log(N) nats - the "speed of light" for information flow.
-         *───────────────────────────────────────────────────────────────────────*/
-        struct RBPF_KL_State *kl_state; /* NULL when disabled */
-        int kl_tempering_enabled;       /* 1 = use KL tempering */
-
-        /*───────────────────────────────────────────────────────────────────────
-         * MISC STATE
-         *───────────────────────────────────────────────────────────────────────*/
-        int structural_break_signaled;
-        RBPF_AssetPreset current_preset;
-        uint64_t tick_count;
-
-        int last_resampled;
-
-        HawkesIntegrator hawkes_integrator;
-        int apf_kick_enabled;
-        float apf_surprise_threshold;
-
-
-    } RBPF_Extended;
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 1: CORE LIFECYCLE (rbpf_ksc_param_integration.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    /**
-     * Create RBPF_Extended instance
-     */
-    RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mode);
-
-    /**
-     * Destroy RBPF_Extended instance
-     */
-    void rbpf_ext_destroy(RBPF_Extended *ext);
-
-    /**
-     * Initialize filter state
-     */
-    void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0);
-
-    /**
-     * Main step function - processes one observation
-     */
-    void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output);
-
-    /**
-     * APF step (lookahead) - currently disabled, falls back to standard
-     */
-    void rbpf_ext_step_apf(RBPF_Extended *ext, rbpf_real_t obs_current,
-                           rbpf_real_t obs_next, RBPF_KSC_Output *output);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 2: BASIC CONFIGURATION (rbpf_ksc_param_integration.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    /**
-     * Set regime parameters (θ, μ_vol, σ_vol)
-     */
-    void rbpf_ext_set_regime_params(RBPF_Extended *ext, int regime,
-                                    rbpf_real_t theta, rbpf_real_t mu_vol,
-                                    rbpf_real_t sigma_vol);
-
-    /**
-     * Build transition LUT from probability matrix
-     */
-    void rbpf_ext_build_transition_lut(RBPF_Extended *ext, const rbpf_real_t *trans_matrix);
-
-    /**
-     * Set Storvik sampling interval for regime
-     */
-    void rbpf_ext_set_storvik_interval(RBPF_Extended *ext, int regime, int interval);
-
-    /**
-     * Enable HFT mode (regime-adaptive sampling)
-     */
-    void rbpf_ext_set_hft_mode(RBPF_Extended *ext, int enable);
-
-    /**
-     * Enable full update mode (every tick, all regimes)
-     */
-    void rbpf_ext_set_full_update_mode(RBPF_Extended *ext);
-
-    /**
-     * Signal structural break (triggers circuit breaker)
-     */
-    void rbpf_ext_signal_structural_break(RBPF_Extended *ext);
-
-    /**
-     * Check if structural break was detected (circuit breaker tripped)
-     * Implementation in rbpf_adaptive_forgetting.c
-     */
-    int rbpf_ext_structural_break_detected(const RBPF_Extended *ext);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 3: TRANSITION LEARNING (rbpf_ksc_param_integration.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void rbpf_ext_enable_transition_learning(RBPF_Extended *ext, int enable);
-    void rbpf_ext_configure_transition_learning(RBPF_Extended *ext,
-                                                double forgetting,
-                                                double prior_diag,
-                                                double prior_off,
-                                                int update_interval);
-    void rbpf_ext_reset_transition_counts(RBPF_Extended *ext);
-    double rbpf_ext_get_transition_prob(const RBPF_Extended *ext, int from, int to);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 4: PARAMETER ACCESS (rbpf_ksc_param_integration.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void rbpf_ext_get_learned_params(const RBPF_Extended *ext, int regime,
-                                     rbpf_real_t *mu_vol, rbpf_real_t *sigma_vol);
-    void rbpf_ext_get_storvik_summary(const RBPF_Extended *ext, int regime,
-                                      RegimeParams *summary);
-    void rbpf_ext_get_learning_stats(const RBPF_Extended *ext,
-                                     uint64_t *stat_updates,
-                                     uint64_t *samples_drawn,
-                                     uint64_t *samples_skipped);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 5: DIAGNOSTICS (rbpf_ksc_param_integration.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void rbpf_ext_print_config(const RBPF_Extended *ext);
-    void rbpf_ext_print_storvik_stats(const RBPF_Extended *ext, int regime);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 6: HAWKES SELF-EXCITATION (rbpf_ext_hawkes.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void rbpf_ext_enable_hawkes(RBPF_Extended *ext,
-                                rbpf_real_t mu, rbpf_real_t alpha,
-                                rbpf_real_t beta, rbpf_real_t threshold);
-    void rbpf_ext_disable_hawkes(RBPF_Extended *ext);
-    void rbpf_ext_set_hawkes_boost(RBPF_Extended *ext,
-                                   rbpf_real_t boost_scale, rbpf_real_t boost_cap);
-    void rbpf_ext_enable_adaptive_hawkes(RBPF_Extended *ext, int enable);
-    void rbpf_ext_set_hawkes_regime_scale(RBPF_Extended *ext, int regime, rbpf_real_t scale);
-    rbpf_real_t rbpf_ext_get_hawkes_intensity(const RBPF_Extended *ext);
-
-    /* Internal Hawkes functions (called from rbpf_ext_step) */
-    void rbpf_ext_hawkes_apply_to_transitions(RBPF_Extended *ext);
-    void rbpf_ext_hawkes_update_intensity(RBPF_Extended *ext, rbpf_real_t obs);
-    void rbpf_ext_hawkes_restore_base_transitions(RBPF_Extended *ext);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 7: ROBUST OCSN (rbpf_ext_hawkes.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void rbpf_ext_enable_robust_ocsn(RBPF_Extended *ext);
-    void rbpf_ext_enable_robust_ocsn_simple(RBPF_Extended *ext,
-                                            rbpf_real_t prob, rbpf_real_t variance);
-    void rbpf_ext_set_outlier_params(RBPF_Extended *ext, int regime,
-                                     rbpf_real_t prob, rbpf_real_t variance);
-    void rbpf_ext_disable_robust_ocsn(RBPF_Extended *ext);
-    rbpf_real_t rbpf_ext_get_outlier_fraction(const RBPF_Extended *ext);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 8: ASSET PRESETS (rbpf_ext_hawkes.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void rbpf_ext_apply_preset(RBPF_Extended *ext, RBPF_AssetPreset preset);
-    RBPF_AssetPreset rbpf_ext_get_preset(const RBPF_Extended *ext);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 9: SMOOTHED STORVIK (rbpf_ext_smoothed_storvik.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    /**
-     * Enable PARIS-smoothed Storvik parameter learning
-     *
-     * Replaces filtered (ℓ, ℓ_lag) with smoothed (ℓ̃, ℓ̃_lag) in Storvik updates.
-     * Trading signal (vol_mean) remains IMMEDIATE - no delay.
-     * Only parameter learning gets L-tick smoothed values.
-     *
-     * @param ext   RBPF_Extended handle
-     * @param lag   Smoothing lag L (recommended: 50 for HFT)
-     * @return      0 on success, -1 on failure
-     */
-    int rbpf_ext_enable_smoothed_storvik(RBPF_Extended *ext, int lag);
-
-    /**
-     * Disable PARIS-smoothed Storvik (revert to filtered baseline)
-     */
-    void rbpf_ext_disable_smoothed_storvik(RBPF_Extended *ext);
-
-    /**
-     * Check if smoothed Storvik is enabled
-     */
-    int rbpf_ext_is_smoothed_storvik_enabled(const RBPF_Extended *ext);
-
-    /**
-     * Get smoothed Storvik diagnostics
-     */
-    void rbpf_ext_get_smoother_stats(const RBPF_Extended *ext,
-                                     uint64_t *flush_count,
-                                     uint64_t *reset_count,
-                                     double *avg_smooth_us,
-                                     int *buffer_fill);
-
-    /**
-     * Configure smoothed Storvik parameters
-     */
-    void rbpf_ext_configure_smoother(RBPF_Extended *ext,
-                                     int min_buffer_for_flush,
-                                     float ess_collapse_thresh);
-
-    /**
-     * Internal: Process smoother step (called from rbpf_ext_step)
-     */
-    void rbpf_ext_smoother_step(RBPF_Extended *ext, const RBPF_KSC_Output *output);
-
-    /**
-     * Print smoother configuration
-     */
-    void rbpf_ext_print_smoother_config(const RBPF_Extended *ext);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 10: ADAPTIVE FORGETTING (rbpf_adaptive_forgetting.c)
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    void rbpf_adaptive_forgetting_init(RBPF_AdaptiveForgetting *af);
-    void rbpf_adaptive_forgetting_update(RBPF_Extended *ext, rbpf_real_t marginal_lik, int dominant_regime);
-
-    void rbpf_ext_enable_adaptive_forgetting(RBPF_Extended *ext);
-    void rbpf_ext_enable_adaptive_forgetting_mode(RBPF_Extended *ext, RBPF_AdaptSignal signal);
-    void rbpf_ext_disable_adaptive_forgetting(RBPF_Extended *ext);
-    void rbpf_ext_set_regime_lambda(RBPF_Extended *ext, int regime, rbpf_real_t lambda);
-    void rbpf_ext_set_adaptive_sigmoid(RBPF_Extended *ext,
-                                       rbpf_real_t center,
-                                       rbpf_real_t steepness,
-                                       rbpf_real_t max_discount);
-    void rbpf_ext_set_adaptive_bounds(RBPF_Extended *ext,
-                                      rbpf_real_t floor,
-                                      rbpf_real_t ceiling);
-    void rbpf_ext_set_adaptive_smoothing(RBPF_Extended *ext,
-                                         rbpf_real_t baseline_alpha,
-                                         rbpf_real_t signal_alpha);
-    void rbpf_ext_set_adaptive_cooldown(RBPF_Extended *ext, int ticks);
-
-    void rbpf_ext_enable_circuit_breaker(RBPF_Extended *ext, double quantile, int window);
-    void rbpf_ext_disable_circuit_breaker(RBPF_Extended *ext);
-    void rbpf_ext_set_circuit_breaker_min_memory(RBPF_Extended *ext, int min_ticks);
-    uint64_t rbpf_ext_get_circuit_breaker_trips(const RBPF_Extended *ext);
-    rbpf_real_t rbpf_ext_get_circuit_breaker_threshold(const RBPF_Extended *ext);
-    rbpf_real_t rbpf_ext_get_last_emergency_lambda(const RBPF_Extended *ext);
-
-    rbpf_real_t rbpf_ext_get_current_lambda(const RBPF_Extended *ext);
-    rbpf_real_t rbpf_ext_get_surprise_zscore(const RBPF_Extended *ext);
-    void rbpf_ext_get_adaptive_stats(const RBPF_Extended *ext,
-                                     uint64_t *interventions,
-                                     rbpf_real_t *current_lambda,
-                                     rbpf_real_t *max_surprise);
-    void rbpf_ext_print_adaptive_config(const RBPF_Extended *ext);
-
-    /**
-     * @brief Set restoration blend duration
-     *
-     * After circuit breaker cooldown expires, per-regime lambdas are
-     * gradually restored over this many ticks.
-     *
-     * @param ext    Extended RBPF handle
-     * @param ticks  Number of ticks to blend from emergency → saved (default 50)
-     */
-    void rbpf_ext_set_circuit_breaker_restore_ticks(RBPF_Extended *ext, int ticks);
-
-    /**
-     * @brief Check if lambda override is currently active
-     *
-     * Returns true between circuit breaker trip and restoration completion.
-     */
-    int rbpf_ext_lambda_override_active(const RBPF_Extended *ext);
-
-    /**
-     * @brief Get restoration progress (0.0 to 1.0)
-     *
-     * Returns how far along the lambda restoration process is.
-     * 0.0 = just started (using emergency lambda)
-     * 1.0 = complete (using original per-regime lambdas)
-     */
-    rbpf_real_t rbpf_ext_get_restore_progress(const RBPF_Extended *ext);
-
-    /*═══════════════════════════════════════════════════════════════════════════
-     * SECTION 11: KL TEMPERING (rbpf_kl_tempering.c)
-     *
-     * Information-geometric weight normalization. Prevents "numerical genocide"
-     * of particles by clamping KL divergence to log(N) nats per tick.
-     *═══════════════════════════════════════════════════════════════════════════*/
-
-    /**
-     * @brief Enable KL tempering
-     *
-     * When enabled, weight updates are tempered based on KL divergence
-     * to prevent particle collapse on extreme observations.
-     *
-     * @param ext   Extended RBPF instance
-     */
-    void rbpf_ext_enable_kl_tempering(RBPF_Extended *ext);
-
-    /**
-     * @brief Disable KL tempering (use standard weight updates)
-     */
-    void rbpf_ext_disable_kl_tempering(RBPF_Extended *ext);
-
-    /**
-     * @brief Check if KL tempering is enabled
-     */
-    int rbpf_ext_kl_tempering_enabled(const RBPF_Extended *ext);
-
-    /**
-     * @brief Get last tempering factor β
-     *
-     * @return β ∈ [0.1, 1.0], where 1.0 = full update, <1.0 = tempered
-     */
-    rbpf_real_t rbpf_ext_get_last_beta(const RBPF_Extended *ext);
-
-    /**
-     * @brief Get last KL divergence
-     *
-     * @return KL(proposed || old) in nats
-     */
-    rbpf_real_t rbpf_ext_get_last_kl(const RBPF_Extended *ext);
-
-    /**
-     * @brief Get KL ceiling (log N)
-     *
-     * @return Hard limit on per-tick information in nats
-     */
-    rbpf_real_t rbpf_ext_get_kl_ceiling(const RBPF_Extended *ext);
-
-    /**
-     * @brief Get zombie reset count
-     *
-     * Number of times particles were detected as "zombies" (sustained β < 0.5)
-     * and a forced reset was triggered.
-     */
-    uint64_t rbpf_ext_get_zombie_resets(const RBPF_Extended *ext);
-
-    /**
-     * @brief Print KL tempering diagnostics
-     */
-    void rbpf_ext_print_kl_diagnostics(const RBPF_Extended *ext);
-
-    /* APF Kick Configuration */
-    void rbpf_ext_enable_apf_kick(RBPF_Extended *ext, int enable);
-    int rbpf_ext_apf_kick_enabled(const RBPF_Extended *ext);
-    void rbpf_ext_configure_hawkes(RBPF_Extended *ext, const HawkesIntegratorConfig *cfg);
-    void rbpf_ext_configure_hawkes_params(RBPF_Extended *ext,
-                                          float mu, float alpha, float beta,
-                                          float event_threshold);
-    float rbpf_ext_get_hawkes_intensity(const RBPF_Extended *ext);
-    float rbpf_ext_get_hawkes_surprise(const RBPF_Extended *ext);
-    int rbpf_ext_hawkes_is_ready(const RBPF_Extended *ext);
-    void rbpf_ext_print_hawkes_state(const RBPF_Extended *ext);
-    void rbpf_ext_set_apf_surprise_threshold(RBPF_Extended *ext, float threshold);
-float rbpf_ext_get_apf_surprise_threshold(const RBPF_Extended *ext);
-
-#ifdef __cplusplus
-}
-#endif
+/* Type definitions: constants, enums, structs */
+#include "rbpf_ext_types.h"
+
+/* Function declarations */
+#include "rbpf_ext_api.h"
 
 #endif /* RBPF_KSC_PARAM_INTEGRATION_H */
