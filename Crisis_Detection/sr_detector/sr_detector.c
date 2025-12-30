@@ -14,6 +14,24 @@
 #include <stdlib.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * PLATFORM COMPATIBILITY (Windows/MSVC vs Linux/GCC)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#if defined(_MSC_VER)
+/* MSVC on Windows */
+#include <malloc.h>
+#define sr_alloca(size) _alloca(size)
+#define sr_aligned_alloc(align, size) _aligned_malloc((size), (align))
+#define sr_aligned_free(ptr) _aligned_free(ptr)
+#else
+/* GCC/Clang on Linux/Mac */
+#include <alloca.h>
+#define sr_alloca(size) alloca(size)
+#define sr_aligned_alloc(align, size) aligned_alloc((align), (size))
+#define sr_aligned_free(ptr) free(ptr)
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * PLATFORM DETECTION
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -788,11 +806,11 @@ float sr_update_batch(
 
     if (on_stack)
     {
-        log_lr = (float *)alloca(n * sizeof(float));
+        log_lr = (float *)sr_alloca(n * sizeof(float));
     }
     else
     {
-        log_lr = (float *)aligned_alloc(SR_ALIGN, n * sizeof(float));
+        log_lr = (float *)sr_aligned_alloc(SR_ALIGN, n * sizeof(float));
     }
 
     /* Compute all log-LRs */
@@ -803,7 +821,7 @@ float sr_update_batch(
 
     if (!on_stack)
     {
-        free(log_lr);
+        sr_aligned_free(log_lr);
     }
 
     return final;

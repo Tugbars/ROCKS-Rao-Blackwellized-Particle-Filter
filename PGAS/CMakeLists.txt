@@ -142,7 +142,6 @@ endif()
 #───────────────────────────────────────────────────────────────────────────────
 
 add_subdirectory(test-bench)
-add_subdirectory(hawkes_signal)
 add_subdirectory(kl_trigger)
 add_subdirectory(saem_blender)
 add_subdirectory(thompson_sampler)

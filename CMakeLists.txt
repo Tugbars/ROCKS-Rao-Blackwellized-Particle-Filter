@@ -78,6 +78,9 @@ endif()
 # Add Subdirectories
 #───────────────────────────────────────────────────────────────────────────────
 
+# Crisis Detection subdirectory
+add_subdirectory(Crisis_Detection)
+
 # Core RBPF library (online filtering)
 add_subdirectory(RBPF)
 
@@ -86,6 +89,7 @@ add_subdirectory(PGAS)
 
 # Hawkes MLE subdirectory
 add_subdirectory(Hawkes_MLE)
+
 
 #───────────────────────────────────────────────────────────────────────────────
 # Summary

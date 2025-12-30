@@ -79,7 +79,7 @@ target_include_directories(rocks
         ${CMAKE_CURRENT_SOURCE_DIR}/pmmh
         ${CMAKE_CURRENT_SOURCE_DIR}/duration_tracker
         ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS
-        ${CMAKE_CURRENT_SOURCE_DIR}/../PGAS/hawkes_signal
+        ${CMAKE_CURRENT_SOURCE_DIR}/../Crisis_Detection/hawkes_signal
 )
 
 target_link_libraries(rocks 

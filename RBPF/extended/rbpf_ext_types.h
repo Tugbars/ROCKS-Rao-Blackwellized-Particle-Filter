@@ -21,7 +21,6 @@
 #include "rbpf_param_learn.h"
 #include "hawkes_integrator.h"
 #include "p2_quantile.h"
-
 #include <stdint.h>
 #include <stdbool.h>
 
