@@ -426,7 +426,7 @@ static void propagate_reference_forward_vectorized(PGASSlidingState *state,
                  state->ws_rng_uniform, 0.0f, 1.0f);
 
     /* Generate standard Normals for AR(1) noise */
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, n_needed,
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n_needed,
                   state->ws_rng_normal, 0.0f, 1.0f);
 
     /* ═══════════════════════════════════════════════════════════════════════

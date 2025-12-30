@@ -755,7 +755,7 @@ static void csmc_init_mkl(PGASMKLState *state)
 
     /* Generate standard normal N(0,1) - will scale by per-regime sigma_vol below
      * This is more efficient than generating K different distributions */
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, N,
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, N,
                   state->ws_normal, 0.0f, 1.0f);
 
     /* Initialize particles at t=0 (stride = Np for SIMD alignment) */

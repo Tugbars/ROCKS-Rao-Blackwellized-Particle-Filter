@@ -1012,7 +1012,7 @@ void pgas_paris_sample_mu_vol(PGASParisState *state,
         {
             /* No data for this regime, sample from prior */
             float sample;
-            vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1,
+            vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1,
                           &sample, m0, sqrtf(s0_sq));
             pgas->model.mu_vol[k] = sample;
             continue;
@@ -1039,7 +1039,7 @@ void pgas_paris_sample_mu_vol(PGASParisState *state,
 
         /* Sample from posterior */
         float sample;
-        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1,
+        vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1,
                       &sample, (float)mean_post, sqrtf((float)var_post));
 
         pgas->model.mu_vol[k] = sample;
@@ -1206,7 +1206,7 @@ void pgas_paris_sample_phi(PGASParisState *state,
     /* Propose new φ via random walk on logit scale */
     float logit_curr = logit(phi_curr, phi_min, phi_max);
     float noise;
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1,
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1,
                   &noise, 0.0f, prior->phi_proposal_std);
     float logit_prop = logit_curr + noise;
     float phi_prop = inv_logit(logit_prop, phi_min, phi_max);

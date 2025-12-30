@@ -115,7 +115,7 @@ static void generate_synthetic_data(SyntheticData *data, int T, uint32_t seed)
     float *normal = (float *)malloc(T * sizeof(float));
 
     vsRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, T, uniform, 0.0f, 1.0f);
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, T, normal, 0.0f, TRUE_SIGMA_H);
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, T, normal, 0.0f, TRUE_SIGMA_H);
 
     /* Generate latent process */
     for (int t = 1; t < T; t++)
@@ -142,7 +142,7 @@ static void generate_synthetic_data(SyntheticData *data, int T, uint32_t seed)
 
     /* Generate observations: raw returns (matches test_regime_learning) */
     float *obs_noise = (float *)malloc(T * sizeof(float));
-    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, T, obs_noise, 0.0f, 1.0f);
+    vsRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, T, obs_noise, 0.0f, 1.0f);
     for (int t = 0; t < T; t++)
     {
         float vol = expf(0.5f * data->true_h[t]);

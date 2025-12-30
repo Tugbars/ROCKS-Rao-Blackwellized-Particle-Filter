@@ -75,7 +75,7 @@ static double sample_ocsn(VSLStreamStatePtr stream)
 {
     int comp = sample_categorical(OCSN_PROB, 10, stream);
     double z;
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z,
+    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1, &z,
                   OCSN_MEAN[comp], sqrt(OCSN_VAR[comp]));
     return z;
 }
@@ -112,7 +112,7 @@ SyntheticData *generate_synthetic_data(int K, int T, const double *trans,
     double h_mean = mu_vol[init_regime];
     double h_var = (sigma_vol[init_regime] * sigma_vol[init_regime]) / (1.0 - phi * phi);
     double z;
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, 0.0, sqrt(h_var));
+    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1, &z, 0.0, sqrt(h_var));
     data->true_h[0] = (float)(h_mean + z);
     data->observations[0] = data->true_h[0] + (float)sample_ocsn(stream);
 
@@ -122,7 +122,7 @@ SyntheticData *generate_synthetic_data(int K, int T, const double *trans,
         data->true_regimes[t] = sample_categorical(&trans[prev * K], K, stream);
         int curr = data->true_regimes[t];
         double mean_h = mu_vol[curr] * (1.0 - phi) + phi * data->true_h[t - 1];
-        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, 0.0, sigma_vol[curr]);
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1, &z, 0.0, sigma_vol[curr]);
         data->true_h[t] = (float)(mean_h + z);
         data->observations[t] = data->true_h[t] + (float)sample_ocsn(stream);
     }

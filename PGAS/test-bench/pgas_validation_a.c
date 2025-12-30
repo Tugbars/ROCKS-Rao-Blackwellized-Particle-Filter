@@ -107,7 +107,7 @@ static double sample_ocsn(VSLStreamStatePtr stream)
 
     /* Then sample from that Gaussian component */
     double z;
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z,
+    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1, &z,
                   OCSN_MEAN[comp], sqrt(OCSN_VAR[comp]));
     return z;
 }
@@ -149,7 +149,7 @@ SyntheticData *generate_synthetic_data(
     double h_mean = mu_vol[data->true_regimes[0]];
     double h_var = (sigma_h * sigma_h) / (1.0 - phi * phi);
     double z;
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, 0.0, sqrt(h_var));
+    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1, &z, 0.0, sqrt(h_var));
     data->true_h[0] = (float)(h_mean + z);
 
     /* Generate observation y_0 = h_0 + epsilon (OCSN noise) */
@@ -168,7 +168,7 @@ SyntheticData *generate_synthetic_data(
         double mu_k = mu_vol[curr_regime];
         double mean_h = mu_k * (1.0 - phi) + phi * data->true_h[t - 1];
 
-        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER, stream, 1, &z, 0.0, sigma_h);
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, 1, &z, 0.0, sigma_h);
         data->true_h[t] = (float)(mean_h + z);
 
         /* Observation: y_t = h_t + epsilon (OCSN) */
