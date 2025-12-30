@@ -276,6 +276,70 @@ static void free_synthetic_data(SyntheticData *data)
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
+ * CRAMER-RAO BOUND CALCULATION
+ *───────────────────────────────────────────────────────────────────────────*/
+
+typedef struct {
+    double avg_bound_rmse; // The theoretical lower limit for RMSE
+    double *daily_bounds;  // The bound at each tick
+} CRB_Result;
+
+static CRB_Result compute_conditional_pcrb(SyntheticData *data)
+{
+    int n = data->n_ticks;
+    double *bounds = (double *)malloc(n * sizeof(double));
+    
+    /* * J is the Fisher Information Matrix (scalar for 1D log-vol).
+     * Initialize with steady-state info of the starting regime.
+     */
+    double J = 1.0 / (TRUE_PARAMS[HYPO_CALM].sigma_eta * TRUE_PARAMS[HYPO_CALM].sigma_eta); 
+    double sum_bound_sq = 0.0;
+
+    /* Constant Fisher Information for observing y_t w.r.t h_t in SV models 
+     * assuming Gaussian observation noise. 
+     * E[-d^2/dh^2 log p(y|h)] = 0.5 */
+    const double I_obs = 0.5;
+
+    for (int t = 0; t < n; t++) {
+        /* 1. Get True Parameters for this moment's regime */
+        int r = data->true_hypothesis[t];
+        double phi = TRUE_PARAMS[r].phi;
+        double sigma_eta = TRUE_PARAMS[r].sigma_eta;
+        double sigma_sq = sigma_eta * sigma_eta;
+
+        /* * 2. Tichavsky Recursion for Posterior Information 
+         * J_t = I_obs + inv( Q + inv( phi^2 * J_{t-1} ) )
+         * Where Q is process noise variance.
+         */
+        
+        /* Information propagated from previous step */
+        double J_pred = (phi * phi) * J;
+        
+        /* Information loss due to process noise diffusion */
+        /* If J_pred is high (certainty), process noise lowers it. */
+        double J_prior = 1.0 / (sigma_sq + (1.0 / J_pred));
+        
+        /* Add new information from observation */
+        /* Note: If it is an outlier, I_obs technically changes, 
+         * but standard CRB assumes the model holds. */
+        J = J_prior + I_obs;
+
+        /* 3. The Bound is the sqrt of the inverse Information */
+        bounds[t] = sqrt(1.0 / J);
+        
+        /* Accumulate MSE for average RMSE calculation */
+        sum_bound_sq += (1.0 / J);
+    }
+
+    CRB_Result res;
+    res.daily_bounds = bounds;
+    /* The "Average Bound" is the sqrt of the mean variance bound */
+    res.avg_bound_rmse = sqrt(sum_bound_sq / n);
+    
+    return res;
+}
+
+/*─────────────────────────────────────────────────────────────────────────────
  * TICK RECORD
  *───────────────────────────────────────────────────────────────────────────*/
 
@@ -738,6 +802,21 @@ int main(int argc, char **argv)
     /* Compute metrics */
     SummaryMetrics metrics;
     compute_metrics(records, data, &metrics);
+
+    /* Compute Theoretical Lower Bound */
+    CRB_Result crb = compute_conditional_pcrb(data);
+
+    printf("\n  THEORETICAL BENCHMARK (Cramér-Rao Bound)\n");
+    printf("  ────────────────────────────────────────────────────────────────────────────\n");
+    printf("    Theoretical Min RMSE:   %.4f\n", crb.avg_bound_rmse);
+    printf("    RBPF Log-Vol RMSE:      %.4f\n", metrics.log_vol_rmse);
+    
+    double efficiency = crb.avg_bound_rmse / metrics.log_vol_rmse;
+    printf("    Estimator Efficiency:   %.1f%% (100%% is optimal)\n", efficiency * 100.0);
+    printf("    Note: <100%% due to regime uncertainty and outliers.\n");
+    printf("  ══════════════════════════════════════════════════════════════════════════════\n");
+
+    free(crb.daily_bounds);
 
     /* Write CSV */
     printf("\nWriting CSV...\n");
