@@ -8,6 +8,7 @@ project(crisis_detection VERSION 1.0.0 LANGUAGES C)
 option(USE_MKL "Use Intel MKL for vectorized math" ON)
 option(BUILD_TESTS "Build test executables" ON)
 option(BUILD_BENCH "Build benchmark executable" ON)
+option(BUILD_PYTHON_LIB "Build shared library for Python bindings" ON)
 set(SIMD_ARCH "native" CACHE STRING "SIMD architecture: native, avx512, avx2, sse4, none")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -18,26 +19,28 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_C_STANDARD 11)
     set(CMAKE_C_STANDARD_REQUIRED ON)
 
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic")
-    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
-    set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
-    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+    if(NOT MSVC)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic")
+        set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+        set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
+        set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
 
-    # SIMD flags
-    if(SIMD_ARCH STREQUAL "native")
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native")
-    elseif(SIMD_ARCH STREQUAL "avx512")
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=skylake-avx512")
-    elseif(SIMD_ARCH STREQUAL "avx2")
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=haswell")
-    elseif(SIMD_ARCH STREQUAL "sse4")
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse4.2")
-    endif()
+        # SIMD flags
+        if(SIMD_ARCH STREQUAL "native")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native")
+        elseif(SIMD_ARCH STREQUAL "avx512")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=skylake-avx512")
+        elseif(SIMD_ARCH STREQUAL "avx2")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=haswell")
+        elseif(SIMD_ARCH STREQUAL "sse4")
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse4.2")
+        endif()
 
-    include(CheckCCompilerFlag)
-    check_c_compiler_flag("-mfma" COMPILER_SUPPORTS_FMA)
-    if(COMPILER_SUPPORTS_FMA)
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mfma")
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag("-mfma" COMPILER_SUPPORTS_FMA)
+        if(COMPILER_SUPPORTS_FMA)
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mfma")
+        endif()
     endif()
 endif()
 
@@ -143,6 +146,16 @@ if(UNIX)
     target_link_libraries(sr_detector PUBLIC m)
 endif()
 
+# MKL for sr_detector (uses VML functions)
+if(TARGET MKL::MKL)
+    target_link_libraries(sr_detector PUBLIC MKL::MKL)
+    target_compile_definitions(sr_detector PUBLIC __INTEL_MKL__ USE_MKL=1)
+elseif(MKL_FOUND)
+    target_compile_definitions(sr_detector PUBLIC __INTEL_MKL__ USE_MKL=1)
+    target_include_directories(sr_detector PUBLIC ${MKL_INCLUDE_DIR})
+    target_link_libraries(sr_detector PUBLIC ${MKL_LIBRARIES})
+endif()
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LIBRARY: event_detector (standalone)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -194,6 +207,77 @@ elseif(MKL_FOUND)
     message(STATUS "  crisis_detection - with MKL (manual)")
 else()
     message(STATUS "  crisis_detection - scalar fallback (no MKL)")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARED LIBRARY: libcrisis (for Python bindings)
+# ═══════════════════════════════════════════════════════════════════════════════
+if(BUILD_PYTHON_LIB)
+    # Source files for shared library
+    set(CRISIS_SHARED_SOURCES
+        sr_detector/sr_detector.c
+        event_detector/event_detector.c
+        hawkes_signal/hawkes_integrator.c
+        crisis_detector/crisis_detector.c
+    )
+
+    # On Windows, add the .def file for exports
+    if(WIN32 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libcrisis.def)
+        set(CRISIS_SHARED_SOURCES ${CRISIS_SHARED_SOURCES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/libcrisis.def
+        )
+        message(STATUS "  libcrisis - using libcrisis.def for exports")
+    endif()
+
+    add_library(crisis SHARED ${CRISIS_SHARED_SOURCES})
+
+    target_include_directories(crisis PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/sr_detector
+        ${CMAKE_CURRENT_SOURCE_DIR}/event_detector
+        ${CMAKE_CURRENT_SOURCE_DIR}/hawkes_signal
+        ${CMAKE_CURRENT_SOURCE_DIR}/crisis_detector
+    )
+
+    # Platform-specific settings
+    if(WIN32)
+        # Windows: output as libcrisis.dll
+        set_target_properties(crisis PROPERTIES
+            OUTPUT_NAME "libcrisis"
+            PREFIX ""
+            SUFFIX ".dll"
+        )
+    else()
+        # Linux/Mac: output as libcrisis.so
+        set_target_properties(crisis PROPERTIES
+            OUTPUT_NAME "crisis"
+            PREFIX "lib"
+        )
+        target_link_libraries(crisis PUBLIC m)
+    endif()
+
+    # MKL acceleration for shared library
+    if(TARGET MKL::MKL)
+        target_link_libraries(crisis PUBLIC MKL::MKL)
+        target_compile_definitions(crisis PUBLIC __INTEL_MKL__ USE_MKL=1)
+        message(STATUS "  libcrisis (Python) - with MKL::MKL")
+    elseif(MKL_FOUND)
+        target_compile_definitions(crisis PUBLIC __INTEL_MKL__ USE_MKL=1)
+        target_include_directories(crisis PUBLIC ${MKL_INCLUDE_DIR})
+        target_link_libraries(crisis PUBLIC ${MKL_LIBRARIES})
+        if(UNIX)
+            target_link_libraries(crisis PUBLIC pthread dl)
+        endif()
+        message(STATUS "  libcrisis (Python) - with MKL (manual)")
+    else()
+        message(STATUS "  libcrisis (Python) - scalar fallback (no MKL)")
+    endif()
+
+    # Install shared library
+    install(TARGETS crisis
+        RUNTIME DESTINATION bin      # Windows DLL
+        LIBRARY DESTINATION lib      # Linux/Mac .so
+    )
 endif()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -274,11 +358,15 @@ message(STATUS "  SIMD arch:      ${SIMD_ARCH}")
 message(STATUS "  MKL:            ${MKL_FOUND}")
 message(STATUS "  Build tests:    ${BUILD_TESTS}")
 message(STATUS "  Build bench:    ${BUILD_BENCH}")
+message(STATUS "  Python lib:     ${BUILD_PYTHON_LIB}")
 message(STATUS "")
 message(STATUS "  Libraries:")
 message(STATUS "    - hawkes_integrator  (standalone, for RBPF)")
 message(STATUS "    - sr_detector        (standalone)")
 message(STATUS "    - event_detector     (standalone)")
-message(STATUS "    - crisis_detection   (combined)")
+message(STATUS "    - crisis_detection   (combined static)")
+if(BUILD_PYTHON_LIB)
+message(STATUS "    - libcrisis          (shared, for Python)")
+endif()
 message(STATUS "═══════════════════════════════════════════════════════")
 message(STATUS "")

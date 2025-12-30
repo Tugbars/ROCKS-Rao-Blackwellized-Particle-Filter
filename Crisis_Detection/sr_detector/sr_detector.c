@@ -36,7 +36,7 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #ifdef __INTEL_MKL__
-#define SR_USE_MKL 1
+#define SR_USE_MKL 0
 #include <mkl.h>
 #else
 #define SR_USE_MKL 0

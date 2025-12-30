@@ -1,0 +1,83 @@
+; libcrisis.def - Export definitions for Windows DLL
+; Only functions that are actually compiled (not static inline)
+
+LIBRARY libcrisis
+EXPORTS
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; Crisis Detector (crisis_detector.c)
+    ; ═══════════════════════════════════════════════════════════════════════
+    crisis_detector_config_default
+    crisis_detector_config_sensitive
+    crisis_detector_config_conservative
+    crisis_detector_init
+    crisis_detector_reset
+    crisis_detector_free
+    crisis_detector_get_sigma_peace
+    crisis_detector_set_sigma_peace
+    crisis_detector_update
+    crisis_detector_update_full
+    crisis_detector_get_info
+    crisis_detector_print_state
+    
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; SR Detector (sr_detector.c)
+    ; ═══════════════════════════════════════════════════════════════════════
+    sr_log_lr_gaussian
+    sr_log_lr_student_t
+    sr_accumulate_step
+    sr_stat_init
+    sr_stat_reset
+    sr_stat_update
+    dual_sr_init
+    dual_sr_reset
+    dual_sr_reset_up
+    dual_sr_reset_down
+    dual_sr_update_entry
+    dual_sr_update_exit
+    dual_sr_update_both
+    dual_sr_set_sigma_peace
+    adaptive_threshold_init
+    adaptive_threshold_reset
+    adaptive_threshold_tick
+    adaptive_threshold_false_alarm
+    adaptive_threshold_clean_exit
+    adaptive_threshold_compute
+    sr_compute_log_lr_batch
+    sr_accumulate_batch
+    sr_update_batch
+    
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; Event Detector (event_detector.c)
+    ; ═══════════════════════════════════════════════════════════════════════
+    event_detector_init
+    event_detector_reset
+    event_detector_enable_volume
+    event_detector_enable_imbalance
+    event_detector_update
+    event_detector_update_full
+    event_detector_get_last_info
+    event_detector_force_theoretical_distribution
+    
+    ; ═══════════════════════════════════════════════════════════════════════
+    ; Hawkes Integrator (hawkes_integrator.c)
+    ; ═══════════════════════════════════════════════════════════════════════
+    hawkes_integrator_config_defaults
+    hawkes_integrator_config_responsive
+    hawkes_integrator_config_conservative
+    hawkes_integrator_init
+    hawkes_integrator_reset
+    hawkes_integrator_free
+    hawkes_integrator_update
+    hawkes_integrator_update_batch
+    hawkes_integrator_get_surprise
+    hawkes_integrator_get_intensity
+    hawkes_integrator_get_instant_intensity
+    hawkes_integrator_get_state
+    hawkes_integrator_is_ready
+    hawkes_integrator_get_branching_ratio
+    hawkes_integrator_get_half_life
+    hawkes_integrator_predict
+    hawkes_integrator_force_trigger
+    hawkes_integrator_clear_refractory
+    hawkes_integrator_set_thresholds
+    hawkes_integrator_set_params

@@ -22,6 +22,27 @@ from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import os
+import sys
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WINDOWS MKL DLL PATHS (must be set BEFORE loading the library)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if sys.platform == "win32":
+    mkl_paths = [
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\redist\intel64",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
+        r"C:\Program Files\Intel\oneAPI\mkl\latest\bin",
+        r"C:\Program Files\Intel\oneAPI\mkl\latest\redist\intel64",
+        r"C:\Program Files\Intel\oneAPI\compiler\latest\bin",
+    ]
+    for p in mkl_paths:
+        if os.path.exists(p):
+            try:
+                os.add_dll_directory(p)
+            except (OSError, AttributeError):
+                pass  # add_dll_directory not available on older Python
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENUMS
@@ -130,27 +151,52 @@ class CrisisDetectorOpaque(ctypes.Structure):
 
 def _load_library():
     """Load the shared library from various possible locations."""
-    search_paths = [
-        Path(__file__).parent / "libcrisis.so",
-        Path.cwd() / "libcrisis.so",
-        Path.home() / "libcrisis.so",
-        "/home/claude/libcrisis.so",
+    import platform
+    
+    # Platform-specific library name
+    if platform.system() == "Windows":
+        lib_names = ["libcrisis.dll", "crisis.dll"]
+    elif platform.system() == "Darwin":
+        lib_names = ["libcrisis.dylib", "libcrisis.so"]
+    else:
+        lib_names = ["libcrisis.so"]
+    
+    # Search paths
+    search_dirs = [
+        Path(__file__).parent,
+        Path.cwd(),
+        Path.cwd() / "Release",
+        Path.cwd() / "Debug",
     ]
     
+    # Build full search paths
+    search_paths = []
+    for dir_path in search_dirs:
+        for lib_name in lib_names:
+            search_paths.append(dir_path / lib_name)
+    
+    # Try each path
     for path in search_paths:
         if path.exists():
-            return ctypes.CDLL(str(path))
+            try:
+                return ctypes.CDLL(str(path))
+            except OSError as e:
+                print(f"Warning: Found {path} but failed to load: {e}")
+                continue
     
     # Try system path
-    try:
-        return ctypes.CDLL("libcrisis.so")
-    except OSError:
-        pass
+    for lib_name in lib_names:
+        try:
+            return ctypes.CDLL(lib_name)
+        except OSError:
+            pass
     
     raise RuntimeError(
-        f"Could not find libcrisis.so. Searched: {[str(p) for p in search_paths]}\n"
-        "Compile with: gcc -O3 -fPIC -shared crisis_detector.c event_detector.c "
-        "sr_detector.c hawkes_integrator.c -lm -o libcrisis.so"
+        f"Could not find crisis detection library.\n"
+        f"Searched: {[str(p) for p in search_paths]}\n"
+        f"On Windows: place libcrisis.dll in the same folder as this script.\n"
+        f"On Linux: compile with: gcc -O3 -fPIC -shared crisis_detector.c "
+        f"event_detector.c sr_detector.c hawkes_integrator.c -lm -o libcrisis.so"
     )
 
 _lib = None
