@@ -211,6 +211,29 @@ target_compile_options(test_hawkes_timing PRIVATE ${COMMON_FLAGS})
 # Register with CTest
 add_test(NAME hawkes_timing COMMAND test_hawkes_timing)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test: Crisis Detection Test (Hawkes + SR vs Ground Truth)
+# ═══════════════════════════════════════════════════════════════════════════════
+add_executable(test_crisis_detection
+    test/test_crisis_detection.c
+)
+
+target_include_directories(test_crisis_detection PRIVATE
+    ${CMAKE_SOURCE_DIR}/RBPF/extended           # rbpf_ksc_param_integration.h, rbpf_ext_crisis.h
+    ${CMAKE_SOURCE_DIR}/RBPF/core               # rbpf_ksc.h
+    ${CMAKE_SOURCE_DIR}/RBPF/storvik            # rbpf_param_learn.h
+    ${CMAKE_SOURCE_DIR}/Crisis_Detection/hawkes_signal  # hawkes_integrator.h
+)
+
+target_link_libraries(test_crisis_detection PRIVATE
+    rocks                # RBPF extended (includes Hawkes integrator)
+)
+
+target_compile_options(test_crisis_detection PRIVATE ${COMMON_FLAGS})
+
+# Register with CTest
+add_test(NAME crisis_detection COMMAND test_crisis_detection)
+
 #───────────────────────────────────────────────────────────────────────────────
 # Installation
 #───────────────────────────────────────────────────────────────────────────────
