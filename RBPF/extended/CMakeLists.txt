@@ -6,12 +6,14 @@ set(EXTENDED_SOURCES
     rbpf_ksc_param_integration.c    # Core: lifecycle, step
     rbpf_ext_config.c               # Configuration functions
     rbpf_ext_diagnostics.c          # Getters and print functions
+    rbpf_ext_crisis.c               # Crisis mode transition learning
 )
 
 set(EXTENDED_HEADERS
     rbpf_ksc_param_integration.h    # Main header (includes types + api)
     rbpf_ext_types.h                # Structs and enums
     rbpf_ext_api.h                  # Function declarations
+    rbpf_ext_crisis.h               # Crisis mode API 
 )
 
 # Add sources to parent scope for rocks library

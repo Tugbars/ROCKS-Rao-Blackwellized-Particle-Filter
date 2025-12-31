@@ -34,17 +34,8 @@ double rbpf_ext_get_transition_prob(const RBPF_Extended *ext, int from, int to)
     if (to < 0 || to >= ext->rbpf->n_regimes)
         return 0.0;
 
-    const int nr = ext->rbpf->n_regimes;
-    const double prior = (from == to) ? ext->trans_prior_diag : ext->trans_prior_off;
-
-    double row_sum = 0.0;
-    for (int j = 0; j < nr; j++)
-    {
-        double p = (from == j) ? ext->trans_prior_diag : ext->trans_prior_off;
-        row_sum += ext->trans_counts[from][j] + p;
-    }
-
-    return (ext->trans_counts[from][to] + prior) / row_sum;
+    /* Delegate to core RBPF - PGAS owns Π */
+    return (double)rbpf_ksc_get_transition_prob(ext->rbpf, from, to);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════

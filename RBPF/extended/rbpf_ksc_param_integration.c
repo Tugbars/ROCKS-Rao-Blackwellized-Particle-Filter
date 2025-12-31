@@ -8,15 +8,19 @@
  *   - rbpf_ext_step() - the hot path
  *   - Internal helpers (SIMD, sync, lag buffers, transition counts)
  *
+ * MODIFIED: Soft-voting transition learning + Crisis mode integration
+ *
  * Related files:
  *   - rbpf_ext_config.c             Configuration functions
  *   - rbpf_ext_diagnostics.c        Getters and print functions
  *   - rbpf_ext_hawkes.c             Hawkes + Robust OCSN + Presets
  *   - rbpf_ext_smoothed_storvik.c   PARIS fixed-lag smoother
+ *   - rbpf_ext_crisis.c             Crisis mode API (NEW)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
 #include "rbpf_ksc_param_integration.h"
+#include "rbpf_ext_crisis.h" /* NEW: Crisis mode API */
 #include "rbpf_fixed_lag_smoother.h"
 #include "rbpf_sprt.h"
 #include "rbpf_dirichlet_transition.h"
@@ -215,100 +219,6 @@ static FORCE_INLINE void update_lag_buffers(RBPF_Extended *ext)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * INTERNAL: TRANSITION COUNT UPDATE
- *═══════════════════════════════════════════════════════════════════════════*/
-
-static void update_transition_counts_optimized(RBPF_Extended *ext)
-{
-    if (!ext->trans_learn_enabled)
-        return;
-
-    RBPF_KSC *rbpf = ext->rbpf;
-    const int n = rbpf->n_particles;
-    const int nr = rbpf->n_regimes;
-    const double forget = ext->trans_forgetting;
-
-    /* Decay old counts */
-#if defined(USE_AVX512)
-    __m512d vforget = _mm512_set1_pd(forget);
-    for (int i = 0; i < nr; i++)
-    {
-        int j = 0;
-        for (; j + 8 <= nr; j += 8)
-        {
-            __m512d counts = _mm512_loadu_pd(&ext->trans_counts[i][j]);
-            counts = _mm512_mul_pd(counts, vforget);
-            _mm512_storeu_pd(&ext->trans_counts[i][j], counts);
-        }
-        for (; j < nr; j++)
-        {
-            ext->trans_counts[i][j] *= forget;
-        }
-    }
-#else
-    for (int i = 0; i < nr; i++)
-    {
-        for (int j = 0; j < nr; j++)
-        {
-            ext->trans_counts[i][j] *= forget;
-        }
-    }
-#endif
-
-    /* Accumulate new counts */
-    int local_counts[RBPF_MAX_REGIMES][RBPF_MAX_REGIMES] = {{0}};
-    const int *RESTRICT regime = rbpf->regime;
-    const int *RESTRICT prev = ext->prev_regime;
-
-    for (int k = 0; k < n; k++)
-    {
-        int r_prev = prev[k];
-        int r_curr = regime[k];
-        if (r_prev >= 0 && r_prev < nr && r_curr >= 0 && r_curr < nr)
-        {
-            local_counts[r_prev][r_curr]++;
-        }
-    }
-
-    const double inv_n = 1.0 / n;
-    for (int i = 0; i < nr; i++)
-    {
-        for (int j = 0; j < nr; j++)
-        {
-            ext->trans_counts[i][j] += local_counts[i][j] * inv_n;
-        }
-    }
-}
-
-static void rebuild_transition_lut(RBPF_Extended *ext)
-{
-    if (!ext->trans_learn_enabled)
-        return;
-
-    RBPF_KSC *rbpf = ext->rbpf;
-    const int nr = rbpf->n_regimes;
-    rbpf_real_t flat_matrix[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
-
-    for (int i = 0; i < nr; i++)
-    {
-        double row_sum = 0.0;
-        for (int j = 0; j < nr; j++)
-        {
-            double prior = (i == j) ? ext->trans_prior_diag : ext->trans_prior_off;
-            row_sum += ext->trans_counts[i][j] + prior;
-        }
-        for (int j = 0; j < nr; j++)
-        {
-            double prior = (i == j) ? ext->trans_prior_diag : ext->trans_prior_off;
-            double count = ext->trans_counts[i][j] + prior;
-            flat_matrix[i * nr + j] = (rbpf_real_t)(count / row_sum);
-        }
-    }
-
-    rbpf_ksc_build_transition_lut(rbpf, flat_matrix);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
  * LIFECYCLE
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -367,14 +277,25 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
         ext->storvik_initialized = 1;
     }
 
-    /* Transition learning defaults */
+    /*═══════════════════════════════════════════════════════════════════════
+     * TRANSITION LEARNING (DEPRECATED) + CRISIS MODE
+     *═══════════════════════════════════════════════════════════════════════*/
+
+    /* Transition learning disabled - PGAS owns Π */
     ext->trans_learn_enabled = 0;
+    ext->trans_update_interval = 100;
+    ext->trans_ticks_since_update = 0;
     ext->trans_forgetting = 0.995;
     ext->trans_prior_diag = 50.0;
     ext->trans_prior_off = 1.0;
-    ext->trans_update_interval = 100;
-    ext->trans_ticks_since_update = 0;
-    memset(ext->trans_counts, 0, sizeof(ext->trans_counts));
+
+    /* Crisis mode defaults */
+    ext->trans_mode = TRANS_MODE_NORMAL;
+    ext->ticks_in_crisis_mode = 0;
+    ext->emission_lambda_override_active = 0;
+    ext->emission_lambda_override = 0.95f;
+    ext->crisis_entries = 0;
+    ext->crisis_exits = 0;
 
     /* Per-particle parameter mode */
     ext->rbpf->use_learned_params = 1;
@@ -382,8 +303,8 @@ RBPF_Extended *rbpf_ext_create(int n_particles, int n_regimes, RBPF_ParamMode mo
     /* Hawkes Integrator for APF Kick */
     HawkesIntegratorConfig hawkes_cfg = hawkes_integrator_config_defaults();
     hawkes_integrator_init(&ext->hawkes_integrator, &hawkes_cfg);
-    ext->apf_kick_enabled = 0;          /* Off by default */
-    ext->apf_surprise_threshold = 0.5f; /* APF activates when surprise > this */
+    ext->apf_kick_enabled = 0;
+    ext->apf_surprise_threshold = 0.5f;
 
     memset(ext->base_trans_matrix, 0, sizeof(ext->base_trans_matrix));
 
@@ -492,14 +413,13 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
     {
         fls_reset(ext->smoother);
 
-        /* Sync model params to smoother for PARIS backward kernel */
         if (ext->smoothed_storvik_enabled)
         {
             const int nr = ext->rbpf->n_regimes;
             double trans[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
             double mu_vol[RBPF_MAX_REGIMES];
             double sigma_vol[RBPF_MAX_REGIMES];
-            double phi = 1.0 - ext->rbpf->params[0].theta; /* Assume same θ */
+            double phi = 1.0 - ext->rbpf->params[0].theta;
 
             for (int i = 0; i < nr; i++)
             {
@@ -528,6 +448,13 @@ void rbpf_ext_init(RBPF_Extended *ext, rbpf_real_t mu0, rbpf_real_t var0)
     /* Initialize policy engine state */
     ext->prev_sprt_regime = 0;
     ext->structural_break_signaled = 0;
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * RESET CRISIS MODE STATE
+     *═══════════════════════════════════════════════════════════════════════*/
+    ext->trans_mode = TRANS_MODE_NORMAL;
+    ext->ticks_in_crisis_mode = 0;
+    ext->emission_lambda_override_active = 0;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -550,7 +477,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     if (ext->structural_break_signaled && ext->storvik_initialized)
     {
         param_learn_signal_structural_break(&ext->storvik);
-        /* Don't clear yet - smoother needs to see it */
     }
 
     /*═══════════════════════════════════════════════════════════════════════
@@ -568,28 +494,17 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
 
     /*═══════════════════════════════════════════════════════════════════════
      * PHASE 2: HAWKES UPDATE + REGIME TRANSITION (APF Kick when crisis)
-     *
-     * Hawkes detects sustained intensity elevation.
-     * APF kick activates while intensity is elevated above baseline,
-     * weighting transitions by p(y|regime) for immediate crisis detection.
-     * Deactivates when intensity decays back to baseline (crisis over).
      *═══════════════════════════════════════════════════════════════════════*/
     int apf_active = 0;
 
     if (ext->apf_kick_enabled)
     {
-        /* Update Hawkes with observed return */
         HawkesIntegratorResult hawkes_result = hawkes_integrator_update(
             &ext->hawkes_integrator,
             (float)ext->tick_count,
             (float)obs);
 
-        /* APF kick while intensity is elevated above baseline
-         * surprise_sigma > 0 means intensity > EMA baseline
-         * Use configurable threshold to avoid noise */
         apf_active = (hawkes_result.surprise_sigma > ext->apf_surprise_threshold);
-
-        /* Store for diagnostics */
         ext->last_hawkes_intensity = (rbpf_real_t)hawkes_result.integrated_intensity;
     }
 
@@ -619,10 +534,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
 
     /*═══════════════════════════════════════════════════════════════════════
      * PHASE 4: KL TEMPERING
-     *
-     * When enabled, weights are applied with tempering factor β.
-     * Prevents particle collapse from extreme observations.
-     * Zombie detection triggers structural break.
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->kl_tempering_enabled && ext->kl_state)
     {
@@ -638,9 +549,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
         {
             ext->structural_break_signaled = 1;
         }
-#else
-        /* KL tempering requires float mode */
-        /* TODO: Add double-precision wrapper if needed */
 #endif
     }
 
@@ -649,8 +557,6 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
      *═══════════════════════════════════════════════════════════════════════*/
     rbpf_ksc_compute_outputs(rbpf, marginal_lik, output);
     output->resampled = rbpf_ksc_resample(rbpf);
-
-    /* Track for next tick's KL tempering */
     ext->last_resampled = output->resampled;
 
     /*═══════════════════════════════════════════════════════════════════════
@@ -668,7 +574,7 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     output->outlier_fraction = ext->last_outlier_fraction;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 7: ADAPTIVE FORGETTING
+     * PHASE 7: ADAPTIVE FORGETTING (with crisis override)
      *═══════════════════════════════════════════════════════════════════════*/
     if (ext->adaptive_forgetting.enabled)
     {
@@ -692,14 +598,23 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
             }
         }
         rbpf_adaptive_forgetting_update(ext, marginal_lik, dominant_regime);
+
+        /* Crisis override takes precedence */
+        if (ext->emission_lambda_override_active)
+        {
+            ext->adaptive_forgetting.lambda_current = ext->emission_lambda_override;
+        }
+
+        /* Push to Storvik */
+        if (ext->storvik_initialized)
+        {
+            param_learn_set_forgetting(&ext->storvik, 1,
+                                       ext->adaptive_forgetting.lambda_current);
+        }
     }
 
     /*═══════════════════════════════════════════════════════════════════════
      * PHASE 8: POLICY ENGINE (Regime Change Detection)
-     *
-     * Two independent detectors:
-     *   1. P² Circuit Breaker: "Tail event - old world is dead"
-     *   2. SPRT Transition: "Statistically confirmed regime flip"
      *═══════════════════════════════════════════════════════════════════════*/
     {
         int p2_tail_event = rbpf_ext_structural_break_detected(ext);
@@ -708,7 +623,7 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
         if (p2_tail_event)
         {
             output->regime_changed = 1;
-            output->change_type = 1; /* Tail event */
+            output->change_type = 1;
 
             sprt_multi_force_regime(&rbpf->sprt, output->dominant_regime);
             ext->structural_break_signaled = 1;
@@ -717,7 +632,7 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
         else if (sprt_flip)
         {
             output->regime_changed = 1;
-            output->change_type = 2; /* SPRT transition */
+            output->change_type = 2;
 
             if (rbpf->trans_prior_enabled)
             {
@@ -759,37 +674,14 @@ void rbpf_ext_step(RBPF_Extended *ext, rbpf_real_t obs, RBPF_KSC_Output *output)
     ext->structural_break_signaled = 0;
 
     /*═══════════════════════════════════════════════════════════════════════
-     * PHASE 10: TRANSITION LEARNING
+     * PHASE 10: CRISIS MODE TICK COUNTER
+     *
+     * Just increment ticks_in_crisis_mode for PGAS veto timing.
+     * PGAS handles Π learning.
      *═══════════════════════════════════════════════════════════════════════*/
-    if (ext->trans_learn_enabled)
+    if (ext->trans_mode == TRANS_MODE_CRISIS)
     {
-        update_transition_counts_optimized(ext);
-
-        ext->trans_ticks_since_update++;
-        if (ext->trans_ticks_since_update >= ext->trans_update_interval)
-        {
-            rebuild_transition_lut(ext);
-            ext->trans_ticks_since_update = 0;
-
-            /* Update base matrix for Hawkes */
-            const uint8_t (*lut)[RBPF_LUT_SIZE] = rbpf_lut_acquire_read(&rbpf->trans_lut);
-            const int nr = rbpf->n_regimes;
-
-            for (int i = 0; i < nr; i++)
-            {
-                for (int j = 0; j < nr; j++)
-                {
-                    int count = 0;
-                    for (int k = 0; k < RBPF_LUT_SIZE; k++)
-                    {
-                        if (lut[i][k] == (uint8_t)j)
-                            count++;
-                    }
-                    ext->base_trans_matrix[i * nr + j] =
-                        (rbpf_real_t)count / (rbpf_real_t)RBPF_LUT_SIZE;
-                }
-            }
-        }
+        ext->ticks_in_crisis_mode++;
     }
 
     /*═══════════════════════════════════════════════════════════════════════

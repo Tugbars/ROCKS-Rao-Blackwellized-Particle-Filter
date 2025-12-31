@@ -5,7 +5,7 @@
  * ═══════════════════════════════════════════════════════════════════════════
  * This file contains:
  *   - Constants and limits
- *   - Enumerations (param mode, asset presets, signal sources)
+ *   - Enumerations (param mode, asset presets, signal sources, transition mode)
  *   - RBPF_AdaptiveForgetting struct
  *   - RBPF_Extended struct (main integration layer)
  *
@@ -61,7 +61,7 @@ extern "C"
      */
     typedef enum
     {
-        RBPF_PRESET_CUSTOM = 0,  /**< User-defined parameters */
+        RBPF_PRESET_CUSTOM = 0,   /**< User-defined parameters */
         RBPF_PRESET_EQUITY_INDEX, /**< S&P 500, NASDAQ, etc. */
         RBPF_PRESET_SINGLE_STOCK, /**< Individual equities */
         RBPF_PRESET_FX_G10,       /**< Major currency pairs */
@@ -83,6 +83,18 @@ extern "C"
         ADAPT_SIGNAL_PREDICTIVE_SURPRISE, /**< Scale λ by predictive surprise z-score */
         ADAPT_SIGNAL_COMBINED             /**< Max of outlier + surprise (recommended) */
     } RBPF_AdaptSignal;
+
+    /**
+     * @brief Crisis mode state
+     *
+     * NORMAL: PGAS can inject Π, adaptive emission λ
+     * CRISIS: PGAS vetoed until catchup, fast emission λ (0.95)
+     */
+    typedef enum
+    {
+        TRANS_MODE_NORMAL = 0,  /**< Normal operation */
+        TRANS_MODE_CRISIS       /**< Crisis confirmed, PGAS vetoed */
+    } TransitionMode;
 
     /*═══════════════════════════════════════════════════════════════════════════
      * FORWARD DECLARATIONS
@@ -122,7 +134,7 @@ extern "C"
         /*─────────────────────────────────────────────────────────────────────
          * ENABLE/MODE
          *─────────────────────────────────────────────────────────────────────*/
-        int enabled;                 /**< 0 = use fixed λ, 1 = adaptive */
+        int enabled;                    /**< 0 = use fixed λ, 1 = adaptive */
         RBPF_AdaptSignal signal_source; /**< What drives adaptation */
 
         /*─────────────────────────────────────────────────────────────────────
@@ -176,16 +188,16 @@ extern "C"
          * When surprise exceeds trigger_percentile, signals structural break
          * and applies emergency_lambda.
          *─────────────────────────────────────────────────────────────────────*/
-        int enable_circuit_breaker;            /**< 0 = disabled */
-        double trigger_percentile;             /**< e.g., 0.999 for 99.9th */
-        int min_ticks_for_lambda;              /**< Min ticks before triggering */
-        int warmup_ticks;                      /**< Warmup period for P² */
-        uint64_t ticks_since_last_break;       /**< Ticks since last trigger */
-        P2Quantile surprise_quantile;          /**< P² quantile tracker */
-        uint64_t circuit_breaker_trips;        /**< Total trip count */
-        int structural_break_detected;         /**< Flag for current tick */
+        int enable_circuit_breaker;                /**< 0 = disabled */
+        double trigger_percentile;                 /**< e.g., 0.999 for 99.9th */
+        int min_ticks_for_lambda;                  /**< Min ticks before triggering */
+        int warmup_ticks;                          /**< Warmup period for P² */
+        uint64_t ticks_since_last_break;           /**< Ticks since last trigger */
+        P2Quantile surprise_quantile;              /**< P² quantile tracker */
+        uint64_t circuit_breaker_trips;            /**< Total trip count */
+        int structural_break_detected;             /**< Flag for current tick */
         rbpf_real_t last_trigger_percentile_value; /**< Threshold that triggered */
-        rbpf_real_t emergency_lambda_used;     /**< λ applied during break */
+        rbpf_real_t emergency_lambda_used;         /**< λ applied during break */
 
         /*─────────────────────────────────────────────────────────────────────
          * OUTPUT (computed each tick)
@@ -202,16 +214,16 @@ extern "C"
          * emergency_lambda. These fields track original values for
          * gradual restoration after crisis passes.
          *─────────────────────────────────────────────────────────────────────*/
-        int lambda_override_active;                    /**< Override in effect */
-        rbpf_real_t saved_lambda_global;               /**< Saved global λ */
+        int lambda_override_active;                        /**< Override in effect */
+        rbpf_real_t saved_lambda_global;                   /**< Saved global λ */
         rbpf_real_t saved_lambda_regime[RBPF_MAX_REGIMES]; /**< Saved per-regime */
-        int restore_blend_ticks;                       /**< Blend duration */
-        int restore_ticks_elapsed;                     /**< Blend progress */
+        int restore_blend_ticks;                           /**< Blend duration */
+        int restore_ticks_elapsed;                         /**< Blend progress */
 
         /*─────────────────────────────────────────────────────────────────────
          * STATISTICS
          *─────────────────────────────────────────────────────────────────────*/
-        uint64_t interventions;      /**< Total λ adjustments */
+        uint64_t interventions;        /**< Total λ adjustments */
         rbpf_real_t max_surprise_seen; /**< Largest surprise observed */
 
     } RBPF_AdaptiveForgetting;
@@ -225,7 +237,7 @@ extern "C"
      *   3. Robust OCSN (11th mixture component for outliers)
      *   4. PARIS smoothed Storvik (fixed-lag backward smoother)
      *   5. Adaptive forgetting (regime-aware λ with P² circuit breaker)
-     *   6. Transition learning (online Dirichlet updates)
+     *   6. Transition learning (soft-voting Dirichlet with crisis mode)
      *   7. KL tempering (information-geometric weight normalization)
      *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -234,7 +246,7 @@ extern "C"
         /*─────────────────────────────────────────────────────────────────────
          * CORE RBPF
          *─────────────────────────────────────────────────────────────────────*/
-        RBPF_KSC *rbpf;          /**< Core particle filter */
+        RBPF_KSC *rbpf;            /**< Core particle filter */
         RBPF_ParamMode param_mode; /**< Parameter learning mode */
 
         /*─────────────────────────────────────────────────────────────────────
@@ -243,8 +255,8 @@ extern "C"
          * Learns regime parameters (μ_vol, σ_vol) online using sufficient
          * statistics. Updates are per-particle, per-regime.
          *─────────────────────────────────────────────────────────────────────*/
-        ParamLearner storvik;      /**< Storvik learner state */
-        int storvik_initialized;   /**< 1 if storvik is ready */
+        ParamLearner storvik;    /**< Storvik learner state */
+        int storvik_initialized; /**< 1 if storvik is ready */
 
         /*─────────────────────────────────────────────────────────────────────
          * PARTICLE INFO WORKSPACE
@@ -262,19 +274,19 @@ extern "C"
          * APF kick uses observation likelihood to weight regime transitions
          * for faster crisis detection (auxiliary particle filter style).
          *─────────────────────────────────────────────────────────────────────*/
-        HawkesIntegrator hawkes_integrator; /**< Hawkes intensity tracker */
-        int apf_kick_enabled;               /**< 1 = use APF during elevated intensity */
-        float apf_surprise_threshold;       /**< Surprise σ threshold for APF */
+        HawkesIntegrator hawkes_integrator;                            /**< Hawkes intensity tracker */
+        int apf_kick_enabled;                                          /**< 1 = use APF during elevated intensity */
+        float apf_surprise_threshold;                                  /**< Surprise σ threshold for APF */
         rbpf_real_t base_trans_matrix[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES]; /**< Base Π */
-        rbpf_real_t last_hawkes_intensity;  /**< Last computed intensity */
+        rbpf_real_t last_hawkes_intensity;                             /**< Last computed intensity */
 
         /*─────────────────────────────────────────────────────────────────────
          * ROBUST OCSN (11th Component)
          *
          * Adds heavy-tailed outlier component to KSC mixture for robustness.
          *─────────────────────────────────────────────────────────────────────*/
-        RBPF_RobustOCSN robust_ocsn;        /**< Outlier component config */
-        rbpf_real_t last_outlier_fraction;  /**< Fraction assigned to outlier */
+        RBPF_RobustOCSN robust_ocsn;       /**< Outlier component config */
+        rbpf_real_t last_outlier_fraction; /**< Fraction assigned to outlier */
 
         /*─────────────────────────────────────────────────────────────────────
          * ADAPTIVE FORGETTING
@@ -282,17 +294,46 @@ extern "C"
         RBPF_AdaptiveForgetting adaptive_forgetting;
 
         /*─────────────────────────────────────────────────────────────────────
-         * TRANSITION LEARNING (Online Dirichlet)
+         * TRANSITION LEARNING (Legacy - kept for backward compat)
          *
-         * Learns transition matrix Π online from observed regime switches.
+         * Π learning is handled by PGAS, not here.
          *─────────────────────────────────────────────────────────────────────*/
-        int trans_learn_enabled;    /**< 1 = learning enabled */
-        double trans_counts[RBPF_MAX_REGIMES][RBPF_MAX_REGIMES]; /**< Pseudo-counts */
-        double trans_forgetting;    /**< Count decay factor */
-        double trans_prior_diag;    /**< Prior for staying (diagonal) */
-        double trans_prior_off;     /**< Prior for switching (off-diagonal) */
-        int trans_update_interval;  /**< Ticks between LUT rebuilds */
-        int trans_ticks_since_update; /**< Counter */
+        int trans_learn_enabled;      /**< DEPRECATED: always 0, PGAS owns Π */
+        int trans_update_interval;    /**< DEPRECATED */
+        int trans_ticks_since_update; /**< DEPRECATED */
+        double trans_forgetting;      /**< DEPRECATED */
+        double trans_prior_diag;      /**< DEPRECATED */
+        double trans_prior_off;       /**< DEPRECATED */
+
+        /*─────────────────────────────────────────────────────────────────────
+         * CRISIS MODE (PGAS Veto + Emission λ Override)
+         *
+         * State machine (owned by external CrisisDetector):
+         *   NORMAL → CRISIS → NORMAL
+         *
+         * During crisis:
+         *   1. Veto PGAS injection until it has seen crisis data
+         *   2. Override Storvik λ to 0.95 for fast emission learning
+         *
+         * PGAS handles Π learning - we just coordinate timing.
+         *─────────────────────────────────────────────────────────────────────*/
+        TransitionMode trans_mode; /**< Current mode (NORMAL or CRISIS) */
+        int ticks_in_crisis_mode;  /**< Counter since crisis entry */
+
+        /*─────────────────────────────────────────────────────────────────────
+         * EMISSION λ OVERRIDE
+         *
+         * During confirmed crisis, override adaptive forgetting with
+         * fast λ to accelerate Storvik emission learning.
+         *─────────────────────────────────────────────────────────────────────*/
+        int emission_lambda_override_active; /**< 1 = override adaptive λ */
+        float emission_lambda_override;      /**< Value to use (default 0.95) */
+
+        /*─────────────────────────────────────────────────────────────────────
+         * CRISIS MODE STATISTICS
+         *─────────────────────────────────────────────────────────────────────*/
+        uint64_t crisis_entries;  /**< Times entered CRISIS */
+        uint64_t crisis_exits;    /**< Times exited CRISIS */
 
         /*─────────────────────────────────────────────────────────────────────
          * SMOOTHED STORVIK (PARIS Fixed-Lag)
@@ -331,9 +372,9 @@ extern "C"
         /*─────────────────────────────────────────────────────────────────────
          * MISC STATE
          *─────────────────────────────────────────────────────────────────────*/
-        int structural_break_signaled;  /**< Pending structural break */
+        int structural_break_signaled;   /**< Pending structural break */
         RBPF_AssetPreset current_preset; /**< Active preset */
-        uint64_t tick_count;            /**< Total ticks processed */
+        uint64_t tick_count;             /**< Total ticks processed */
 
     } RBPF_Extended;
 

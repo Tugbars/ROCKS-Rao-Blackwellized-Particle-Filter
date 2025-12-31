@@ -180,7 +180,7 @@ void rbpf_ext_reset_transition_counts(RBPF_Extended *ext)
 {
     if (!ext)
         return;
-    memset(ext->trans_counts, 0, sizeof(ext->trans_counts));
+    /* No-op: trans_counts removed, PGAS owns Π */
     ext->trans_ticks_since_update = 0;
 }
 
