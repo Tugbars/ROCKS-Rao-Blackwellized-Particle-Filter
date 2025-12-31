@@ -186,6 +186,90 @@ extern "C"
     int64_t pgas_oracle_get_observations(const PGASOracleState *oracle);
     void pgas_oracle_print_diagnostics(const PGASOracleState *oracle);
 
+    /*===========================================================================
+     * BOUNDED-MEMORY BAYESIAN ESTIMATION
+     *===========================================================================*/
+
+    /**
+     * @brief Set memory decay for accumulated counts
+     *
+     * Controls how inactive rows erode over time.
+     *
+     * @param oracle  Oracle state
+     * @param decay   Per-window decay factor (0.99 default)
+     * @param floor   Minimum count floor (0.5 default)
+     */
+    void pgas_oracle_set_memory_decay(PGASOracleState *oracle, float decay, float floor);
+
+    /**
+     * @brief Set maximum inertia for accumulated counts (Inertia Clamping)
+     *
+     * Controls how "heavy" history can get before new data is ignored:
+     *   - 200 = Very Agile (20 ticks = 10% impact)
+     *   - 300 = Agile (20 ticks = 6.7% impact) [RECOMMENDED]
+     *   - 500 = Balanced (20 ticks = 4% impact)
+     *
+     * @param oracle       Oracle state
+     * @param max_inertia  Maximum row sum for accumulated counts
+     */
+    void pgas_oracle_set_max_inertia(PGASOracleState *oracle, float max_inertia);
+
+    /**
+     * @brief Enable/disable adaptive kappa (anti-chattering)
+     *
+     * When enabled, sticky_kappa is dynamically adjusted based on observed
+     * chatter rate using RLS estimation. Reduces regime flipping noise.
+     *
+     * @param oracle   Oracle state
+     * @param enabled  1 = enabled, 0 = disabled (default)
+     */
+    void pgas_oracle_set_adaptive_kappa(PGASOracleState *oracle, int enabled);
+
+    /*===========================================================================
+     * ADAPTIVE SLIDE CONTROL
+     *===========================================================================*/
+
+    /**
+     * @brief Enable/disable adaptive slide based on SR
+     *
+     * When enabled, slide interval adapts based on SR statistic:
+     *   - SR low  → slide = slide_normal (save compute)
+     *   - SR high → slide = slide_fast (faster Π updates)
+     *
+     * @param oracle   Oracle state
+     * @param enabled  1 = enabled (default), 0 = use fixed slide_step
+     */
+    void pgas_oracle_set_adaptive_slide(PGASOracleState *oracle, int enabled);
+
+    /**
+     * @brief Set SR thresholds for adaptive slide modes
+     *
+     * @param oracle       Oracle state
+     * @param sr_elevated  SR threshold for elevated mode (default: 1.0)
+     * @param sr_fast      SR threshold for fast mode (default: 3.0)
+     */
+    void pgas_oracle_set_sr_thresholds(PGASOracleState *oracle,
+                                       float sr_elevated, float sr_fast);
+
+    /**
+     * @brief Update adaptive slide based on current SR statistic
+     *
+     * Call this from the main loop whenever you have a new SR value.
+     * Typically from Hawkes integrator: hawkes_integrator_get_cumulative_residual()
+     *
+     * @param oracle   Oracle state
+     * @param sr_stat  Current SR statistic
+     */
+    void pgas_oracle_update_sr(PGASOracleState *oracle, float sr_stat);
+
+    /**
+     * @brief Get current effective slide interval
+     *
+     * @return Current slide being used (may differ from configured slide_step
+     *         if adaptive slide is enabled)
+     */
+    int pgas_oracle_get_effective_slide(const PGASOracleState *oracle);
+
 #ifdef __cplusplus
 }
 #endif

@@ -2,13 +2,14 @@
  * @file pgas_mkl.c
  * @brief MKL-optimized PGAS + PARIS implementation
  *
- * UPDATED: OCSN 10-component emission + Transition matrix learning
+ * UPDATED: Recursive Bayesian Estimation for transition learning
  *
  * Changes from original:
  *   1. Replaced Gaussian emission with OCSN 10-component (Omori et al. 2007)
  *   2. Added transition matrix sampling via Dirichlet posterior
  *   3. Added pgas_mkl_gibbs_sweep() for full Gibbs iteration
- *   4. Matches RBPF and HDP-HMM likelihood exactly for validation
+ *   4. **NEW**: Recursive estimation - accumulated counts with decay
+ *      Posterior of window N becomes prior for window N+1
  */
 
 #include "pgas_mkl.h"
@@ -258,6 +259,35 @@ PGASMKLState *pgas_mkl_alloc(int N, int T, int K, uint32_t seed)
     state->sticky_kappa = 10.0f;
     memset(state->n_trans, 0, sizeof(state->n_trans));
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * BOUNDED-MEMORY BAYESIAN ESTIMATION (Inertia Clamping)
+     *
+     * Initialize accumulated counts to prior (α + κ on diagonal)
+     * This is the "knowledge base" that persists across windows
+     *
+     * max_inertia limits how "heavy" history can get:
+     *   300 = Agile (new data matters: 20/300 = 6.7%)
+     *   500 = Balanced
+     *   1000 = Stiff (requires massive evidence to change)
+     * ═══════════════════════════════════════════════════════════════════════*/
+    state->memory_decay = 0.99f; /* Decay for rare transitions */
+    state->count_floor = 0.5f;   /* Prevent vanishing priors */
+    state->max_inertia = 300.0f; /* Max row sum - keeps us agile */
+    state->ticks_in_update = 0;  /* Set by sliding window before sampling */
+
+    for (int i = 0; i < K; i++)
+    {
+        for (int j = 0; j < K; j++)
+        {
+            float init_count = state->prior_alpha;
+            if (i == j)
+            {
+                init_count += state->sticky_kappa;
+            }
+            state->accumulated_counts[i * K + j] = init_count;
+        }
+    }
+
     /* Initialize adaptive kappa (DISABLED by default) */
     state->adaptive_kappa_enabled = 0;
     state->kappa_min = 20.0f;
@@ -418,6 +448,57 @@ void pgas_mkl_set_recency_lambda(PGASMKLState *state, float lambda)
     {
         state->model.recency_lambda = lambda;
     }
+}
+
+/**
+ * Set memory decay for accumulated counts (Recursive Bayesian Estimation)
+ *
+ * @param state  PGAS state
+ * @param decay  Per-window decay factor (0.99 = ~100 window memory)
+ * @param floor  Minimum count floor to prevent vanishing priors
+ */
+void pgas_mkl_set_memory_decay(PGASMKLState *state, float decay, float floor)
+{
+    if (!state)
+        return;
+    state->memory_decay = decay;
+    state->count_floor = floor;
+}
+
+/**
+ * Set maximum inertia for accumulated counts (Inertia Clamping)
+ *
+ * Controls how "heavy" history can get before new data is ignored:
+ *   - 200 = Very Agile (20 ticks = 10% impact)
+ *   - 300 = Agile (20 ticks = 6.7% impact) [RECOMMENDED]
+ *   - 500 = Balanced (20 ticks = 4% impact)
+ *   - 1000 = Stiff (20 ticks = 2% impact)
+ *
+ * @param state        PGAS state
+ * @param max_inertia  Maximum row sum for accumulated counts
+ */
+void pgas_mkl_set_max_inertia(PGASMKLState *state, float max_inertia)
+{
+    if (!state)
+        return;
+    state->max_inertia = max_inertia;
+}
+
+/**
+ * Enable/disable adaptive kappa (anti-chattering)
+ *
+ * When enabled, sticky_kappa is dynamically adjusted based on observed
+ * chatter rate using RLS estimation. This reduces regime chattering
+ * by increasing stickiness when chatter is detected.
+ *
+ * @param state    PGAS state
+ * @param enabled  1 = enabled, 0 = disabled (default)
+ */
+void pgas_mkl_set_adaptive_kappa(PGASMKLState *state, int enabled)
+{
+    if (!state)
+        return;
+    state->adaptive_kappa_enabled = enabled;
 }
 
 void pgas_mkl_set_reference(PGASMKLState *state,
@@ -1093,7 +1174,20 @@ int pgas_mkl_run_adaptive(PGASMKLState *state)
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * TRANSITION MATRIX LEARNING
+ * TRANSITION MATRIX LEARNING - BOUNDED-MEMORY BAYESIAN ESTIMATION
+ *
+ * Key changes from naive recursive estimation:
+ *   1. INERTIA CLAMPING - Prevent history from becoming infinitely heavy
+ *   2. DECAY - Standard exponential decay for rare transitions
+ *   3. PARTIAL ACCUMULATION - Only add NEW data (slide portion, not whole window)
+ *   4. SAMPLE Π from accumulated counts
+ *
+ * Why Inertia Clamping?
+ *   Without it: After hours of trading, accumulated ≈ 50,000
+ *   New 20 ticks = 0.04% impact = useless
+ *   With clamp (300): 20 ticks = 6.7% impact = responsive
+ *
+ * This is Bounded-Memory Bayesian Learning - exactly what HFT needs.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 void pgas_mkl_sample_transitions(PGASMKLState *state)
@@ -1105,17 +1199,90 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
     const int T = state->T;
     VSLStreamStatePtr stream = (VSLStreamStatePtr)state->rng.stream;
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 1: INERTIA CLAMPING (Per-Row)
+     *
+     * Prevent any row from exceeding max_inertia total counts.
+     * This ensures new data always has "fighting chance":
+     *   - 20 new ticks vs 300 history = 6.7% signal
+     *   - 100 new ticks vs 300 history = 33% signal (crisis detected!)
+     *
+     * Without this, after hours: 20 vs 50000 = 0.04% = invisible
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (int i = 0; i < K; i++)
+    {
+        float row_sum = 0.0f;
+        for (int j = 0; j < K; j++)
+        {
+            row_sum += state->accumulated_counts[i * K + j];
+        }
+
+        if (row_sum > state->max_inertia)
+        {
+            float scale = state->max_inertia / row_sum;
+            for (int j = 0; j < K; j++)
+            {
+                state->accumulated_counts[i * K + j] *= scale;
+            }
+        }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 2: DECAY - Discount old knowledge
+     *
+     * Still useful for rare transitions that haven't been seen recently.
+     * Preserves "embers" of memory for regimes not recently visited.
+     *═══════════════════════════════════════════════════════════════════════*/
+    for (int i = 0; i < K * K; i++)
+    {
+        state->accumulated_counts[i] *= state->memory_decay;
+
+        /* Floor to prevent vanishing priors */
+        if (state->accumulated_counts[i] < state->count_floor)
+        {
+            state->accumulated_counts[i] = state->count_floor;
+        }
+    }
+
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 3: PARTIAL ACCUMULATION - Only add NEW data
+     *
+     * CRITICAL: We only count transitions from the NEW portion of window.
+     * If we slid 20 ticks, count only last 20 transitions.
+     * Otherwise we double-count old data!
+     *
+     * ticks_in_update = effective_slide_step from adaptive slide
+     *═══════════════════════════════════════════════════════════════════════*/
+    int ticks_new = state->ticks_in_update;
+    if (ticks_new <= 0)
+        ticks_new = T - 1; /* Fallback: count all (first window) */
+
+    int start_t = T - ticks_new;
+    if (start_t < 1)
+        start_t = 1;
+
+    /* Track per-window counts for diagnostics */
     memset(state->n_trans, 0, K * K * sizeof(int));
-    for (int t = 1; t < T; t++)
+
+    for (int t = start_t; t < T; t++)
     {
         int s_prev = state->ref_regimes[t - 1];
         int s_curr = state->ref_regimes[t];
         if (s_prev >= 0 && s_prev < K && s_curr >= 0 && s_curr < K)
         {
+            /* Add to accumulated (float) */
+            state->accumulated_counts[s_prev * K + s_curr] += 1.0f;
+            /* Track per-window (int) for diagnostics */
             state->n_trans[s_prev * K + s_curr]++;
         }
     }
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 3b: DIAGNOSTICS - Track chatter ratio
+     *
+     * Note: We compare observed vs expected for the NEW data only,
+     * not the full window. This matches what we actually counted.
+     *═══════════════════════════════════════════════════════════════════════*/
     int off_diag_count = 0;
     int total_count = 0;
     for (int i = 0; i < K; i++)
@@ -1133,9 +1300,12 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
     state->last_off_diag_count = off_diag_count;
     state->last_total_count = total_count;
 
+    /* Use ticks_in_update (what we actually counted), not T-1 */
+    int actual_transitions = ticks_new; /* Same as what we counted in step 3 */
+
     float expected_diag = (state->sticky_kappa + state->prior_alpha) /
                           (state->sticky_kappa + K * state->prior_alpha);
-    float expected_off_diag_count = (float)(T - 1) * (1.0f - expected_diag);
+    float expected_off_diag_count = (float)actual_transitions * (1.0f - expected_diag);
 
     if (expected_off_diag_count > 0.1f)
     {
@@ -1146,6 +1316,17 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         state->last_chatter_ratio = 1.0f;
     }
 
+    /* Adaptive kappa logic - DISABLED BY DEFAULT
+     *
+     * When enabled, adjusts sticky_kappa based on observed chatter rate.
+     * Uses RLS (Recursive Least Squares) to smooth the estimate.
+     *
+     * To enable: state->adaptive_kappa_enabled = 1;
+     *
+     * Note: With bounded-memory estimation, adaptive kappa may be less
+     * necessary since the system is already more responsive. But it can
+     * still help if you're seeing too much regime chattering.
+     */
     if (state->adaptive_kappa_enabled && state->last_total_count >= 10)
     {
         const float alpha = state->prior_alpha;
@@ -1218,6 +1399,12 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
         state->sticky_kappa = kappa_new;
     }
 
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 4: SAMPLE - Draw Π from ACCUMULATED counts
+     *
+     * Key change: Use accumulated_counts (float) instead of n_trans (int)
+     * The accumulated counts already contain rich history from all windows
+     *═══════════════════════════════════════════════════════════════════════*/
     float gamma_samples[PGAS_MKL_MAX_K];
 
     for (int i = 0; i < K; i++)
@@ -1226,12 +1413,10 @@ void pgas_mkl_sample_transitions(PGASMKLState *state)
 
         for (int j = 0; j < K; j++)
         {
-            float alpha_j = state->prior_alpha + (float)state->n_trans[i * K + j];
-            if (i == j)
-            {
-                alpha_j += state->sticky_kappa;
-            }
+            /* Use accumulated counts directly */
+            float alpha_j = state->accumulated_counts[i * K + j];
 
+            /* Safety floor */
             if (alpha_j < 0.01f)
                 alpha_j = 0.01f;
 
@@ -1261,6 +1446,57 @@ float pgas_mkl_gibbs_sweep(PGASMKLState *state)
     pgas_mkl_sample_transitions(state);
 
     return accept;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * ACCUMULATED COUNTS API
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+/**
+ * Get accumulated transition counts (for diagnostics)
+ */
+void pgas_mkl_get_accumulated_counts(const PGASMKLState *state,
+                                     float *counts_out, int K)
+{
+    if (!state || !counts_out)
+        return;
+    int K_copy = (K < state->K) ? K : state->K;
+    for (int i = 0; i < K_copy; i++)
+    {
+        for (int j = 0; j < K_copy; j++)
+        {
+            counts_out[i * K + j] = state->accumulated_counts[i * state->K + j];
+        }
+    }
+}
+
+/**
+ * Print accumulated counts matrix (for debugging)
+ */
+void pgas_mkl_print_accumulated_counts(const PGASMKLState *state)
+{
+    if (!state)
+        return;
+    int K = state->K;
+    printf("\nAccumulated Transition Counts (max_inertia=%.0f, decay=%.3f):\n",
+           state->max_inertia, state->memory_decay);
+
+    float total_mass = 0.0f;
+    for (int i = 0; i < K; i++)
+    {
+        float row_sum = 0.0f;
+        printf("  Row %d: ", i);
+        for (int j = 0; j < K; j++)
+        {
+            printf("%7.1f ", state->accumulated_counts[i * K + j]);
+            row_sum += state->accumulated_counts[i * K + j];
+        }
+        printf(" | sum=%.1f\n", row_sum);
+        total_mass += row_sum;
+    }
+    printf("  Total mass: %.1f (max per row: %.0f)\n", total_mass, state->max_inertia);
+    printf("  Last update: %d ticks\n", state->ticks_in_update);
+    printf("\n");
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -1500,7 +1736,7 @@ void pgas_mkl_print_diagnostics(const PGASMKLState *state)
         return;
 
     printf("═══════════════════════════════════════════════════════════\n");
-    printf("PGAS-MKL DIAGNOSTICS (OCSN 10-component)\n");
+    printf("PGAS-MKL DIAGNOSTICS (OCSN 10-component + Recursive Memory)\n");
     printf("═══════════════════════════════════════════════════════════\n");
     printf("Particles:          %d (padded: %d)\n", state->N, state->N_padded);
     printf("Regimes:            %d\n", state->K);
@@ -1513,5 +1749,9 @@ void pgas_mkl_print_diagnostics(const PGASMKLState *state)
                                                                                                                     : "(STUCK)");
     printf("Final ESS:          %.1f / %d\n", pgas_mkl_get_ess(state, state->T - 1), state->N);
     printf("Transition prior:   α=%.2f, κ=%.2f (sticky)\n", state->prior_alpha, state->sticky_kappa);
+    printf("Memory decay:       %.4f (count floor: %.2f)\n", state->memory_decay, state->count_floor);
     printf("═══════════════════════════════════════════════════════════\n");
+
+    /* Print accumulated counts */
+    pgas_mkl_print_accumulated_counts(state);
 }

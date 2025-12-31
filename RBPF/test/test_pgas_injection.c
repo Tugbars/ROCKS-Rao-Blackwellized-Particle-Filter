@@ -685,6 +685,9 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
     rbpf_ext_enable_kl_tempering(ext);
     rbpf_ext_enable_smoothed_storvik(ext, 5);
 
+
+
+
     /* Regime params */
     rbpf_ext_set_regime_params(ext, 0, 0.0030f, -4.299f, 0.080f);
     rbpf_ext_set_regime_params(ext, 1, 0.0420f, -3.465f, 0.267f);
@@ -736,6 +739,10 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
     pgas_oracle_set_model(oracle, pgas_trans, mu_vol, sigma_vol, 0.97);
     pgas_oracle_set_prior(oracle, 1.0f, 50.0f);
     pgas_oracle_set_recency(oracle, 0.001f);
+
+    pgas_oracle_set_max_inertia(oracle, 50.0f); // Bounded memory
+    pgas_oracle_set_adaptive_slide(oracle, 1);   // SR-based slide
+    pgas_oracle_set_adaptive_kappa(oracle, 1);   // Anti-chattering (optional)
 
     /* Pin PGAS to threads and start */
     pgas_oracle_set_affinity(oracle, 0, PGAS_THREADS);

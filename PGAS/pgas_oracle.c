@@ -2,6 +2,10 @@
  * @file pgas_oracle.c
  * @brief PGAS Oracle - Background Parameter Server Implementation
  *
+ * UPDATED:
+ *   - Added SR-based adaptive slide control
+ *   - Added memory decay configuration forwarding
+ *
  * Cross-platform: Windows + POSIX
  */
 
@@ -193,8 +197,9 @@ static void pgas_worker_body(PGASOracleState *oracle)
 
         if ((iters % 10) == 0)
         {
-            printf("[PGAS] iter=%lld tick=%lld acc=%.3f time=%.1fms\n",
-                   (long long)iters, (long long)tick, acceptance, elapsed);
+            int eff_slide = pgas_sliding_get_effective_slide(oracle->sliding);
+            printf("[PGAS] iter=%lld tick=%lld acc=%.3f time=%.1fms slide=%d\n",
+                   (long long)iters, (long long)tick, acceptance, elapsed, eff_slide);
         }
     }
 
@@ -345,6 +350,64 @@ void pgas_oracle_set_affinity(PGASOracleState *oracle, int core_start, int n_cor
         return;
     oracle->core_start = core_start;
     oracle->n_cores = n_cores;
+}
+
+/*===========================================================================
+ * RECURSIVE BAYESIAN ESTIMATION (Memory Decay)
+ *===========================================================================*/
+
+void pgas_oracle_set_memory_decay(PGASOracleState *oracle, float decay, float floor)
+{
+    if (!oracle || !oracle->sliding)
+        return;
+    pgas_sliding_set_memory_decay(oracle->sliding, decay, floor);
+}
+
+void pgas_oracle_set_max_inertia(PGASOracleState *oracle, float max_inertia)
+{
+    if (!oracle || !oracle->sliding)
+        return;
+    pgas_sliding_set_max_inertia(oracle->sliding, max_inertia);
+}
+
+void pgas_oracle_set_adaptive_kappa(PGASOracleState *oracle, int enabled)
+{
+    if (!oracle || !oracle->sliding)
+        return;
+    pgas_sliding_set_adaptive_kappa(oracle->sliding, enabled);
+}
+
+/*===========================================================================
+ * ADAPTIVE SLIDE CONTROL
+ *===========================================================================*/
+
+void pgas_oracle_set_adaptive_slide(PGASOracleState *oracle, int enabled)
+{
+    if (!oracle || !oracle->sliding)
+        return;
+    pgas_sliding_set_adaptive_slide(oracle->sliding, enabled);
+}
+
+void pgas_oracle_set_sr_thresholds(PGASOracleState *oracle,
+                                   float sr_elevated, float sr_fast)
+{
+    if (!oracle || !oracle->sliding)
+        return;
+    pgas_sliding_set_sr_thresholds(oracle->sliding, sr_elevated, sr_fast);
+}
+
+void pgas_oracle_update_sr(PGASOracleState *oracle, float sr_stat)
+{
+    if (!oracle || !oracle->sliding)
+        return;
+    pgas_sliding_update_sr(oracle->sliding, sr_stat);
+}
+
+int pgas_oracle_get_effective_slide(const PGASOracleState *oracle)
+{
+    if (!oracle || !oracle->sliding)
+        return 0;
+    return pgas_sliding_get_effective_slide(oracle->sliding);
 }
 
 /*===========================================================================
@@ -499,7 +562,7 @@ void pgas_oracle_peek(const PGASOracleState *oracle,
 }
 
 /*===========================================================================
- * HOT SWAP
+ * HOT SWAP (Simplified - no crisis veto needed with recursive memory)
  *===========================================================================*/
 
 bool pgas_oracle_try_hot_swap(PGASOracleState *oracle,
@@ -510,11 +573,11 @@ bool pgas_oracle_try_hot_swap(PGASOracleState *oracle,
     if (!oracle || !pi_out)
         return false;
 
-    /* Veto if crisis */
-    if (crisis)
-    {
-        return false;
-    }
+    /* Note: With recursive Bayesian estimation, we don't need to veto
+     * during crisis. PGAS remembers crisis transitions even after
+     * extended calm periods. We keep the parameter for API compatibility
+     * but it's effectively ignored. */
+    (void)crisis;
 
     /* Check ready */
     if (!pgas_atomic_load_32(&oracle->channel.ready))
@@ -583,5 +646,12 @@ void pgas_oracle_print_diagnostics(const PGASOracleState *oracle)
     printf("Iterations:         %lld\n", (long long)pgas_atomic_load_64((pgas_atomic_int64 *)&oracle->iterations));
     printf("Avg acceptance:     %.3f\n", oracle->avg_acceptance_rate);
     printf("Avg iter time:      %.1f ms\n", oracle->avg_iteration_time_ms);
+    printf("Effective slide:    %d\n", pgas_oracle_get_effective_slide(oracle));
     printf("===============================\n");
+
+    /* Print sliding window diagnostics */
+    if (oracle->sliding)
+    {
+        pgas_sliding_print_diagnostics(oracle->sliding);
+    }
 }

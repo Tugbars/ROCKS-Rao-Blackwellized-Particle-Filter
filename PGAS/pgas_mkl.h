@@ -92,7 +92,7 @@ extern "C"
         float inv_sigma_vol_sq[PGAS_MKL_MAX_REGIMES];          /**< 1 / σ_vol[k]² */
         float neg_half_inv_sigma_vol_sq[PGAS_MKL_MAX_REGIMES]; /**< -0.5 / σ_vol[k]² */
 
-        float recency_lambda; 
+        float recency_lambda;
     } PGASMKLModel;
 
     /**
@@ -144,6 +144,23 @@ extern "C"
         int n_trans[PGAS_MKL_MAX_K * PGAS_MKL_MAX_K]; /**< Transition counts from ref trajectory */
         float prior_alpha;                            /**< Symmetric Dirichlet prior (default: 1.0) */
         float sticky_kappa;                           /**< Self-transition bias for sticky prior (default: 10.0) */
+
+        /*  ═══════════════════════════════════════════════════════════════════════
+         * BOUNDED-MEMORY BAYESIAN ESTIMATION (Inertia Clamping)
+         *
+         * Posterior of window N becomes prior for window N+1.
+         * Accumulated counts persist across windows with:
+         *   - Inertia clamping (prevents infinite weight)
+         *   - Exponential decay (for rare transitions)
+         *   - Partial accumulation (only new data)
+         *
+         * This solves both the "Amnesia Problem" AND the "Stiffness Problem"
+         * ═══════════════════════════════════════════════════════════════════════*/
+        float accumulated_counts[PGAS_MKL_MAX_K * PGAS_MKL_MAX_K]; /**< Decayed transition counts */
+        float memory_decay;                                        /**< Per-window decay (0.99 default) */
+        float count_floor;                                         /**< Minimum count to prevent vanishing (0.5 default) */
+        float max_inertia;                                         /**< Max row sum - keeps us agile (300 default) */
+        int ticks_in_update;                                       /**< How many new ticks in this window (= slide step) */
 
         /* ═══════════════════════════════════════════════════════════════════
          * ADAPTIVE KAPPA (Optional)
@@ -486,6 +503,44 @@ extern "C"
      * Half-life = ln(2) / λ ≈ 693 ticks at λ=0.001
      */
     void pgas_mkl_set_recency_lambda(PGASMKLState *state, float lambda);
+
+    /**
+     * @brief Set memory decay for accumulated counts
+     *
+     * @param state  PGAS state
+     * @param decay  Per-window decay factor (0.99 default)
+     * @param floor  Minimum count floor (0.5 default)
+     */
+    void pgas_mkl_set_memory_decay(PGASMKLState *state, float decay, float floor);
+
+    /**
+     * @brief Set maximum inertia for accumulated counts (Inertia Clamping)
+     *
+     * Controls how "heavy" history can get before new data is ignored:
+     *   - 200 = Very Agile (20 ticks = 10% impact)
+     *   - 300 = Agile (20 ticks = 6.7% impact) [RECOMMENDED]
+     *   - 500 = Balanced (20 ticks = 4% impact)
+     *   - 1000 = Stiff (20 ticks = 2% impact)
+     *
+     * @param state        PGAS state
+     * @param max_inertia  Maximum row sum for accumulated counts
+     */
+    void pgas_mkl_set_max_inertia(PGASMKLState *state, float max_inertia);
+
+    /**
+     * @brief Get accumulated transition counts (for diagnostics)
+     *
+     * @param state      PGAS state
+     * @param counts_out Output array [K*K], will be filled with accumulated counts
+     * @param K          Number of regimes
+     */
+    void pgas_mkl_get_accumulated_counts(const PGASMKLState *state,
+                                         float *counts_out, int K);
+
+    /**
+     * @brief Print accumulated counts matrix (for debugging)
+     */
+    void pgas_mkl_print_accumulated_counts(const PGASMKLState *state);
 
 #ifdef __cplusplus
 }

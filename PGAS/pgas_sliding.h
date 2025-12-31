@@ -19,10 +19,8 @@
  *   4. PGAS loop:
  *        while (running) {
  *            if (pgas_sliding_window_ready(state)) {
- *                pgas_sliding_extract_window(state);
- *                pgas_sliding_run_sweeps(state, 5);
- *                pgas_sliding_get_pi(state, pi_out);
- *                pgas_sliding_slide(state);  // Prepare for next window
+ *                pgas_sliding_iterate(state, 5, pi_out);
+ *                // Publish pi_out to channel
  *            }
  *        }
  */
@@ -85,6 +83,36 @@ extern "C"
         int64_t window_start_tick; /* Global tick at window[0] */
         int64_t window_end_tick;   /* Global tick at window[T-1] */
         int windows_completed;     /* Number of windows processed */
+
+        /* ═══════════════════════════════════════════════════════════════════════
+         * ADAPTIVE SLIDE CONTROL
+         *
+         * Instead of fixed slide_step, we adapt based on SR statistic:
+         *   - SR low  → slide = slide_normal (save compute)
+         *   - SR high → slide = slide_fast (faster Π updates)
+         *
+         * This is safer than dynamic plasticity because false alarms
+         * just mean extra computation, not memory destruction.
+         * ═══════════════════════════════════════════════════════════════════════*/
+        int adaptive_slide_enabled; /**< 1 = enabled (default), 0 = use fixed slide_step */
+        int slide_normal;           /**< Slide for SR < threshold_elevated (default: slide_step) */
+        int slide_elevated;         /**< Slide for SR in [elevated, fast) (default: slide_step/2) */
+        int slide_fast;             /**< Slide for SR >= threshold_fast (default: slide_step/3) */
+        int effective_slide_step;   /**< Current slide being used */
+
+        float sr_threshold_elevated; /**< SR threshold for elevated mode (default: 1.0) */
+        float sr_threshold_fast;     /**< SR threshold for fast mode (default: 3.0) */
+        float last_sr_stat;          /**< Last SR value received */
+
+        /* Hysteresis */
+        int ticks_in_current_mode;   /**< How long we've been in current mode */
+        int min_ticks_before_loosen; /**< Minimum ticks before allowing loosening */
+
+        /* Statistics */
+        int adaptive_mode_switches; /**< Total mode switch count */
+        int ticks_in_fast_mode;     /**< Cumulative time in fast mode */
+        int ticks_in_elevated_mode; /**< Cumulative time in elevated mode */
+        int ticks_in_normal_mode;   /**< Cumulative time in normal mode */
 
         /* ═══════════════════════════════════════════════════════════════════════
          * REFERENCE TRAJECTORY (Warm Start)
@@ -269,6 +297,77 @@ extern "C"
      * Print diagnostic information
      */
     void pgas_sliding_print_diagnostics(const PGASSlidingState *state);
+
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * ADAPTIVE SLIDE CONTROL
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @brief Enable/disable adaptive slide
+     *
+     * When disabled, uses fixed slide_step.
+     * When enabled, adapts slide based on SR statistic.
+     */
+    void pgas_sliding_set_adaptive_slide(PGASSlidingState *state, int enabled);
+
+    /**
+     * @brief Set SR thresholds for adaptive slide
+     *
+     * @param sr_elevated  SR threshold for elevated mode (default: 1.0)
+     * @param sr_fast      SR threshold for fast mode (default: 3.0)
+     */
+    void pgas_sliding_set_sr_thresholds(PGASSlidingState *state,
+                                        float sr_elevated, float sr_fast);
+
+    /**
+     * @brief Update adaptive slide based on current SR statistic
+     *
+     * Call this from the main loop whenever you have a new SR value.
+     * The effective slide will be adjusted based on SR level.
+     *
+     * @param sr_stat  Current SR statistic from Hawkes integrator
+     */
+    void pgas_sliding_update_sr(PGASSlidingState *state, float sr_stat);
+
+    /**
+     * @brief Get current effective slide interval
+     */
+    int pgas_sliding_get_effective_slide(const PGASSlidingState *state);
+
+    /**
+     * @brief Print adaptive slide statistics
+     */
+    void pgas_sliding_print_adaptive_slide(const PGASSlidingState *state);
+
+    /*═══════════════════════════════════════════════════════════════════════════════
+     * BOUNDED-MEMORY BAYESIAN ESTIMATION
+     *═══════════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * @brief Set memory decay for accumulated counts (forwards to pgas_mkl)
+     *
+     * @param decay  Per-window decay factor (0.99 default)
+     * @param floor  Minimum count floor (0.5 default)
+     */
+    void pgas_sliding_set_memory_decay(PGASSlidingState *state, float decay, float floor);
+
+    /**
+     * @brief Set maximum inertia for accumulated counts (forwards to pgas_mkl)
+     *
+     * Controls agility: lower = more responsive to new data
+     *   - 300 = Agile (20 ticks = 6.7% impact) [RECOMMENDED]
+     */
+    void pgas_sliding_set_max_inertia(PGASSlidingState *state, float max_inertia);
+
+    /**
+     * @brief Enable/disable adaptive kappa (anti-chattering)
+     *
+     * When enabled, sticky_kappa is dynamically adjusted based on observed
+     * chatter rate using RLS estimation.
+     *
+     * @param enabled  1 = enabled, 0 = disabled (default)
+     */
+    void pgas_sliding_set_adaptive_kappa(PGASSlidingState *state, int enabled);
 
 #ifdef __cplusplus
 }
