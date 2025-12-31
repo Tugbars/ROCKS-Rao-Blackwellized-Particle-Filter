@@ -43,7 +43,7 @@
 #define N_PARTICLES 512
 #define N_REGIMES 4
 #define PGAS_WINDOW 500
-#define PGAS_SLIDE 55
+#define PGAS_SLIDE 70
 #define PGAS_PARTICLES 64
 #define PGAS_SWEEPS 2
 #define PGAS_THREADS 8

@@ -286,6 +286,10 @@ typedef struct
     int *detected_crisis;    /* 1 if we think we're in crisis at tick t */
     float *hawkes_intensity; /* Raw Hawkes intensity */
     float *surprise;         /* RBPF surprise signal */
+    float *rls_mu;           /* RLS baseline */
+    float *rls_sigma;        /* RLS sigma */
+    float *entry_threshold;  /* Adaptive entry threshold */
+    float *exit_threshold;   /* Adaptive exit threshold */
 
     /* Summary metrics */
     int true_positives;  /* Detected while actually in crisis */
@@ -303,55 +307,108 @@ typedef struct
     float max_intensity;
     float avg_intensity_in_crisis;
     float avg_intensity_out_crisis;
+
+    /* RLS stats */
+    float final_mu;
+    float final_sigma;
+    float final_K;
 } CrisisMetrics;
 
 /*─────────────────────────────────────────────────────────────────────────────
- * SIMPLE THRESHOLD-BASED CRISIS DETECTOR (Placeholder)
+ * RLS BASELINE TRACKER (for adaptive thresholds)
+ *───────────────────────────────────────────────────────────────────────────*/
+
+#include "rls_baseline.h"
+
+/*─────────────────────────────────────────────────────────────────────────────
+ * ADAPTIVE CRISIS DETECTOR (RLS-based thresholds)
  *
- * This is a simple detector for testing. Replace with your actual
- * Hawkes + SR detector when ready.
+ * Uses RLS to track Hawkes baseline and σ. Thresholds adapt to the data:
+ *   Entry: μ + entry_sigma * σ
+ *   Exit:  μ + exit_sigma * σ
+ *
+ * This works for any dataset without manual tuning.
  *───────────────────────────────────────────────────────────────────────────*/
 
 typedef struct
 {
+    /* RLS baseline tracker */
+    RLS_Baseline rls;
+
     /* State */
     int in_crisis;
     int ticks_in_state;
 
-    /* Thresholds (tune these) */
-    float hawkes_entry_threshold;   /* Enter crisis if intensity > this */
-    float hawkes_exit_threshold;    /* Exit crisis if intensity < this */
-    float surprise_entry_threshold; /* Enter if surprise > this */
-    int min_confirm_ticks;          /* Min ticks above threshold to confirm */
-    int min_exit_ticks;             /* Min ticks below threshold to exit */
+    /* Threshold multipliers (in σ units) */
+    float entry_sigma;          /* Enter if intensity > μ + entry_sigma * σ */
+    float exit_sigma;           /* Exit if intensity < μ + exit_sigma * σ */
+    float surprise_entry_sigma; /* Enter if RBPF surprise > this */
+
+    /* Debounce */
+    int min_confirm_ticks; /* Min ticks above threshold to confirm */
+    int min_exit_ticks;    /* Min ticks below threshold to exit */
 
     /* Tracking */
     int ticks_above_entry;
     int ticks_below_exit;
-} SimpleCrisisDetector;
 
-static void crisis_detector_init(SimpleCrisisDetector *det)
+    /* Last computed thresholds (for diagnostics) */
+    float last_entry_threshold;
+    float last_exit_threshold;
+} AdaptiveCrisisDetector;
+
+static void adaptive_detector_init(AdaptiveCrisisDetector *det)
 {
     memset(det, 0, sizeof(*det));
 
-    /* Default thresholds - tune based on your Hawkes calibration */
-    det->hawkes_entry_threshold = 0.15f;  /* Elevated intensity */
-    det->hawkes_exit_threshold = 0.08f;   /* Back to baseline */
-    det->surprise_entry_threshold = 3.0f; /* High surprise */
-    det->min_confirm_ticks = 5;           /* Debounce */
-    det->min_exit_ticks = 20;             /* Don't exit too fast */
+    /* Initialize RLS with typical Hawkes baseline */
+    rls_baseline_init(&det->rls, 0.05f);
+
+    /* Tune RLS for crisis detection:
+     * - Lower Q: baseline should be stable (don't chase intensity)
+     * - Higher initial σ: start conservative */
+    det->rls.Q = 1e-6f;         /* Slower baseline drift */
+    det->rls.var_ema = 0.01f;   /* Higher initial variance */
+    det->rls.sigma = 0.05f;     /* Conservative initial σ */
+    det->rls.var_alpha = 0.01f; /* Slower σ adaptation (~100 tick memory) */
+    det->rls.adapt_R = 0;       /* Disable R adaptation - fixed R works better */
+    det->rls.R = 0.001f;        /* Low observation noise for responsiveness */
+
+    /* Threshold multipliers (in σ units) */
+    det->entry_sigma = 2.0f;          /* 2σ above baseline for entry */
+    det->exit_sigma = 0.5f;           /* 0.5σ above baseline for exit */
+    det->surprise_entry_sigma = 3.0f; /* RBPF surprise threshold */
+
+    /* Debounce */
+    det->min_confirm_ticks = 3;
+    det->min_exit_ticks = 15;
 }
 
-static int crisis_detector_update(SimpleCrisisDetector *det,
-                                  float hawkes_intensity,
-                                  float surprise,
-                                  RBPF_Extended *ext)
+static int adaptive_detector_update(AdaptiveCrisisDetector *det,
+                                    float hawkes_intensity,
+                                    float rbpf_surprise,
+                                    RBPF_Extended *ext)
 {
     int trigger = 0;
 
-    /* Entry condition: Hawkes elevated OR high surprise */
-    if (hawkes_intensity > det->hawkes_entry_threshold ||
-        surprise > det->surprise_entry_threshold)
+    /* Update RLS - freeze learning during crisis but still compute innovation
+     * During crisis, intensity is elevated - don't learn that as baseline */
+    int do_update = !det->in_crisis;
+    rls_baseline_update_conditional(&det->rls, hawkes_intensity, do_update);
+
+    /* Compute adaptive thresholds */
+    float entry_thresh = rls_baseline_get_threshold(&det->rls, det->entry_sigma);
+    float exit_thresh = rls_baseline_get_threshold(&det->rls, det->exit_sigma);
+
+    /* Store for diagnostics */
+    det->last_entry_threshold = entry_thresh;
+    det->last_exit_threshold = exit_thresh;
+
+    /* Entry condition: Hawkes elevated OR high RBPF surprise */
+    int above_entry = (hawkes_intensity > entry_thresh) ||
+                      (rbpf_surprise > det->surprise_entry_sigma);
+
+    if (above_entry)
     {
         det->ticks_above_entry++;
         det->ticks_below_exit = 0;
@@ -361,8 +418,8 @@ static int crisis_detector_update(SimpleCrisisDetector *det,
         det->ticks_above_entry = 0;
     }
 
-    /* Exit condition: Hawkes back to normal */
-    if (hawkes_intensity < det->hawkes_exit_threshold)
+    /* Exit condition: Hawkes back near baseline */
+    if (hawkes_intensity < exit_thresh)
     {
         det->ticks_below_exit++;
     }
@@ -392,11 +449,31 @@ static int crisis_detector_update(SimpleCrisisDetector *det,
             det->in_crisis = 0;
             det->ticks_in_state = 0;
             rbpf_ext_exit_crisis(ext);
+
+            /* After crisis, boost uncertainty to re-learn baseline faster */
+            rls_baseline_boost_uncertainty(&det->rls, 2.0f);
+
             trigger = -1; /* Falling edge */
         }
     }
 
     return trigger;
+}
+
+/* Legacy wrapper for compatibility */
+typedef AdaptiveCrisisDetector SimpleCrisisDetector;
+
+static void crisis_detector_init(SimpleCrisisDetector *det)
+{
+    adaptive_detector_init(det);
+}
+
+static int crisis_detector_update(SimpleCrisisDetector *det,
+                                  float hawkes_intensity,
+                                  float surprise,
+                                  RBPF_Extended *ext)
+{
+    return adaptive_detector_update(det, hawkes_intensity, surprise, ext);
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +490,10 @@ static void run_crisis_detection_test(SyntheticData *data, CrisisMetrics *metric
     metrics->detected_crisis = (int *)calloc(n, sizeof(int));
     metrics->hawkes_intensity = (float *)calloc(n, sizeof(float));
     metrics->surprise = (float *)calloc(n, sizeof(float));
+    metrics->rls_mu = (float *)calloc(n, sizeof(float));
+    metrics->rls_sigma = (float *)calloc(n, sizeof(float));
+    metrics->entry_threshold = (float *)calloc(n, sizeof(float));
+    metrics->exit_threshold = (float *)calloc(n, sizeof(float));
 
     /* Initialize metrics */
     metrics->first_detection_tick = -1;
@@ -491,6 +572,10 @@ static void run_crisis_detection_test(SyntheticData *data, CrisisMetrics *metric
         /* Store for analysis */
         metrics->hawkes_intensity[t] = intensity;
         metrics->surprise[t] = surprise;
+        metrics->rls_mu[t] = rls_baseline_get_mu(&detector.rls);
+        metrics->rls_sigma[t] = rls_baseline_get_sigma(&detector.rls);
+        metrics->entry_threshold[t] = detector.last_entry_threshold;
+        metrics->exit_threshold[t] = detector.last_exit_threshold;
 
         /* Update crisis detector */
         crisis_detector_update(&detector, intensity, surprise, ext);
@@ -562,8 +647,11 @@ static void run_crisis_detection_test(SyntheticData *data, CrisisMetrics *metric
         /* Print key events */
         if (t == 2500 || t == 3000 || t == 4000 || t == 5350 || t == 5410)
         {
-            printf("  t=%4d: intensity=%.4f, surprise=%.2f, detected=%d, actual=%d\n",
-                   t, intensity, surprise, detector.in_crisis, actual_crisis);
+            printf("  t=%4d: λ=%.4f (μ=%.4f, thresh=%.4f), surp=%.2f, det=%d, act=%d\n",
+                   t, intensity,
+                   rls_baseline_get_mu(&detector.rls),
+                   detector.last_entry_threshold,
+                   surprise, detector.in_crisis, actual_crisis);
         }
     }
 
@@ -571,9 +659,18 @@ static void run_crisis_detection_test(SyntheticData *data, CrisisMetrics *metric
     metrics->avg_intensity_in_crisis = (count_in > 0) ? sum_intensity_in / count_in : 0;
     metrics->avg_intensity_out_crisis = (count_out > 0) ? sum_intensity_out / count_out : 0;
 
+    /* Store final RLS state */
+    metrics->final_mu = rls_baseline_get_mu(&detector.rls);
+    metrics->final_sigma = rls_baseline_get_sigma(&detector.rls);
+    metrics->final_K = rls_baseline_get_kalman_gain(&detector.rls);
+
     /* Print Hawkes state at end */
     printf("\n  Final Hawkes state:\n");
     rbpf_ext_print_hawkes_state(ext);
+
+    /* Print RLS state */
+    printf("\n  RLS Baseline Tracker:\n");
+    rls_baseline_print(&detector.rls);
 
     /* Print crisis mode state */
     rbpf_ext_print_crisis_state(ext);
@@ -649,6 +746,16 @@ static void print_crisis_results(CrisisMetrics *m, SyntheticData *data)
     printf("    Ratio (in/out):       %.2fx\n",
            m->avg_intensity_out_crisis > 0 ? m->avg_intensity_in_crisis / m->avg_intensity_out_crisis : 0);
 
+    printf("\n  RLS ADAPTIVE THRESHOLDS\n");
+    printf("  ────────────────────────────────────────────────────────────────────────────\n");
+    printf("    Final baseline (μ):   %.4f\n", m->final_mu);
+    printf("    Final std dev (σ):    %.4f\n", m->final_sigma);
+    printf("    Final Kalman gain:    %.4f\n", m->final_K);
+    printf("    Entry threshold:      μ + 2.5σ = %.4f\n",
+           m->final_mu + 2.5f * m->final_sigma);
+    printf("    Exit threshold:       μ + 1.0σ = %.4f\n",
+           m->final_mu + 1.0f * m->final_sigma);
+
     printf("\n  FIRST DETECTION\n");
     printf("  ────────────────────────────────────────────────────────────────────────────\n");
     if (m->first_detection_tick >= 0)
@@ -689,15 +796,18 @@ static void write_crisis_csv(const char *filename, CrisisMetrics *m,
     }
 
     fprintf(f, "tick,return,true_log_vol,true_hypo,is_outlier,"
-               "hawkes_intensity,surprise,detected_crisis,actual_crisis\n");
+               "hawkes_intensity,surprise,rls_mu,rls_sigma,entry_thresh,exit_thresh,"
+               "detected_crisis,actual_crisis\n");
 
     for (int t = 0; t < data->n_ticks; t++)
     {
         int actual = is_in_crisis_ground_truth(t);
-        fprintf(f, "%d,%.8f,%.6f,%d,%d,%.6f,%.4f,%d,%d\n",
+        fprintf(f, "%d,%.8f,%.6f,%d,%d,%.6f,%.4f,%.6f,%.6f,%.6f,%.6f,%d,%d\n",
                 t, data->returns[t], data->true_log_vol[t],
                 data->true_hypothesis[t], data->is_outlier[t],
                 m->hawkes_intensity[t], m->surprise[t],
+                m->rls_mu[t], m->rls_sigma[t],
+                m->entry_threshold[t], m->exit_threshold[t],
                 m->detected_crisis[t], actual);
     }
 
@@ -759,6 +869,10 @@ int main(int argc, char **argv)
     free(metrics.detected_crisis);
     free(metrics.hawkes_intensity);
     free(metrics.surprise);
+    free(metrics.rls_mu);
+    free(metrics.rls_sigma);
+    free(metrics.entry_threshold);
+    free(metrics.exit_threshold);
     free_synthetic_data(data);
 
     return 0;
