@@ -1,19 +1,17 @@
 /*=============================================================================
- * PGAS → RBPF Injection Test
+ * PGAS → RBPF Injection Test (Learning Evaluation)
  *
- * Same test as test_single_rbpf but with PGAS injecting learned Π into RBPF.
- * Compares accuracy with and without PGAS injection.
+ * Tests whether PGAS learning helps by repeating the dataset twice:
+ *   - First half (0-7999): PGAS learns transition dynamics
+ *   - Second half (8000-15999): Same scenarios repeat, evaluate with learned Π
+ *
+ * Only the second half is scored, giving PGAS a fair chance to demonstrate
+ * that learned Π improves regime detection.
  *
  * Architecture:
  *   - RBPF runs on main thread (Storvik learns μ, σ)
  *   - PGAS runs on background thread (learns Π from sliding window)
  *   - When PGAS produces Π, inject into RBPF's transition LUT
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * BUILD (add to PGAS/CMakeLists.txt or compile manually)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- *   Link against: rbpf_ksc, pgas_oracle, pgas_sliding, MKL, OpenMP
  *
  *===========================================================================*/
 
@@ -47,6 +45,11 @@
 #define PGAS_PARTICLES 64
 #define PGAS_SWEEPS 2
 #define PGAS_THREADS 8
+
+/* Test structure: repeat data twice */
+#define BASE_TICKS 8000
+#define TOTAL_TICKS (BASE_TICKS * 2)  /* 16000 ticks */
+#define EVAL_START BASE_TICKS         /* Score only second half */
 
 /*─────────────────────────────────────────────────────────────────────────────
  * TIMING UTILITIES
@@ -138,7 +141,7 @@ static const HypothesisParams TRUE_PARAMS[N_HYPOTHESES] = {
     {.mu_vol = -1.5, .phi = 0.85, .sigma_eta = 0.50, .vol_approx = 0.220}};
 
 /*─────────────────────────────────────────────────────────────────────────────
- * SYNTHETIC DATA (Same as test_single_rbpf)
+ * SYNTHETIC DATA (Repeated twice for learning evaluation)
  *───────────────────────────────────────────────────────────────────────────*/
 
 typedef struct
@@ -150,14 +153,16 @@ typedef struct
     int *is_outlier;
     double *outlier_sigma;
     int n_ticks;
-    int scenario_starts[10];
-    const char *scenario_names[10];
+    int base_ticks;          /* Original data length before repetition */
+    int scenario_starts[20]; /* Extended for 2 repetitions */
+    const char *scenario_names[20];
     int n_scenarios;
     int n_outliers_injected;
 } SyntheticData;
 
 static void inject_outlier(SyntheticData *data, int t, double target_sigma, pcg32_t *rng)
 {
+    if (t >= data->n_ticks) return;
     double vol = data->true_vol[t];
     double sign = (pcg32_double(rng) < 0.5) ? -1.0 : 1.0;
     data->returns[t] = sign * target_sigma * vol;
@@ -166,12 +171,15 @@ static void inject_outlier(SyntheticData *data, int t, double target_sigma, pcg3
     data->n_outliers_injected++;
 }
 
-static SyntheticData *generate_test_data(int seed)
+static SyntheticData *generate_test_data_repeated(int seed)
 {
     SyntheticData *data = (SyntheticData *)calloc(1, sizeof(SyntheticData));
 
-    int n = 8000;
+    int base_n = BASE_TICKS;
+    int n = TOTAL_TICKS;  /* 2x base for repeated evaluation */
+    
     data->n_ticks = n;
+    data->base_ticks = base_n;
     data->returns = (double *)malloc(n * sizeof(double));
     data->true_log_vol = (double *)malloc(n * sizeof(double));
     data->true_vol = (double *)malloc(n * sizeof(double));
@@ -180,6 +188,12 @@ static SyntheticData *generate_test_data(int seed)
     data->outlier_sigma = (double *)calloc(n, sizeof(double));
 
     pcg32_t rng = {seed * 12345ULL + 1, seed * 67890ULL | 1};
+
+    /* Generate base data once, then copy */
+    double *base_returns = (double *)malloc(base_n * sizeof(double));
+    double *base_log_vol = (double *)malloc(base_n * sizeof(double));
+    double *base_vol = (double *)malloc(base_n * sizeof(double));
+    int *base_hypo = (int *)malloc(base_n * sizeof(int));
 
     double log_vol = TRUE_PARAMS[HYPO_CALM].mu_vol;
     int t = 0;
@@ -192,10 +206,10 @@ static SyntheticData *generate_test_data(int seed)
         log_vol = p->phi * log_vol + theta * p->mu_vol + p->sigma_eta * pcg32_gaussian(&rng); \
         double vol = exp(log_vol);                                                            \
         double ret = vol * pcg32_gaussian(&rng);                                              \
-        data->returns[t] = ret;                                                               \
-        data->true_log_vol[t] = log_vol;                                                      \
-        data->true_vol[t] = vol;                                                              \
-        data->true_hypothesis[t] = (H);                                                       \
+        base_returns[t] = ret;                                                                \
+        base_log_vol[t] = log_vol;                                                            \
+        base_vol[t] = vol;                                                                    \
+        base_hypo[t] = (H);                                                                   \
     } while (0)
 
     /* Scenario 1: Extended Calm (0-1499) */
@@ -206,8 +220,6 @@ static SyntheticData *generate_test_data(int seed)
     {
         EVOLVE_STATE(HYPO_CALM);
     }
-    inject_outlier(data, 500, 6.0, &rng);
-    inject_outlier(data, 1200, 8.0, &rng);
 
     /* Scenario 2: Slow Trend (1500-2499) */
     data->scenario_starts[1] = 1500;
@@ -227,11 +239,6 @@ static SyntheticData *generate_test_data(int seed)
     {
         EVOLVE_STATE(HYPO_CRISIS);
     }
-    inject_outlier(data, 2510, 8.0, &rng);
-    inject_outlier(data, 2530, 10.0, &rng);
-    inject_outlier(data, 2560, 12.0, &rng);
-    inject_outlier(data, 2650, 9.0, &rng);
-    inject_outlier(data, 2800, 11.0, &rng);
 
     /* Scenario 4: Crisis Persistence (3000-3999) */
     data->scenario_starts[3] = 3000;
@@ -241,9 +248,6 @@ static SyntheticData *generate_test_data(int seed)
     {
         EVOLVE_STATE(HYPO_CRISIS);
     }
-    inject_outlier(data, 3200, 10.0, &rng);
-    inject_outlier(data, 3500, 15.0, &rng);
-    inject_outlier(data, 3800, 12.0, &rng);
 
     /* Scenario 5: Recovery (4000-5199) */
     data->scenario_starts[4] = 4000;
@@ -274,7 +278,6 @@ static SyntheticData *generate_test_data(int seed)
             h = HYPO_CALM;
         EVOLVE_STATE(h);
     }
-    inject_outlier(data, 5380, 12.0, &rng);
 
     /* Scenario 7: Choppy (5700-7999) */
     data->scenario_starts[6] = 5700;
@@ -282,7 +285,7 @@ static SyntheticData *generate_test_data(int seed)
     data->n_scenarios = 7;
     Hypothesis current_h = HYPO_TREND;
     int next_switch = 5700 + 80 + (int)(pcg32_double(&rng) * 120);
-    for (; t < 8000; t++)
+    for (; t < base_n; t++)
     {
         if (t >= next_switch)
         {
@@ -294,6 +297,65 @@ static SyntheticData *generate_test_data(int seed)
     }
 
 #undef EVOLVE_STATE
+
+    /* Copy base data twice into full array */
+    for (int rep = 0; rep < 2; rep++)
+    {
+        int offset = rep * base_n;
+        for (int i = 0; i < base_n; i++)
+        {
+            data->returns[offset + i] = base_returns[i];
+            data->true_log_vol[offset + i] = base_log_vol[i];
+            data->true_vol[offset + i] = base_vol[i];
+            data->true_hypothesis[offset + i] = base_hypo[i];
+        }
+    }
+
+    /* Add second-half scenario markers */
+    for (int s = 0; s < 7; s++)
+    {
+        data->scenario_starts[7 + s] = base_n + data->scenario_starts[s];
+        /* Reuse names with "(2)" suffix in display */
+    }
+    data->scenario_names[7] = "Extended Calm (2)";
+    data->scenario_names[8] = "Slow Trend (2)";
+    data->scenario_names[9] = "Sudden Crisis (2)";
+    data->scenario_names[10] = "Crisis Persist (2)";
+    data->scenario_names[11] = "Recovery (2)";
+    data->scenario_names[12] = "Flash Crash (2)";
+    data->scenario_names[13] = "Choppy (2)";
+    data->n_scenarios = 14;
+
+    /* Inject outliers in both halves */
+    inject_outlier(data, 500, 6.0, &rng);
+    inject_outlier(data, 1200, 8.0, &rng);
+    inject_outlier(data, 2510, 8.0, &rng);
+    inject_outlier(data, 2530, 10.0, &rng);
+    inject_outlier(data, 2560, 12.0, &rng);
+    inject_outlier(data, 2650, 9.0, &rng);
+    inject_outlier(data, 2800, 11.0, &rng);
+    inject_outlier(data, 3200, 10.0, &rng);
+    inject_outlier(data, 3500, 15.0, &rng);
+    inject_outlier(data, 3800, 12.0, &rng);
+    inject_outlier(data, 5380, 12.0, &rng);
+    
+    /* Same outliers in second half */
+    inject_outlier(data, base_n + 500, 6.0, &rng);
+    inject_outlier(data, base_n + 1200, 8.0, &rng);
+    inject_outlier(data, base_n + 2510, 8.0, &rng);
+    inject_outlier(data, base_n + 2530, 10.0, &rng);
+    inject_outlier(data, base_n + 2560, 12.0, &rng);
+    inject_outlier(data, base_n + 2650, 9.0, &rng);
+    inject_outlier(data, base_n + 2800, 11.0, &rng);
+    inject_outlier(data, base_n + 3200, 10.0, &rng);
+    inject_outlier(data, base_n + 3500, 15.0, &rng);
+    inject_outlier(data, base_n + 3800, 12.0, &rng);
+    inject_outlier(data, base_n + 5380, 12.0, &rng);
+
+    free(base_returns);
+    free(base_log_vol);
+    free(base_vol);
+    free(base_hypo);
 
     return data;
 }
@@ -346,7 +408,7 @@ typedef struct
     /* Flags */
     int regime_changed;
     int resampled;
-    int pgas_injected; /* NEW: Was Π injected this tick? */
+    int pgas_injected;
 
     /* Timing */
     double latency_us;
@@ -366,7 +428,7 @@ static int rbpf_regime_to_hypothesis(int regime)
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
- * SUMMARY METRICS
+ * SUMMARY METRICS (Computed only on evaluation range)
  *───────────────────────────────────────────────────────────────────────────*/
 
 typedef struct
@@ -380,7 +442,7 @@ typedef struct
     int missed_crisis_count;
     int spurious_switches_on_outlier;
     int regime_stable_after_outlier;
-    int total_outliers_in_non_crisis;
+    int total_outliers_in_eval;
     double avg_ess;
     double min_ess;
     double log_vol_rmse_outliers;
@@ -392,13 +454,9 @@ typedef struct
     double max_latency_us;
     int total_resamples;
     int total_regime_changes;
-
-    /* PGAS-specific */
     int total_injections;
-    double accuracy_before_first_inject;
-    double accuracy_after_first_inject;
-    int ticks_before_first_inject;
-    int ticks_after_first_inject;
+    int eval_start;
+    int eval_end;
 } SummaryMetrics;
 
 static int compare_double(const void *a, const void *b)
@@ -408,10 +466,14 @@ static int compare_double(const void *a, const void *b)
     return (da > db) - (da < db);
 }
 
-static void compute_metrics(TickRecord *records, SyntheticData *data, SummaryMetrics *m)
+static void compute_metrics_range(TickRecord *records, SyntheticData *data, 
+                                  SummaryMetrics *m, int eval_start, int eval_end)
 {
-    int n = data->n_ticks;
     memset(m, 0, sizeof(SummaryMetrics));
+    m->eval_start = eval_start;
+    m->eval_end = eval_end;
+    
+    int eval_n = eval_end - eval_start;
 
     double sum_log_err2 = 0, sum_log_err = 0, sum_vol_err2 = 0;
     int hypo_correct = 0;
@@ -421,14 +483,11 @@ static void compute_metrics(TickRecord *records, SyntheticData *data, SummaryMet
     int n_outlier = 0, n_normal = 0;
     double sum_outlier_frac_outlier = 0, sum_outlier_frac_normal = 0;
 
-    double *latencies = (double *)malloc(n * sizeof(double));
+    double *latencies = (double *)malloc(eval_n * sizeof(double));
     double max_latency = 0;
+    int lat_idx = 0;
 
-    /* Track accuracy before/after first injection */
-    int first_inject_tick = -1;
-    int correct_before = 0, correct_after = 0;
-
-    for (int t = 0; t < n; t++)
+    for (int t = eval_start; t < eval_end; t++)
     {
         TickRecord *r = &records[t];
 
@@ -440,17 +499,7 @@ static void compute_metrics(TickRecord *records, SyntheticData *data, SummaryMet
         sum_vol_err2 += vol_err * vol_err;
 
         if (r->est_hypothesis == r->true_hypothesis)
-        {
             hypo_correct++;
-            if (first_inject_tick < 0)
-            {
-                correct_before++;
-            }
-            else
-            {
-                correct_after++;
-            }
-        }
 
         if (r->true_hypothesis == HYPO_CRISIS && r->est_hypothesis != HYPO_CRISIS)
             m->missed_crisis_count++;
@@ -465,37 +514,28 @@ static void compute_metrics(TickRecord *records, SyntheticData *data, SummaryMet
             m->total_resamples++;
         if (r->regime_changed)
             m->total_regime_changes++;
-
         if (r->pgas_injected)
-        {
             m->total_injections++;
-            if (first_inject_tick < 0)
-            {
-                first_inject_tick = t;
-                m->ticks_before_first_inject = t;
-            }
-        }
 
         if (data->is_outlier[t])
         {
             sum_log_err2_outlier += log_err * log_err;
             sum_outlier_frac_outlier += r->outlier_fraction;
             n_outlier++;
+            m->total_outliers_in_eval++;
 
             if (data->true_hypothesis[t] != HYPO_CRISIS)
             {
-                m->total_outliers_in_non_crisis++;
-
-                if (t > 0 &&
+                if (t > eval_start &&
                     records[t - 1].est_hypothesis != HYPO_CRISIS &&
                     r->est_hypothesis == HYPO_CRISIS)
                 {
                     m->spurious_switches_on_outlier++;
                 }
 
-                if (t + 5 < n)
+                if (t + 5 < eval_end)
                 {
-                    int pre_regime = (t > 0) ? records[t - 1].est_hypothesis : r->est_hypothesis;
+                    int pre_regime = (t > eval_start) ? records[t - 1].est_hypothesis : r->est_hypothesis;
                     int post_regime = records[t + 5].est_hypothesis;
                     if (pre_regime == post_regime)
                     {
@@ -511,16 +551,16 @@ static void compute_metrics(TickRecord *records, SyntheticData *data, SummaryMet
             n_normal++;
         }
 
-        latencies[t] = r->latency_us;
+        latencies[lat_idx++] = r->latency_us;
         if (r->latency_us > max_latency)
             max_latency = r->latency_us;
     }
 
-    m->log_vol_rmse = sqrt(sum_log_err2 / n);
-    m->log_vol_mae = sum_log_err / n;
-    m->vol_rmse = sqrt(sum_vol_err2 / n);
-    m->hypothesis_accuracy = (double)hypo_correct / n;
-    m->avg_ess = sum_ess / n;
+    m->log_vol_rmse = sqrt(sum_log_err2 / eval_n);
+    m->log_vol_mae = sum_log_err / eval_n;
+    m->vol_rmse = sqrt(sum_vol_err2 / eval_n);
+    m->hypothesis_accuracy = (double)hypo_correct / eval_n;
+    m->avg_ess = sum_ess / eval_n;
     m->min_ess = min_ess;
 
     if (n_outlier > 0)
@@ -534,37 +574,27 @@ static void compute_metrics(TickRecord *records, SyntheticData *data, SummaryMet
         m->avg_outlier_frac_on_normal = sum_outlier_frac_normal / n_normal;
     }
 
-    qsort(latencies, n, sizeof(double), compare_double);
-    m->avg_latency_us = latencies[n / 2];
-    m->p99_latency_us = latencies[(int)(0.99 * n)];
+    qsort(latencies, eval_n, sizeof(double), compare_double);
+    m->avg_latency_us = latencies[eval_n / 2];
+    m->p99_latency_us = latencies[(int)(0.99 * eval_n)];
     m->max_latency_us = max_latency;
-
-    /* Compute before/after accuracy */
-    if (first_inject_tick >= 0)
-    {
-        m->ticks_after_first_inject = n - first_inject_tick;
-        if (m->ticks_before_first_inject > 0)
-            m->accuracy_before_first_inject = (double)correct_before / m->ticks_before_first_inject;
-        if (m->ticks_after_first_inject > 0)
-            m->accuracy_after_first_inject = (double)correct_after / m->ticks_after_first_inject;
-    }
 
     free(latencies);
 }
 
-static double compute_transition_lag(TickRecord *records, SyntheticData *data)
+static double compute_transition_lag_range(TickRecord *records, SyntheticData *data,
+                                           int eval_start, int eval_end)
 {
-    int n = data->n_ticks;
     int total_lag = 0;
     int n_transitions = 0;
 
-    for (int t = 1; t < n; t++)
+    for (int t = eval_start + 1; t < eval_end; t++)
     {
         if (data->true_hypothesis[t] != data->true_hypothesis[t - 1])
         {
             int target = data->true_hypothesis[t];
             int lag = 0;
-            for (int s = t; s < n && s < t + 200; s++)
+            for (int s = t; s < eval_end && s < t + 200; s++)
             {
                 if (records[s].est_hypothesis == target)
                     break;
@@ -586,13 +616,16 @@ static double compute_transition_lag(TickRecord *records, SyntheticData *data)
  *───────────────────────────────────────────────────────────────────────────*/
 
 static void print_results(SummaryMetrics *m, TickRecord *records, SyntheticData *data,
-                          const char *title)
+                          const char *title, int eval_start, int eval_end)
 {
-    double trans_lag = compute_transition_lag(records, data);
+    double trans_lag = compute_transition_lag_range(records, data, eval_start, eval_end);
+    int eval_n = eval_end - eval_start;
 
     printf("\n");
     printf("══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %s (%d ticks, %d outliers)\n", title, data->n_ticks, data->n_outliers_injected);
+    printf("  %s\n", title);
+    printf("  Evaluation range: ticks %d-%d (%d ticks, %d outliers)\n", 
+           eval_start, eval_end - 1, eval_n, m->total_outliers_in_eval);
     printf("══════════════════════════════════════════════════════════════════════════════\n");
 
     printf("\n  VOLATILITY ESTIMATION\n");
@@ -611,11 +644,9 @@ static void print_results(SummaryMetrics *m, TickRecord *records, SyntheticData 
     printf("    Missed Crisis Count:    %d\n", m->missed_crisis_count);
     printf("    Total Regime Changes:   %d\n", m->total_regime_changes);
 
-    printf("\n  OUTLIER HANDLING (★ THE MONEY SHOT)\n");
+    printf("\n  OUTLIER HANDLING\n");
     printf("  ────────────────────────────────────────────────────────────────────────────\n");
     printf("    Spurious Crisis on Outlier:     %d\n", m->spurious_switches_on_outlier);
-    printf("    Regime Stable After Outlier:    %d / %d\n",
-           m->regime_stable_after_outlier, m->total_outliers_in_non_crisis);
     printf("    Avg Outlier Frac (on outliers): %.2f\n", m->avg_outlier_frac_on_outliers);
     printf("    Avg Outlier Frac (on normal):   %.4f\n", m->avg_outlier_frac_on_normal);
 
@@ -631,32 +662,29 @@ static void print_results(SummaryMetrics *m, TickRecord *records, SyntheticData 
     printf("    P99 Latency:            %.2f us\n", m->p99_latency_us);
     printf("    Max Latency:            %.2f us\n", m->max_latency_us);
 
-    /* PGAS-specific stats */
     if (m->total_injections > 0)
     {
-        printf("\n  PGAS INJECTION\n");
+        printf("\n  PGAS INJECTION (in eval range)\n");
         printf("  ────────────────────────────────────────────────────────────────────────────\n");
-        printf("    Total Injections:       %d\n", m->total_injections);
-        printf("    First Injection:        tick %d\n", m->ticks_before_first_inject);
-        if (m->ticks_before_first_inject > 0 && m->ticks_after_first_inject > 0)
-        {
-            printf("    Accuracy BEFORE inject: %.1f%% (%d ticks)\n",
-                   100 * m->accuracy_before_first_inject, m->ticks_before_first_inject);
-            printf("    Accuracy AFTER inject:  %.1f%% (%d ticks)\n",
-                   100 * m->accuracy_after_first_inject, m->ticks_after_first_inject);
-            printf("    Improvement:            %+.1f%%\n",
-                   100 * (m->accuracy_after_first_inject - m->accuracy_before_first_inject));
-        }
+        printf("    Injections in eval:     %d\n", m->total_injections);
     }
 
-    printf("\n  PER-SCENARIO ACCURACY\n");
+    /* Per-scenario accuracy (only eval range scenarios) */
+    printf("\n  PER-SCENARIO ACCURACY (Evaluation Half)\n");
     printf("  ────────────────────────────────────────────────────────────────────────────\n");
     printf("    %-24s %10s\n", "Scenario", "Accuracy");
 
-    for (int s = 0; s < data->n_scenarios; s++)
+    /* Only show second-half scenarios (indices 7-13) */
+    for (int s = 7; s < data->n_scenarios; s++)
     {
         int start = data->scenario_starts[s];
         int end = (s + 1 < data->n_scenarios) ? data->scenario_starts[s + 1] : data->n_ticks;
+        
+        /* Clip to eval range */
+        if (start < eval_start) start = eval_start;
+        if (end > eval_end) end = eval_end;
+        if (start >= end) continue;
+        
         int count = end - start;
         int correct = 0;
 
@@ -677,8 +705,7 @@ static void print_results(SummaryMetrics *m, TickRecord *records, SyntheticData 
  *───────────────────────────────────────────────────────────────────────────*/
 
 static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
-                               double *total_time, double *max_latency,
-                               int *out_injections)
+                               double *total_time, int *out_injections)
 {
     /* Create RBPF */
     RBPF_Extended *ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
@@ -727,7 +754,7 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
         return;
     }
 
-    /* Configure PGAS model (same regime params as RBPF) */
+    /* Configure PGAS model */
     double pgas_trans[16];
     for (int i = 0; i < 16; i++)
         pgas_trans[i] = (double)trans[i];
@@ -748,7 +775,6 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
     }
 
     *total_time = 0.0;
-    *max_latency = 0.0;
     int injections = 0;
 
     RBPF_KSC_Output output;
@@ -783,8 +809,6 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
 
         double latency = t_end - t_start;
         *total_time += latency;
-        if (latency > *max_latency)
-            *max_latency = latency;
 
         /* Record */
         TickRecord *rec = &records[t];
@@ -815,9 +839,7 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
     /* Stop PGAS */
     pgas_oracle_stop(oracle);
 
-    /* Print configs */
-    printf("\n");
-    rbpf_ext_print_config(ext);
+    /* Print PGAS diagnostics */
     printf("\n");
     pgas_oracle_print_diagnostics(oracle);
 
@@ -833,7 +855,7 @@ static void run_rbpf_with_pgas(SyntheticData *data, TickRecord *records,
  *───────────────────────────────────────────────────────────────────────────*/
 
 static void run_rbpf_baseline(SyntheticData *data, TickRecord *records,
-                              double *total_time, double *max_latency)
+                              double *total_time)
 {
     RBPF_Extended *ext = rbpf_ext_create(N_PARTICLES, N_REGIMES, RBPF_PARAM_STORVIK);
     rbpf_ext_enable_kl_tempering(ext);
@@ -867,7 +889,6 @@ static void run_rbpf_baseline(SyntheticData *data, TickRecord *records,
     rbpf_ext_init(ext, -4.5f, 0.1f);
 
     *total_time = 0.0;
-    *max_latency = 0.0;
 
     RBPF_KSC_Output output;
     int n = data->n_ticks;
@@ -882,8 +903,6 @@ static void run_rbpf_baseline(SyntheticData *data, TickRecord *records,
 
         double latency = t_end - t_start;
         *total_time += latency;
-        if (latency > *max_latency)
-            *max_latency = latency;
 
         TickRecord *rec = &records[t];
         rec->tick = t;
@@ -925,14 +944,8 @@ int main(int argc, char **argv)
 
     init_timer();
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * MKL TUNING (same as coexistence test)
-     * ═══════════════════════════════════════════════════════════════════════*/
-
-    /* Flush denormals to zero (FTZ+DAZ) */
+    /* MKL Tuning */
     mkl_tuning_flush_denormals();
-
-    /* RBPF: single-threaded MKL for minimal latency */
     mkl_set_num_threads(1);
     mkl_set_dynamic(0);
     mkl_cbwr_set(MKL_CBWR_AVX2);
@@ -942,71 +955,77 @@ int main(int argc, char **argv)
     timeBeginPeriod(1);
 #endif
 
-    /* PGAS uses OpenMP threads (set via pgas_oracle_set_affinity) */
-
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                      MKL TUNING CONFIGURATION                         ║\n");
+    printf("║         PGAS → RBPF Learning Evaluation Test                          ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
-    printf("  Denormals:     FLUSH TO ZERO (FTZ+DAZ enabled)\n");
-    printf("  MKL threads:   1 (RBPF single-threaded)\n");
-    printf("  PGAS threads:  %d (set in background thread)\n", PGAS_THREADS);
-    printf("  MKL dynamic:   OFF\n");
-    printf("  MKL CBWR:      AVX2\n");
-#ifdef _WIN32
-    printf("  Windows:       HIGH priority, timer=1ms\n");
-#endif
+    printf("\n");
+    printf("  Test Design:\n");
+    printf("    - Data is REPEATED twice (16000 ticks total)\n");
+    printf("    - First half (0-7999): Learning phase - PGAS builds Π\n");
+    printf("    - Second half (8000-15999): Evaluation phase - score with learned Π\n");
+    printf("    - Only second half is scored for fair comparison\n");
+    printf("\n");
+    printf("  Config:\n");
+    printf("    Seed: %d\n", seed);
+    printf("    Total ticks: %d (2 × %d)\n", TOTAL_TICKS, BASE_TICKS);
+    printf("    PGAS: window=%d, slide=%d, particles=%d, sweeps=%d\n",
+           PGAS_WINDOW, PGAS_SLIDE, PGAS_PARTICLES, PGAS_SWEEPS);
     printf("\n");
 
-    printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║              PGAS → RBPF Injection Test                               ║\n");
-    printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
-    printf("  Seed: %d\n", seed);
-    printf("  Ticks: 8000\n");
-    printf("  PGAS: window=%d, slide=%d, particles=%d, sweeps=%d, threads=%d\n",
-           PGAS_WINDOW, PGAS_SLIDE, PGAS_PARTICLES, PGAS_SWEEPS, PGAS_THREADS);
-    printf("\n");
-
-    /* Generate data */
-    printf("Generating synthetic data...\n");
-    SyntheticData *data = generate_test_data(seed);
-    printf("  Ticks: %d\n", data->n_ticks);
-    printf("  Scenarios: %d\n", data->n_scenarios);
+    /* Generate repeated data */
+    printf("Generating repeated synthetic data...\n");
+    SyntheticData *data = generate_test_data_repeated(seed);
+    printf("  Total ticks: %d\n", data->n_ticks);
+    printf("  Base pattern: %d ticks (repeated 2×)\n", data->base_ticks);
+    printf("  Scenarios: %d (7 original × 2)\n", data->n_scenarios);
     printf("  Outliers: %d\n\n", data->n_outliers_injected);
 
     /* Allocate records */
     TickRecord *records_baseline = (TickRecord *)calloc(data->n_ticks, sizeof(TickRecord));
     TickRecord *records_pgas = (TickRecord *)calloc(data->n_ticks, sizeof(TickRecord));
 
-    /* Run baseline (no PGAS) */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * RUN BASELINE (no PGAS)
+     * ═══════════════════════════════════════════════════════════════════════*/
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("Running BASELINE (no PGAS injection)...\n");
+    printf("Running BASELINE (no PGAS injection) on %d ticks...\n", data->n_ticks);
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    double baseline_time, baseline_max;
-    run_rbpf_baseline(data, records_baseline, &baseline_time, &baseline_max);
+    double baseline_time;
+    run_rbpf_baseline(data, records_baseline, &baseline_time);
     printf("  Total time: %.2f ms\n", baseline_time / 1000.0);
 
+    /* Compute metrics on SECOND HALF only */
     SummaryMetrics metrics_baseline;
-    compute_metrics(records_baseline, data, &metrics_baseline);
-    print_results(&metrics_baseline, records_baseline, data, "BASELINE (Fixed Π)");
+    compute_metrics_range(records_baseline, data, &metrics_baseline, EVAL_START, TOTAL_TICKS);
+    print_results(&metrics_baseline, records_baseline, data, 
+                  "BASELINE (Fixed Π) - Evaluation Half Only", EVAL_START, TOTAL_TICKS);
 
-    /* Run with PGAS injection */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * RUN WITH PGAS
+     * ═══════════════════════════════════════════════════════════════════════*/
     printf("\n═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("Running WITH PGAS INJECTION...\n");
+    printf("Running WITH PGAS INJECTION on %d ticks...\n", data->n_ticks);
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    double pgas_time, pgas_max;
+    double pgas_time;
     int injections;
-    run_rbpf_with_pgas(data, records_pgas, &pgas_time, &pgas_max, &injections);
+    run_rbpf_with_pgas(data, records_pgas, &pgas_time, &injections);
     printf("  Total time: %.2f ms\n", pgas_time / 1000.0);
-    printf("  Injections: %d\n", injections);
+    printf("  Total injections: %d\n", injections);
 
+    /* Compute metrics on SECOND HALF only */
     SummaryMetrics metrics_pgas;
-    compute_metrics(records_pgas, data, &metrics_pgas);
-    print_results(&metrics_pgas, records_pgas, data, "WITH PGAS INJECTION");
+    compute_metrics_range(records_pgas, data, &metrics_pgas, EVAL_START, TOTAL_TICKS);
+    print_results(&metrics_pgas, records_pgas, data,
+                  "WITH PGAS (Learned Π) - Evaluation Half Only", EVAL_START, TOTAL_TICKS);
 
-    /* Comparison summary */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * COMPARISON SUMMARY
+     * ═══════════════════════════════════════════════════════════════════════*/
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                         COMPARISON SUMMARY                            ║\n");
+    printf("║                    LEARNING EVALUATION SUMMARY                        ║\n");
+    printf("║         (Metrics computed on SECOND HALF only: ticks %d-%d)       ║\n",
+           EVAL_START, TOTAL_TICKS - 1);
     printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
     printf("\n");
     printf("  %-30s %12s %12s %12s\n", "Metric", "Baseline", "PGAS", "Delta");
@@ -1029,10 +1048,33 @@ int main(int argc, char **argv)
     printf("  %-30s %10.1f %10.1f %+10.1f\n", "Avg ESS",
            metrics_baseline.avg_ess, metrics_pgas.avg_ess,
            metrics_pgas.avg_ess - metrics_baseline.avg_ess);
+    
+    double lag_baseline = compute_transition_lag_range(records_baseline, data, EVAL_START, TOTAL_TICKS);
+    double lag_pgas = compute_transition_lag_range(records_pgas, data, EVAL_START, TOTAL_TICKS);
     printf("  %-30s %10.1f %10.1f %+10.1f\n", "Transition Lag (ticks)",
-           compute_transition_lag(records_baseline, data),
-           compute_transition_lag(records_pgas, data),
-           compute_transition_lag(records_pgas, data) - compute_transition_lag(records_baseline, data));
+           lag_baseline, lag_pgas, lag_pgas - lag_baseline);
+    printf("\n");
+
+    /* Interpretation */
+    double acc_delta = metrics_pgas.hypothesis_accuracy - metrics_baseline.hypothesis_accuracy;
+    printf("  ═══════════════════════════════════════════════════════════════════════\n");
+    printf("  INTERPRETATION:\n");
+    if (acc_delta > 0.05)
+    {
+        printf("    ✓ PGAS learning HELPS (+%.1f%% accuracy)\n", 100 * acc_delta);
+        printf("      Learned Π captures transition dynamics that fixed Π misses.\n");
+    }
+    else if (acc_delta > -0.05)
+    {
+        printf("    ~ PGAS learning is NEUTRAL (%.1f%% delta)\n", 100 * acc_delta);
+        printf("      Learned Π neither helps nor hurts significantly.\n");
+    }
+    else
+    {
+        printf("    ✗ PGAS learning HURTS (%.1f%% accuracy)\n", 100 * acc_delta);
+        printf("      Learned Π may be too conservative or crisis-blind.\n");
+    }
+    printf("  ═══════════════════════════════════════════════════════════════════════\n");
     printf("\n");
 
     /* Cleanup */
